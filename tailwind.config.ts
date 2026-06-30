@@ -31,14 +31,20 @@ export default {
           disabled: '#6b7790',
           faint: '#5b6880'
         },
-        border: {
-          subtle: 'rgba(52,211,153,0.12)',
-          DEFAULT: 'rgba(52,211,153,0.22)'
-        }
+        // NOTE: flat keys so `border-border-default` / `border-border-subtle`
+        // (used across the app) resolve correctly. A nested { DEFAULT } would
+        // only produce `border-border`, leaving `-default` to fall back to
+        // Tailwind's near-white preflight color.
+        'border-default': 'rgba(52,211,153,0.22)',
+        'border-subtle': 'rgba(52,211,153,0.12)'
       },
       fontFamily: {
         sans: ['"IBM Plex Sans"', 'system-ui', 'sans-serif'],
         mono: ['"IBM Plex Mono"', 'ui-monospace', 'monospace']
+      },
+      // default border color for bare `border` (overrides Tailwind's near-white)
+      borderColor: {
+        DEFAULT: 'rgba(52,211,153,0.22)'
       },
       borderRadius: {
         card: '20px',
