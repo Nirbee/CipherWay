@@ -1,0 +1,54 @@
+appId: com.cipherway.vpn
+productName: CipherWay VPN
+copyright: Copyright © 2026 CipherWay
+
+directories:
+  buildResources: build
+  output: release
+
+files:
+  - out/**/*
+  - package.json
+
+# Sidecar binaries (downloaded by scripts/download-cores.ts) ship as extra
+# resources, unpacked from asar so child_process can spawn them.
+extraResources:
+  - from: resources/bin
+    to: bin
+    filter:
+      - '**/*'
+
+asarUnpack:
+  - resources/bin/**
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  # no spaces in the artifact name — GitHub rewrites spaces to dots on upload,
+  # which would break the latest.yml -> asset URL match used by the updater.
+  artifactName: CipherWay-VPN-${version}-setup.${ext}
+  # Skip rcedit/signtool (the winCodeSign package) — not signing yet, and its
+  # macOS symlinks can't be extracted without Developer Mode/admin. Re-enable
+  # once a code-signing certificate is configured (see TODO below).
+  signAndEditExecutable: false
+  # TODO(code-signing): obtain an Authenticode (EV) certificate, otherwise
+  # Windows SmartScreen warns on install. Then set:
+  #   certificateFile: build/cert.pfx
+  #   certificatePassword: ${env.CSC_KEY_PASSWORD}
+  # or configure signtool / Azure Trusted Signing here.
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+
+# electron-updater feed — GitHub Releases (https://github.com/Nirbee/CipherWay).
+# Switch provider to 'generic' + url if you later move to a self-hosted server.
+publish:
+  provider: github
+  owner: Nirbee
+  repo: CipherWay

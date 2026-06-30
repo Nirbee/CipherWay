@@ -1,0 +1,51 @@
+{
+  "name": "cipherway-vpn",
+  "version": "0.1.0",
+  "description": "CipherWay VPN — Windows desktop client (Remnawave / XRAY VLESS+REALITY / Hysteria2)",
+  "author": "CipherWay",
+  "license": "UNLICENSED",
+  "main": "./out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "npm run typecheck && electron-vite build",
+    "preview": "electron-vite preview",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "eslint . --ext .ts,.tsx",
+    "format": "prettier --write \"src/**/*.{ts,tsx,css}\"",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "download:cores": "tsx scripts/download-cores.ts",
+    "postinstall": "electron-builder install-app-deps",
+    "pack:win": "npm run build && electron-builder --win --x64"
+  },
+  "dependencies": {
+    "electron-store": "^8.2.0",
+    "electron-updater": "^6.3.9",
+    "zod": "^3.23.8",
+    "zustand": "^5.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@typescript-eslint/eslint-plugin": "^8.18.2",
+    "@typescript-eslint/parser": "^8.18.2",
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.4.20",
+    "electron": "^33.3.0",
+    "electron-builder": "^25.1.8",
+    "electron-vite": "^2.3.0",
+    "eslint": "^8.57.1",
+    "eslint-plugin-react": "^7.37.3",
+    "eslint-plugin-react-hooks": "^5.1.0",
+    "postcss": "^8.4.49",
+    "prettier": "^3.4.2",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "tailwindcss": "^3.4.17",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vite": "^5.4.11",
+    "vitest": "^2.1.8"
+  }
+}

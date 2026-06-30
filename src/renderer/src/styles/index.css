@@ -1,0 +1,65 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * IBM Plex fonts are bundled locally at packaging time into resources/fonts
+ * and copied next to the renderer build. Until then we fall back gracefully.
+ * TODO(packaging): add @fontsource/ibm-plex-sans + @fontsource/ibm-plex-mono
+ * and import them here so font-src stays 'self'.
+ */
+
+:root {
+  --bg-app: #0a0f1c;
+  --bg-panel: #0c1322;
+  --bg-panel-alt: #0d1526;
+  --bg-sidebar: #101a2e;
+  --bg-elevated: #1c2740;
+  --bg-input: #1a2540;
+  --accent-blue: #4d7cfe;
+  --accent-green: #34d399;
+  --accent-amber: #f5b942;
+  --accent-red: #f56565;
+  --text-primary: #eef2fa;
+  --text-muted: #8593ad;
+  --border-default: rgba(255, 255, 255, 0.08);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg-app);
+  color: var(--text-primary);
+  font-family: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  overflow: hidden;
+}
+
+/* draggable region for the custom titlebar */
+.drag-region {
+  -webkit-app-region: drag;
+}
+.no-drag {
+  -webkit-app-region: no-drag;
+}
+
+/* thin dark scrollbars to match the theme */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--bg-elevated);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}

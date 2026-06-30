@@ -1,0 +1,13 @@
+node_modules
+out
+dist
+release
+*.log
+.DS_Store
+
+# Sidecar binaries are downloaded by scripts/download-cores.ts, never committed
+resources/bin/
+
+# Local env / secrets
+.env
+.env.local
