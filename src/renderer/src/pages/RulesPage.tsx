@@ -83,6 +83,7 @@ export function RulesPage() {
   return (
     <div className="flex h-full flex-col">
       <PageHeader
+        overline="Маршрутизация"
         title="Правила"
         subtitle="Маршрутизация по процессам и доменам. Порядок важен — побеждает первое совпадение."
         actions={

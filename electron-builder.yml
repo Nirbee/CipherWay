@@ -17,6 +17,9 @@ extraResources:
     to: bin
     filter:
       - '**/*'
+  # app icon, loaded at runtime as the BrowserWindow/taskbar icon
+  - from: build/icon.ico
+    to: icon.ico
 
 asarUnpack:
   - resources/bin/**
@@ -29,6 +32,7 @@ win:
   # no spaces in the artifact name — GitHub rewrites spaces to dots on upload,
   # which would break the latest.yml -> asset URL match used by the updater.
   artifactName: CipherWay-VPN-${version}-setup.${ext}
+  icon: build/icon.ico
   # Skip rcedit/signtool (the winCodeSign package) — not signing yet, and its
   # macOS symlinks can't be extracted without Developer Mode/admin. Re-enable
   # once a code-signing certificate is configured (see TODO below).
@@ -45,6 +49,9 @@ nsis:
   allowToChangeInstallationDirectory: true
   createDesktopShortcut: true
   createStartMenuShortcut: true
+  installerIcon: build/icon.ico
+  uninstallerIcon: build/icon.ico
+  installerHeaderIcon: build/icon.ico
 
 # electron-updater feed — GitHub Releases (https://github.com/Nirbee/CipherWay).
 # Switch provider to 'generic' + url if you later move to a self-hosted server.
@@ -52,3 +59,6 @@ publish:
   provider: github
   owner: Nirbee
   repo: CipherWay
+  # publish immediately (not as a draft) so the updater sees it; electron-builder
+  # auto-creates the v<version> tag and uploads setup.exe + latest.yml + blockmap.
+  releaseType: release

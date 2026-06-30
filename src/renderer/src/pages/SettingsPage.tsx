@@ -1,4 +1,4 @@
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { PageHeader } from '../components/PageHeader'
 import { Button, Card, Toggle } from '../components/ui'
 import { useSettings } from '../store/settingsStore'
@@ -9,9 +9,11 @@ import { cn } from '../lib/cn'
 export function SettingsPage() {
   const { settings, load, update } = useSettings()
   const logs = useLogs((s) => s.entries)
+  const [version, setVersion] = useState('')
 
   useEffect(() => {
     void load()
+    void window.api.app.getVersion().then(setVersion)
   }, [load])
 
   if (!settings) return null
@@ -29,7 +31,7 @@ export function SettingsPage() {
 
   return (
     <div className="flex h-full flex-col overflow-y-auto">
-      <PageHeader title="Настройки" />
+      <PageHeader overline="Конфигурация" title="Настройки" />
 
       <div className="space-y-5 px-6 pb-8">
         {/* proxy mode */}
@@ -88,7 +90,7 @@ export function SettingsPage() {
         {/* updates */}
         <Section title="Обновления">
           <Row label="Версия приложения" hint="CipherWay VPN">
-            <span className="font-mono text-sm text-text-secondary">v0.1.0</span>
+            <span className="font-mono text-sm text-text-secondary">{version ? `v${version}` : '—'}</span>
           </Row>
           <UpdaterControls />
         </Section>

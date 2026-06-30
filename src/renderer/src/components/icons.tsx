@@ -103,3 +103,11 @@ export const PowerIcon = (p: P) => (
     <path d="M6.3 7.3a8 8 0 1 0 11.4 0" />
   </svg>
 )
+
+export const UpdateIcon = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M12 3v12" />
+    <path d="M8 11l4 4 4-4" />
+    <path d="M5 19h14" />
+  </svg>
+)

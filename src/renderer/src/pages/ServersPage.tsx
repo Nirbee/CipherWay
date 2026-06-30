@@ -35,6 +35,7 @@ export function ServersPage() {
   return (
     <div className="flex h-full flex-col">
       <PageHeader
+        overline="Локации"
         title="Серверы"
         subtitle={data ? `${outbounds.length} нод в подписке` : 'Подписка не загружена'}
         actions={

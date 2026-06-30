@@ -9,6 +9,9 @@ function subscribe(channel: string, cb: (...args: unknown[]) => void): () => voi
 }
 
 const api: ExposedApi = {
+  app: {
+    getVersion: () => ipcRenderer.invoke(IPC.appGetVersion)
+  },
   window: {
     minimize: () => ipcRenderer.send(IPC.windowMinimize),
     maximize: () => ipcRenderer.send(IPC.windowMaximize),
@@ -50,7 +53,8 @@ const api: ExposedApi = {
     status: (cb) => subscribe(IPC.evtStatus, (p) => cb(p as never)),
     traffic: (cb) => subscribe(IPC.evtTraffic, (p) => cb(p as never)),
     log: (cb) => subscribe(IPC.evtLog, (p) => cb(p as never)),
-    updater: (cb) => subscribe(IPC.evtUpdater, (p) => cb(p as never))
+    updater: (cb) => subscribe(IPC.evtUpdater, (p) => cb(p as never)),
+    windowMaximized: (cb) => subscribe(IPC.evtWindowMaximized, (p) => cb(p as never))
   }
 }
 

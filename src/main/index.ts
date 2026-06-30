@@ -9,14 +9,18 @@ let mainWindow: BrowserWindow | null = null
 
 function createWindow(): void {
   mainWindow = new BrowserWindow({
-    width: 1100,
-    height: 720,
-    minWidth: 940,
-    minHeight: 600,
+    width: 1140,
+    height: 740,
+    minWidth: 960,
+    minHeight: 620,
     show: false,
     frame: false, // custom titlebar — see renderer TitleBar component
-    backgroundColor: '#0a0f1c',
+    transparent: true, // rounded window corners via CSS on the app shell
+    backgroundColor: '#00000000',
     title: 'CipherWay VPN',
+    icon: app.isPackaged
+      ? join(process.resourcesPath, 'icon.ico')
+      : join(process.cwd(), 'build', 'icon.ico'),
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false, // node APIs needed in preload bridge; isolation still on
@@ -26,6 +30,11 @@ function createWindow(): void {
   })
 
   mainWindow.on('ready-to-show', () => mainWindow?.show())
+
+  // notify renderer about maximize state so it can square off the corners
+  const sendMaxState = (v: boolean): void => mainWindow?.webContents.send(IPC.evtWindowMaximized, v)
+  mainWindow.on('maximize', () => sendMaxState(true))
+  mainWindow.on('unmaximize', () => sendMaxState(false))
 
   // open external links in the system browser, never in-app
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {

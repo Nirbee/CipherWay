@@ -13,11 +13,15 @@ import type {
 } from './types'
 
 export const IPC = {
+  // app
+  appGetVersion: 'app:getVersion',
+
   // window controls
   windowMinimize: 'window:minimize',
   windowMaximize: 'window:maximize',
   windowClose: 'window:close',
   windowIsMaximized: 'window:isMaximized',
+  evtWindowMaximized: 'evt:windowMaximized',
 
   // connection
   connect: 'vpn:connect',
@@ -66,6 +70,9 @@ export interface UpdaterEvent {
 
 /** The typed surface bridged into the renderer via contextBridge. */
 export interface ExposedApi {
+  app: {
+    getVersion: () => Promise<string>
+  }
   window: {
     minimize: () => void
     maximize: () => void
@@ -108,6 +115,7 @@ export interface ExposedApi {
     traffic: (cb: (s: TrafficStats) => void) => () => void
     log: (cb: (e: LogEntry) => void) => () => void
     updater: (cb: (e: UpdaterEvent) => void) => () => void
+    windowMaximized: (cb: (maximized: boolean) => void) => () => void
   }
 }
 

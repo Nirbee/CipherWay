@@ -1,6 +1,6 @@
 {
   "name": "cipherway-vpn",
-  "version": "0.1.0",
+  "version": "0.2.2",
   "description": "CipherWay VPN — Windows desktop client (Remnawave / XRAY VLESS+REALITY / Hysteria2)",
   "author": "CipherWay",
   "license": "UNLICENSED",
@@ -16,7 +16,8 @@
     "test:watch": "vitest",
     "download:cores": "tsx scripts/download-cores.ts",
     "postinstall": "electron-builder install-app-deps",
-    "pack:win": "npm run build && electron-builder --win --x64"
+    "pack:win": "npm run build && electron-builder --win --x64",
+    "release": "npm run build && electron-builder --win --x64 --publish always"
   },
   "dependencies": {
     "electron-store": "^8.2.0",
@@ -38,6 +39,8 @@
     "eslint": "^8.57.1",
     "eslint-plugin-react": "^7.37.3",
     "eslint-plugin-react-hooks": "^5.1.0",
+    "jimp": "^0.22.12",
+    "png-to-ico": "^2.1.8",
     "postcss": "^8.4.49",
     "prettier": "^3.4.2",
     "react": "^18.3.1",

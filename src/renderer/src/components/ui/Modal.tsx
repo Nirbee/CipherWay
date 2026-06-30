@@ -23,12 +23,12 @@ export function Modal({ open, onClose, title, children, footer, width = 'max-w-l
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6"
+      className="animate-fade fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6 backdrop-blur-sm"
       onMouseDown={onClose}
     >
       <div
         className={cn(
-          'w-full overflow-hidden rounded-card border border-border-default bg-bg-panel shadow-2xl',
+          'animate-scale-in w-full overflow-hidden rounded-card border border-border-default bg-bg-panel shadow-2xl',
           width
         )}
         onMouseDown={(e) => e.stopPropagation()}

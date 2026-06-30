@@ -32,8 +32,8 @@ export default {
           faint: '#5b6880'
         },
         border: {
-          subtle: 'rgba(255,255,255,0.06)',
-          DEFAULT: 'rgba(255,255,255,0.08)'
+          subtle: 'rgba(52,211,153,0.12)',
+          DEFAULT: 'rgba(52,211,153,0.22)'
         }
       },
       fontFamily: {
@@ -41,8 +41,11 @@ export default {
         mono: ['"IBM Plex Mono"', 'ui-monospace', 'monospace']
       },
       borderRadius: {
-        card: '18px',
+        card: '20px',
         pill: '999px'
+      },
+      transitionTimingFunction: {
+        spring: 'cubic-bezier(0.22, 1, 0.36, 1)'
       }
     }
   },

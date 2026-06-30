@@ -29,6 +29,7 @@ export function LogsPage() {
   return (
     <div className="flex h-full flex-col">
       <PageHeader
+        overline="Диагностика"
         title="Логи"
         subtitle="Вывод ядра sing-box и приложения"
         actions={

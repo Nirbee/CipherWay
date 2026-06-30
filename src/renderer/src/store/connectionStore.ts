@@ -7,6 +7,7 @@ interface ConnectionStore {
   message?: string
   traffic: TrafficStats
   globalMode: boolean // true = global, false = split-tunnel
+  connectedAt: number | null // ms timestamp when the tunnel came up
   setStatus: (s: StatusUpdate) => void
   setTraffic: (t: TrafficStats) => void
   setGlobalMode: (v: boolean) => void
@@ -25,7 +26,19 @@ export const useConnection = create<ConnectionStore>((set, get) => ({
   state: 'disconnected',
   traffic: ZERO_TRAFFIC,
   globalMode: false,
-  setStatus: (s) => set({ state: s.state, activeOutboundId: s.activeOutboundId, message: s.message }),
+  connectedAt: null,
+  setStatus: (s) =>
+    set((prev) => ({
+      state: s.state,
+      activeOutboundId: s.activeOutboundId,
+      message: s.message,
+      connectedAt:
+        s.state === 'connected'
+          ? (prev.connectedAt ?? Date.now())
+          : s.state === 'connecting'
+            ? prev.connectedAt
+            : null
+    })),
   setTraffic: (t) => set({ traffic: t }),
   setGlobalMode: (v) => set({ globalMode: v }),
   connect: async (outboundId) => {

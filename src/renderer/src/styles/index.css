@@ -3,10 +3,8 @@
 @tailwind utilities;
 
 /*
- * IBM Plex fonts are bundled locally at packaging time into resources/fonts
- * and copied next to the renderer build. Until then we fall back gracefully.
- * TODO(packaging): add @fontsource/ibm-plex-sans + @fontsource/ibm-plex-mono
- * and import them here so font-src stays 'self'.
+ * IBM Plex fonts are bundled locally at packaging time. Until then we fall back
+ * gracefully. TODO(packaging): add @fontsource/ibm-plex-sans + -mono.
  */
 
 :root {
@@ -22,7 +20,7 @@
   --accent-red: #f56565;
   --text-primary: #eef2fa;
   --text-muted: #8593ad;
-  --border-default: rgba(255, 255, 255, 0.08);
+  --border-default: rgba(52, 211, 153, 0.22);
 }
 
 html,
@@ -33,12 +31,27 @@ body,
 
 body {
   margin: 0;
-  background: var(--bg-app);
+  /* window is transparent — the rounded .app-shell paints the background */
+  background: transparent;
   color: var(--text-primary);
   font-family: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
   -webkit-font-smoothing: antialiased;
   user-select: none;
   overflow: hidden;
+}
+
+/* rounded, bordered application shell (gives the window rounded corners) */
+.app-shell {
+  height: 100vh;
+  background: var(--bg-app);
+  border: 1px solid rgba(52, 211, 153, 0.22);
+  border-radius: 16px;
+  overflow: hidden;
+  transition: border-radius 0.18s ease;
+}
+.app-shell.maximized {
+  border-radius: 0;
+  border-color: transparent;
 }
 
 /* draggable region for the custom titlebar */
@@ -62,4 +75,70 @@ body {
 }
 ::-webkit-scrollbar-track {
   background: transparent;
+}
+
+/* ---- animations -------------------------------------------------------- */
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@keyframes scale-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+@keyframes ring-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes pulse-soft {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+@keyframes glow-breathe {
+  0%,
+  100% {
+    box-shadow: 0 0 24px 2px rgba(52, 211, 153, 0.25);
+  }
+  50% {
+    box-shadow: 0 0 40px 6px rgba(52, 211, 153, 0.45);
+  }
+}
+
+.animate-page {
+  animation: fade-in-up 0.32s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.animate-fade {
+  animation: fade-in 0.25s ease both;
+}
+.animate-scale-in {
+  animation: scale-in 0.2s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.animate-glow {
+  animation: glow-breathe 3s ease-in-out infinite;
 }

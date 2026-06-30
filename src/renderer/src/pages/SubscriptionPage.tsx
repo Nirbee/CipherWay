@@ -73,7 +73,7 @@ export function SubscriptionPage() {
 
   return (
     <div className="flex h-full flex-col overflow-y-auto">
-      <PageHeader title="Подписка" subtitle="Управление подпиской Remnawave" />
+      <PageHeader overline="Тарифы" title="Подписка" subtitle="Управление подпиской Remnawave" />
 
       <div className="space-y-5 px-6 pb-8">
         {/* subscription URL */}

@@ -69,6 +69,8 @@ export function registerIpcHandlers(getWindow: GetWindow): void {
   const send = (channel: string, payload: unknown): void =>
     getWindow()?.webContents.send(channel, payload)
 
+  ipcMain.handle(IPC.appGetVersion, () => app.getVersion())
+
   const manager = new SidecarManager(
     (entry) => send(IPC.evtLog, entry),
     (state, message) => {
