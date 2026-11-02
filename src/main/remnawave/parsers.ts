@@ -57,6 +57,7 @@ export function parseVless(uri: string): OutboundConfig | null {
     port: Number(url.port) || 443,
     uuid: decodeURIComponent(url.username),
     flow: q.get('flow') || undefined,
+    encryption: q.get('encryption') || undefined,
     security,
     publicKey: q.get('pbk') || undefined,
     shortId: q.get('sid') || undefined,

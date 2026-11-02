@@ -1,7 +1,7 @@
 # CipherWay VPN
 
 Windows desktop VPN client (Electron + React + TypeScript) for Remnawave-based
-infrastructure. Supports XRAY (VLESS + REALITY) and Hysteria2, with per-process
+infrastructure. Supports VLESS + REALITY (via Xray-core) and Hysteria2, with per-process
 and per-domain routing rules in the style of Clash / Koala Clash.
 
 ## Stack
@@ -11,15 +11,20 @@ and per-domain routing rules in the style of Clash / Koala Clash.
 - **Zustand** — state
 - **Tailwind CSS** — styling (design tokens in `tailwind.config.ts`)
 - **electron-builder** + **electron-updater** — packaging & auto-update
-- Core: `sing-box.exe` (SagerNet/sing-box) — single engine handling VLESS+REALITY,
-  Hysteria2 and per-process routing natively; `wintun.dll` for the TUN inbound
+- Cores (since 0.3.0 — two processes):
+  - `xray.exe` (XTLS/Xray-core, pinned to **26.7.28** — the same series as the
+    nodes) carries the **VLESS + REALITY / TLS** connections to the servers;
+  - `sing-box.exe` (SagerNet/sing-box 1.13.x) does **TUN / system proxy,
+    per-process & per-domain rules, DNS and Hysteria2**;
+  - `wintun.dll` for the TUN inbound
 
 ## Project layout
 
 ```
 src/
   main/        Electron main process
-    core/      xray-core / hysteria2 sidecar orchestration
+    core/      sidecar orchestration (xray + sing-box), config generators
+    remnawave/ subscription client, link parsers, HWID headers, stub detection
     rules/     routing rules -> core config compiler
     ipc/       IPC handlers (zod-validated)
     updater/   electron-updater logic
@@ -27,16 +32,21 @@ src/
   renderer/    React app (pages, components, store, styles)
   shared/      types + IPC contract shared by main and renderer
 resources/
-  bin/         sing-box.exe / wintun.dll — downloaded, NOT committed
+  bin/         sing-box.exe / xray.exe / wintun.dll — downloaded, NOT committed
+  tray/        tray icons (connected / disconnected)
+build/
+  installer.nsh       NSIS hook: registers the cipherway:// URL scheme
 scripts/
-  download-cores.ts   fetches+verifies sing-box + wintun
+  download-cores.ts   fetches+verifies sing-box + xray + wintun
+  make-tray-icons.cjs regenerates resources/tray/*.ico
 ```
 
 ## Develop
 
 ```bash
 npm install
-npm run download:cores   # fetch xray.exe / hysteria.exe into resources/bin
+npm run download:cores   # fetch sing-box.exe, xray.exe, wintun.dll into resources/bin
+npm run download:cores -- xray   # only one core (names: singbox, xray, wintun)
 npm run dev              # launch the app in dev mode
 ```
 
@@ -96,3 +106,54 @@ TUN requires admin: connecting in TUN mode launches the core through an elevated
 broker (one UAC prompt); disconnecting signals the broker via a stop-file (no
 second prompt).
 ```
+
+## Connection chain (0.3.0+)
+
+```
+apps -> sing-box (TUN "CipherWay" or mixed 127.0.0.1) -- rules / DNS --
+     -> VLESS node:     socks 127.0.0.1:<random port> -> xray (one SOCKS inbound
+                        per node, loopback only, UDP on) -> VLESS+REALITY -> node
+     -> Hysteria2 node: native sing-box outbound
+     -> direct / reject
+```
+
+- xray starts **before** sing-box and stops **after** it; if xray dies the whole
+  connection is stopped with an error (no silent fallback to direct). xray output
+  goes to the «Журнал» screen with source `XRAY`.
+- TUN loop guard: `process_name: xray.exe -> direct` is the first route rule, node
+  host names are resolved by the direct DNS server, `auto_detect_interface` binds
+  `direct` to the physical NIC.
+- Configs are validated in tests against the real binaries (`sing-box check`,
+  `xray run -test -c`) when `resources/bin` is populated.
+
+## Subscription fetch / HWID
+
+The client sends the Remnawave HWID headers (docs.rw → HWID Device Limit):
+`x-hwid` (salted SHA-256 of the Windows MachineGuid, 32 hex — the GUID itself is
+never sent), `x-device-os: Windows`, `x-ver-os` (Windows build), `x-device-model`
+(WMI manufacturer + model or `PC`), `User-Agent: CipherWay/<version> (Windows)`.
+That UA does not match the panel's clash/mihomo rules, so the panel returns the
+plain link list (XRAY_BASE64). Response headers `x-hwid-max-devices-reached` /
+`x-hwid-limit` / `x-hwid-not-supported` and placeholder servers (`0.0.0.0:1`,
+«App not supported», «лимит устройств») are turned into a readable Russian error.
+
+## cipherway:// links
+
+```
+cipherway://import?url=<urlencoded https subscription URL>
+cipherway://install-config?url=<...>      (Clash / Koala Clash style alias)
+```
+
+Only `https` subscriptions are accepted. The app asks «Добавить подписку с
+<домен>?» and never connects by itself. The scheme is registered by the NSIS
+installer (`build/installer.nsh`) and again at runtime
+(`app.setAsDefaultProtocolClient`; in dev only with `CIPHERWAY_DEV_PROTOCOL=1`).
+A second launch (including via a link) hands its arguments to the running copy
+(single-instance lock) and exits.
+
+## Tray
+
+Closing the window hides it to the tray — the VPN keeps running (a one-time
+notification says so). Tray menu: «Открыть», «Подключить/Отключить», «Выход»
+(stops the cores and reverts the system proxy). Double click opens the window;
+the icon differs for connected / disconnected.

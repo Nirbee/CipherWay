@@ -1,6 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { mkdir, open, rm, writeFile, stat } from 'node:fs/promises'
+import { connect } from 'node:net'
 import { join } from 'node:path'
 import { app } from 'electron'
 import type {
@@ -12,6 +13,7 @@ import type {
   TrafficStats
 } from '@shared/types'
 import { generateSingboxConfig } from './configGen'
+import { generateXrayConfig, isXrayHandled, XRAY_EXE, type XrayBridge } from './xrayGen'
 import { findFreePort } from '../system/ports'
 import { disableSystemProxy, enableSystemProxy } from '../system/proxy'
 
@@ -27,9 +29,37 @@ export interface StartParams {
 }
 
 const MAX_RESTARTS = 5
+const XRAY_READY_TIMEOUT_MS = 8000
+
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+
+/** Resolves true once something accepts TCP connections on 127.0.0.1:port. */
+function probePort(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const sock = connect({ host: '127.0.0.1', port })
+    const done = (ok: boolean): void => {
+      sock.destroy()
+      resolve(ok)
+    }
+    sock.setTimeout(500, () => done(false))
+    sock.once('connect', () => done(true))
+    sock.once('error', () => done(false))
+  })
+}
+
+/** xray prints "2026/01/01 00:00:00.000000 [Warning] ..." — map to our levels. */
+function xrayLevel(line: string): LogEntry['level'] {
+  if (/\[Error\]|^panic/i.test(line)) return 'error'
+  if (/\[Warning\]/i.test(line)) return 'warn'
+  if (/\[Debug\]/i.test(line)) return 'debug'
+  return 'info'
+}
 
 /**
- * Drives a single sing-box core.
+ * Drives the cores: xray (VLESS connections, one loopback SOCKS inbound per
+ * node) and sing-box (TUN / system proxy, routing, DNS, Hysteria2).
+ * Order: xray starts before sing-box and stops after it. If xray dies while
+ * connected, everything is stopped with an error (no silent fallback).
  *  - System Proxy mode: sing-box spawned as a normal child (full stdio), the
  *    WinInet registry proxy points at its mixed inbound.
  *  - TUN mode: sing-box needs admin. We launch it through an elevated broker
@@ -38,6 +68,8 @@ const MAX_RESTARTS = 5
  */
 export class SidecarManager {
   private child: ChildProcess | null = null // system-proxy mode child
+  private xray: ChildProcess | null = null // xray-core child (always non-elevated)
+  private xrayTail: string[] = [] // last output lines, for error messages
   private restarts = 0
   private intentionalStop = false
   private mode: AppSettings['proxyMode'] = 'system'
@@ -73,8 +105,14 @@ export class SidecarManager {
   private exePath(): string {
     return join(this.binDir, 'sing-box.exe')
   }
+  private xrayExePath(): string {
+    return join(this.binDir, XRAY_EXE)
+  }
   private get configPath(): string {
     return join(this.runDir, 'config.json')
+  }
+  private get xrayConfigPath(): string {
+    return join(this.runDir, 'xray.json')
   }
   private get logPath(): string {
     return join(this.runDir, 'sing-box.log')
@@ -89,6 +127,8 @@ export class SidecarManager {
   }
 
   async start(p: StartParams): Promise<void> {
+    // a previous xray (e.g. auto-restart path) must be gone before ports are re-bound
+    await this.stopXray()
     this.intentionalStop = false
     this.restarts = 0
     this.lastParams = p
@@ -104,6 +144,12 @@ export class SidecarManager {
       this.onState('error', 'Не выбран сервер. Добавьте подписку и выберите ноду.')
       throw new Error('no active outbound')
     }
+    const xrayNodes = p.outbounds.filter(isXrayHandled)
+    if (xrayNodes.length > 0 && !existsSync(this.xrayExePath())) {
+      this.onState('error', 'xray.exe не найден — переустановите приложение')
+      this.log('error', 'app', `${XRAY_EXE} отсутствует в ${this.binDir}`)
+      throw new Error('xray.exe missing')
+    }
 
     await mkdir(this.runDir, { recursive: true })
     await rm(this.stopFile, { force: true }).catch(() => undefined)
@@ -111,6 +157,17 @@ export class SidecarManager {
 
     this.ports.http = await findFreePort(p.settings.httpPort)
     this.ports.clashApi = await findFreePort(0)
+
+    // one loopback SOCKS inbound per VLESS node, on random free ports
+    const bridges: XrayBridge[] = []
+    const taken = new Set([this.ports.http, this.ports.clashApi])
+    for (const o of xrayNodes) {
+      let port = await findFreePort(0)
+      while (taken.has(port)) port = await findFreePort(0)
+      taken.add(port)
+      bridges.push({ outbound: o, port })
+    }
+    const xrayPorts = Object.fromEntries(bridges.map((b) => [b.outbound.id, b.port]))
 
     const cfg = generateSingboxConfig({
       outbounds: p.outbounds,
@@ -121,9 +178,16 @@ export class SidecarManager {
       httpPort: this.ports.http,
       clashApiPort: this.ports.clashApi,
       logFile: this.logPath,
-      cacheFile: join(this.runDir, 'cache.db')
+      cacheFile: join(this.runDir, 'cache.db'),
+      xrayPorts
     })
     await writeFile(this.configPath, JSON.stringify(cfg, null, 2), 'utf8')
+
+    if (bridges.length > 0) {
+      const xcfg = generateXrayConfig(bridges)
+      await writeFile(this.xrayConfigPath, JSON.stringify(xcfg, null, 2), 'utf8')
+      await this.startXray(bridges.map((b) => b.port))
+    }
 
     if (this.mode === 'tun') {
       await this.startElevated()
@@ -136,6 +200,70 @@ export class SidecarManager {
     this.startLogTail()
     this.startTrafficPolling()
     this.onState('connected')
+  }
+
+  /**
+   * Starts xray-core and waits until its first SOCKS inbound accepts
+   * connections. Throws (with a readable reason) if xray exits or times out.
+   */
+  private async startXray(ports: number[]): Promise<void> {
+    this.xrayTail = []
+    const proc = spawn(this.xrayExePath(), ['run', '-c', this.xrayConfigPath], {
+      cwd: this.binDir,
+      windowsHide: true
+    })
+    this.xray = proc
+    let exited = false
+    const onData = (d: Buffer): void => {
+      for (const raw of d.toString().split(/\r?\n/)) {
+        const line = raw.trim()
+        if (!line) continue
+        this.xrayTail = [...this.xrayTail.slice(-4), line]
+        this.log(xrayLevel(line), 'xray', line)
+      }
+    }
+    proc.stdout?.on('data', onData)
+    proc.stderr?.on('data', onData)
+    proc.on('error', (err) =>
+      this.log('error', 'xray', `Не удалось запустить xray: ${err.message}`)
+    )
+    proc.on('exit', (code) => {
+      exited = true
+      if (this.xray !== proc) return // stopped on purpose / replaced
+      this.xray = null
+      this.log('error', 'xray', `xray завершился (code=${code})`)
+      if (this.intentionalStop) return
+      // xray died while connected: tear everything down and show why
+      const reason = this.xrayTail.at(-1)
+      const msg = `Ядро Xray остановилось (код ${code ?? '?'}), соединение разорвано.${reason ? ` ${reason}` : ''}`
+      void this.stop(true).then(() => this.onState('error', msg))
+    })
+    this.log('info', 'app', `Запуск xray: узлов VLESS — ${ports.length}, вход 127.0.0.1`)
+
+    const deadline = Date.now() + XRAY_READY_TIMEOUT_MS
+    while (Date.now() < deadline && !exited) {
+      if (await probePort(ports[0])) return
+      await sleep(150)
+    }
+    const reason = this.xrayTail.at(-1) ?? 'нет ответа'
+    await this.stopXray()
+    this.onState('error', `Не удалось запустить ядро Xray: ${reason}`)
+    throw new Error('xray failed to start')
+  }
+
+  private async stopXray(): Promise<void> {
+    const proc = this.xray
+    if (!proc) return
+    this.xray = null // the exit handler ignores a process we stop ourselves
+    if (proc.exitCode !== null) return
+    await new Promise<void>((resolve) => {
+      const t = setTimeout(resolve, 2000)
+      proc.once('exit', () => {
+        clearTimeout(t)
+        resolve()
+      })
+      proc.kill()
+    })
   }
 
   /** System-proxy mode: normal child process with captured stdio. */
@@ -225,11 +353,15 @@ Remove-Item $stop -ErrorAction SilentlyContinue
     if (this.mode === 'tun') {
       // signal the elevated broker to kill sing-box
       await writeFile(this.stopFile, '1', 'utf8').catch(() => undefined)
+      // the broker deletes the stop-file once sing-box is gone
+      for (let i = 0; i < 20 && existsSync(this.stopFile); i++) await sleep(150)
     } else {
       this.child?.kill()
       this.child = null
       await disableSystemProxy().catch(() => undefined)
     }
+    // xray goes down after sing-box, so traffic never falls through to direct
+    await this.stopXray()
 
     if (!keepIntent) {
       this.totals = { uploadSpeed: 0, downloadSpeed: 0, totalUpload: 0, totalDownload: 0 }

@@ -44,6 +44,9 @@ const api: ExposedApi = {
     get: () => ipcRenderer.invoke(IPC.settingsGet),
     set: (patch) => ipcRenderer.invoke(IPC.settingsSet, patch)
   },
+  deeplink: {
+    takePending: () => ipcRenderer.invoke(IPC.deeplinkTakePending)
+  },
   updater: {
     check: () => ipcRenderer.invoke(IPC.updaterCheck),
     download: () => ipcRenderer.invoke(IPC.updaterDownload),
@@ -54,7 +57,8 @@ const api: ExposedApi = {
     traffic: (cb) => subscribe(IPC.evtTraffic, (p) => cb(p as never)),
     log: (cb) => subscribe(IPC.evtLog, (p) => cb(p as never)),
     updater: (cb) => subscribe(IPC.evtUpdater, (p) => cb(p as never)),
-    windowMaximized: (cb) => subscribe(IPC.evtWindowMaximized, (p) => cb(p as never))
+    windowMaximized: (cb) => subscribe(IPC.evtWindowMaximized, (p) => cb(p as never)),
+    importRequest: (cb) => subscribe(IPC.evtImportRequest, () => cb())
   }
 }
 

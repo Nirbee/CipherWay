@@ -10,6 +10,7 @@ export interface SbRouteRule {
   domain_suffix?: string[]
   domain_keyword?: string[]
   ip_cidr?: string[]
+  ip_is_private?: boolean
   process_name?: string[]
   process_path?: string[]
   rule_set?: string[]

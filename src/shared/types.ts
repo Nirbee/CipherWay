@@ -16,6 +16,8 @@ export interface OutboundConfig {
   // VLESS / REALITY
   uuid?: string
   flow?: string
+  /** VLESS `encryption` param (usually "none") */
+  encryption?: string
   security?: 'reality' | 'tls' | 'none'
   publicKey?: string
   shortId?: string
@@ -118,8 +120,14 @@ export interface StatusUpdate {
 export interface LogEntry {
   ts: number
   level: 'info' | 'warn' | 'error' | 'debug'
-  source: 'app' | 'singbox'
+  source: 'app' | 'singbox' | 'xray'
   message: string
+}
+
+/** A validated cipherway:// subscription import, awaiting user confirmation. */
+export interface ImportRequest {
+  url: string
+  host: string
 }
 
 export interface ServerPing {

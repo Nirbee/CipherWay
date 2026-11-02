@@ -11,3 +11,6 @@ resources/bin/
 # Local env / secrets
 .env
 .env.local
+
+# graphify (local knowledge graph)
+graphify-out/

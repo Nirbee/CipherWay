@@ -3,6 +3,7 @@
 
 import type {
   AppSettings,
+  ImportRequest,
   LogEntry,
   RoutingRule,
   RulesConfig,
@@ -49,6 +50,9 @@ export const IPC = {
   settingsGet: 'settings:get',
   settingsSet: 'settings:set',
 
+  // cipherway:// deep links (import a subscription)
+  deeplinkTakePending: 'deeplink:takePending',
+
   // updater
   updaterCheck: 'updater:check',
   updaterDownload: 'updater:download',
@@ -58,7 +62,9 @@ export const IPC = {
   evtStatus: 'evt:status',
   evtTraffic: 'evt:traffic',
   evtLog: 'evt:log',
-  evtUpdater: 'evt:updater'
+  evtUpdater: 'evt:updater',
+  /** payload-less ping: a deep-link import is pending, call deeplink.takePending() */
+  evtImportRequest: 'evt:importRequest'
 } as const
 
 export interface UpdaterEvent {
@@ -105,6 +111,10 @@ export interface ExposedApi {
     get: () => Promise<AppSettings>
     set: (patch: Partial<AppSettings>) => Promise<AppSettings>
   }
+  deeplink: {
+    /** returns (and clears) the pending cipherway:// import, if any */
+    takePending: () => Promise<ImportRequest | null>
+  }
   updater: {
     check: () => Promise<void>
     download: () => Promise<void>
@@ -116,6 +126,7 @@ export interface ExposedApi {
     log: (cb: (e: LogEntry) => void) => () => void
     updater: (cb: (e: UpdaterEvent) => void) => () => void
     windowMaximized: (cb: (maximized: boolean) => void) => () => void
+    importRequest: (cb: () => void) => () => void
   }
 }
 

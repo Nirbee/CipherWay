@@ -48,6 +48,8 @@ function matcher(rule: RoutingRule, ruleSets: Map<string, SbRuleSet>): SbRouteRu
       return { rule_set: [rs.tag] }
     }
     case 'GeoIP': {
+      // no upstream geoip-private set; sing-box has a built-in matcher
+      if (rule.value.trim().toLowerCase() === 'private') return { ip_is_private: true }
       const rs = geoipRuleSet(rule.value)
       ruleSets.set(rs.tag, rs)
       return { rule_set: [rs.tag] }
@@ -85,14 +87,15 @@ export function compileRules(
   if (config.defaultBehavior === 'direct') {
     final = TAG_DIRECT
   } else if (config.defaultBehavior === 'auto') {
-    // Russian IPs/sites direct, everything else through the proxy
+    // LAN + Russian IPs/sites direct, everything else through the proxy.
+    // (SagerNet/sing-geoip has no "private" set — a 404 there stops sing-box
+    // at startup — so LAN uses the built-in ip_is_private matcher.)
     const ruRs = geoipRuleSet('ru')
-    const privRs = geoipRuleSet('private')
     const siteRs = geositeRuleSet('category-ru')
     ruleSets.set(ruRs.tag, ruRs)
-    ruleSets.set(privRs.tag, privRs)
     ruleSets.set(siteRs.tag, siteRs)
-    rules.push({ rule_set: [privRs.tag, ruRs.tag], action: 'route', outbound: TAG_DIRECT })
+    rules.push({ ip_is_private: true, action: 'route', outbound: TAG_DIRECT })
+    rules.push({ rule_set: [ruRs.tag], action: 'route', outbound: TAG_DIRECT })
     rules.push({ rule_set: [siteRs.tag], action: 'route', outbound: TAG_DIRECT })
     final = proxyTag
   }

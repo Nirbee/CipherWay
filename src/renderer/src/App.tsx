@@ -11,6 +11,7 @@ import { ServersPage } from './pages/ServersPage'
 import { LogsPage } from './pages/LogsPage'
 import { SubscriptionPage } from './pages/SubscriptionPage'
 import { SettingsPage } from './pages/SettingsPage'
+import { ImportSubscriptionDialog } from './components/ImportSubscriptionDialog'
 import { cn } from './lib/cn'
 
 export default function App() {
@@ -47,6 +48,7 @@ export default function App() {
   return (
     <div className={cn('app-shell flex text-text-primary', maximized && 'maximized')}>
       <Sidebar />
+      <ImportSubscriptionDialog />
       <div className="flex min-w-0 flex-1 flex-col">
         <TitleBar />
         <main className="min-h-0 flex-1 overflow-y-auto">

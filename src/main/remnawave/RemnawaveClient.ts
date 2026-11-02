@@ -1,7 +1,21 @@
+import { randomUUID } from 'node:crypto'
+import { app } from 'electron'
 import type { SubscriptionData } from '@shared/types'
 import { store } from '../store'
 import { getSubscriptionUrl, setSubscriptionUrl } from '../secrets'
 import { parseOutbounds } from './parsers'
+import { buildSubscriptionHeaders, getDeviceInfo } from './device'
+import { filterSubscription, httpStatusError, hwidHeaderError } from './subscriptionGuard'
+
+/** Persistent random id, used for x-hwid only if MachineGuid is unreadable. */
+function fallbackDeviceId(): string {
+  let id = store.get('deviceIdFallback')
+  if (!id) {
+    id = randomUUID()
+    store.set('deviceIdFallback', id)
+  }
+  return id
+}
 
 /**
  * Parses the standard `subscription-userinfo` header that most panels
@@ -41,22 +55,22 @@ export class RemnawaveClient {
 
   /** Fetch a subscription by URL, parse outbounds, persist URL + cache. */
   async fetchSubscription(url: string): Promise<SubscriptionData> {
+    const device = await getDeviceInfo(fallbackDeviceId)
     const res = await fetch(url, {
-      headers: {
-        // request the raw link list; Remnawave honours common UAs
-        'User-Agent': 'CipherWay/1.0 (clash; xray)',
-        Accept: '*/*'
-      },
+      // "CipherWay/<ver> (Windows)" doesn't match the panel's clash/mihomo UA
+      // rules, so Remnawave answers with the plain link list (XRAY_BASE64).
+      headers: buildSubscriptionHeaders(device, app.getVersion()),
       redirect: 'follow'
     })
-    if (!res.ok) {
-      throw new Error(`Подписка недоступна: ${res.status} ${res.statusText}`)
-    }
+    // HWID verdict first: on a device-limit hit the body is only a stub
+    const hwidError = hwidHeaderError((n) => res.headers.get(n))
+    if (hwidError) throw new Error(hwidError)
+    if (!res.ok) throw new Error(httpStatusError(res.status, res.statusText))
+
     const raw = await res.text()
-    const outbounds = parseOutbounds(raw)
-    if (outbounds.length === 0) {
-      throw new Error('В подписке не найдено ни одного профиля (VLESS/Hysteria2)')
-    }
+    const guarded = filterSubscription(parseOutbounds(raw))
+    if (guarded.error) throw new Error(guarded.error)
+    const outbounds = guarded.outbounds
 
     const data: SubscriptionData = {
       url,
@@ -71,6 +85,11 @@ export class RemnawaveClient {
     return data
   }
 
+  /** Warm the device-info cache (WMI query takes ~1–3 s on first call). */
+  prefetchDevice(): void {
+    void getDeviceInfo(fallbackDeviceId).catch(() => undefined)
+  }
+
   /** Refresh using the stored URL. Throws if no subscription configured. */
   async refreshSubscription(): Promise<SubscriptionData> {
     const url = getSubscriptionUrl()
@@ -80,7 +99,10 @@ export class RemnawaveClient {
 
   /** Cached subscription (may be stale / offline). */
   getCached(): SubscriptionData | null {
-    return store.get('subscriptionCache')
+    const data = store.get('subscriptionCache')
+    if (!data) return null
+    // caches written by ≤0.2.x may still hold panel placeholders (0.0.0.0:1)
+    return { ...data, outbounds: filterSubscription(data.outbounds).outbounds }
   }
 
   /** Start periodic background refresh every N hours. */

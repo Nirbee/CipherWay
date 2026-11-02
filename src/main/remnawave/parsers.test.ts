@@ -42,6 +42,7 @@ describe('parseVless (REALITY)', () => {
     expect(o.serverName).toBe('www.microsoft.com')
     expect(o.fingerprint).toBe('chrome')
     expect(o.flow).toBe('xtls-rprx-vision')
+    expect(o.encryption).toBe('none')
   })
 
   it('rejects non-vless uris', () => {

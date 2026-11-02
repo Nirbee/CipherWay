@@ -8,6 +8,10 @@ interface Schema {
   activeOutboundId: string | null
   // subscription URL is stored separately, encrypted via safeStorage (see secrets.ts)
   subscriptionUrlEnc: string | null
+  /** random fallback for x-hwid when the Windows MachineGuid can't be read */
+  deviceIdFallback: string | null
+  /** «CipherWay работает в трее» notification already shown once */
+  trayHintShown: boolean
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -37,6 +41,8 @@ export const store = new Store<Schema>({
     rules: DEFAULT_RULES,
     subscriptionCache: null,
     activeOutboundId: null,
-    subscriptionUrlEnc: null
+    subscriptionUrlEnc: null,
+    deviceIdFallback: null,
+    trayHintShown: false
   }
 })

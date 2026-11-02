@@ -54,6 +54,17 @@ const settingsPatchSchema = z
 
 // runtime connection status, owned by the SidecarManager callbacks
 let status: StatusUpdate = { state: 'disconnected' }
+const statusListeners = new Set<(s: StatusUpdate) => void>()
+
+/** Subscribe to connection status changes (used by the tray). */
+export function onVpnStatus(cb: (s: StatusUpdate) => void): () => void {
+  statusListeners.add(cb)
+  return () => statusListeners.delete(cb)
+}
+
+export function getVpnStatus(): StatusUpdate {
+  return status
+}
 
 function buildStartParams() {
   const sub = remnawave.getCached()
@@ -65,17 +76,34 @@ function buildStartParams() {
   }
 }
 
+let connectImpl: ((outboundId?: string) => Promise<StatusUpdate>) | null = null
+let disconnectImpl: (() => Promise<StatusUpdate>) | null = null
+
+/** Connect / disconnect from outside the renderer (tray menu). */
+export function connectVpn(outboundId?: string): Promise<StatusUpdate> {
+  return connectImpl ? connectImpl(outboundId) : Promise.resolve(status)
+}
+export function disconnectVpn(): Promise<StatusUpdate> {
+  return disconnectImpl ? disconnectImpl() : Promise.resolve(status)
+}
+
 export function registerIpcHandlers(getWindow: GetWindow): void {
-  const send = (channel: string, payload: unknown): void =>
-    getWindow()?.webContents.send(channel, payload)
+  const send = (channel: string, payload: unknown): void => {
+    const win = getWindow()
+    if (win && !win.isDestroyed()) win.webContents.send(channel, payload)
+  }
+  const publish = (next: StatusUpdate): void => {
+    status = next
+    send(IPC.evtStatus, status)
+    for (const cb of statusListeners) cb(status)
+  }
 
   ipcMain.handle(IPC.appGetVersion, () => app.getVersion())
 
   const manager = new SidecarManager(
     (entry) => send(IPC.evtLog, entry),
     (state, message) => {
-      status = { state, activeOutboundId: store.get('activeOutboundId') ?? undefined, message }
-      send(IPC.evtStatus, status)
+      publish({ state, activeOutboundId: store.get('activeOutboundId') ?? undefined, message })
     },
     (traffic) => send(IPC.evtTraffic, traffic)
   )
@@ -84,21 +112,33 @@ export function registerIpcHandlers(getWindow: GetWindow): void {
   activeManager = manager
 
   // ---- connection --------------------------------------------------------
-  ipcMain.handle(IPC.connect, async (_e, outboundId?: string): Promise<StatusUpdate> => {
+  connectImpl = async (outboundId?: string): Promise<StatusUpdate> => {
     if (outboundId) store.set('activeOutboundId', z.string().parse(outboundId))
     try {
       await manager.start(buildStartParams())
     } catch (err) {
-      status = { state: 'error', message: err instanceof Error ? err.message : String(err) }
-      send(IPC.evtStatus, status)
+      // keep a more specific message the manager may already have published
+      if (status.state !== 'error') {
+        publish({ state: 'error', message: err instanceof Error ? err.message : String(err) })
+      }
     }
     return status
-  })
-
-  ipcMain.handle(IPC.disconnect, async (): Promise<StatusUpdate> => {
+  }
+  disconnectImpl = async (): Promise<StatusUpdate> => {
     await manager.stop()
     return status
-  })
+  }
+
+  ipcMain.handle(IPC.connect, async (_e, outboundId?: unknown) =>
+    connectImpl!(
+      z
+        .string()
+        .optional()
+        .parse(outboundId ?? undefined)
+    )
+  )
+
+  ipcMain.handle(IPC.disconnect, async () => disconnectImpl!())
 
   ipcMain.handle(IPC.getStatus, async () => status)
 

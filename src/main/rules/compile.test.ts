@@ -88,6 +88,9 @@ describe('compileRules (sing-box)', () => {
     const auto = compileRules(cfg({ defaultBehavior: 'auto' }), outbounds, 'ob_a')
     expect(auto.final).toBe('ob_a')
     expect(auto.ruleSets.some((r) => r.tag === 'geoip-ru')).toBe(true)
+    // no geoip-private rule-set (doesn't exist upstream); LAN via ip_is_private
+    expect(auto.ruleSets.some((r) => r.tag === 'geoip-private')).toBe(false)
+    expect(auto.rules).toContainEqual({ ip_is_private: true, action: 'route', outbound: 'direct' })
     expect(auto.rules.some((r) => r.rule_set?.includes('geoip-ru') && r.outbound === 'direct')).toBe(
       true
     )

@@ -31,7 +31,7 @@ export function LogsPage() {
       <PageHeader
         overline="Диагностика"
         title="Логи"
-        subtitle="Вывод ядра sing-box и приложения"
+        subtitle="Вывод ядер sing-box, Xray и приложения"
         actions={
           <>
             <Button variant="secondary" size="sm" onClick={copyAll} disabled={entries.length === 0}>
