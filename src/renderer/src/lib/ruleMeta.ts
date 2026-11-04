@@ -1,38 +1,78 @@
-import type { RuleConditionType } from '@shared/types'
+import type { DefaultBehavior, RuleConditionType } from '@shared/types'
 
 interface CondMeta {
   label: string
+  /** Clash type, shown as a hint for people coming from Koala / Clash */
+  clash: string
   placeholder: string
   tone: 'blue' | 'green' | 'amber' | 'neutral'
   mono?: boolean
+  hint?: string
 }
 
 export const CONDITION_META: Record<RuleConditionType, CondMeta> = {
-  ProcessName: { label: 'ProcessName', placeholder: 'firefox.exe', tone: 'blue', mono: true },
-  ProcessPath: {
-    label: 'ProcessPath',
-    placeholder: 'C:\\Users\\...\\Cursor.exe',
+  ProcessName: {
+    label: 'Программа',
+    clash: 'PROCESS-NAME',
+    placeholder: 'Telegram.exe',
     tone: 'blue',
     mono: true
   },
-  Domain: { label: 'Domain', placeholder: 'example.com', tone: 'green' },
-  DomainSuffix: { label: 'DomainSuffix', placeholder: 'google.com', tone: 'green' },
-  DomainKeyword: { label: 'DomainKeyword', placeholder: 'google', tone: 'green' },
-  GeoSite: { label: 'GeoSite', placeholder: 'yandex', tone: 'amber', mono: true },
-  GeoIP: { label: 'GeoIP', placeholder: 'ru', tone: 'amber', mono: true },
-  IPCIDR: { label: 'IPCIDR', placeholder: '10.0.0.0/8', tone: 'neutral', mono: true }
+  ProcessPath: {
+    label: 'Путь к программе',
+    clash: 'PROCESS-PATH',
+    placeholder: 'C:\\Games\\game.exe',
+    tone: 'blue',
+    mono: true
+  },
+  Domain: { label: 'Домен', clash: 'DOMAIN', placeholder: 'api.example.com', tone: 'green' },
+  DomainSuffix: {
+    label: 'Домен и поддомены',
+    clash: 'DOMAIN-SUFFIX',
+    placeholder: 'youtube.com',
+    tone: 'green'
+  },
+  DomainKeyword: {
+    label: 'Слово в домене',
+    clash: 'DOMAIN-KEYWORD',
+    placeholder: 'google',
+    tone: 'green'
+  },
+  DomainRegex: {
+    label: 'Шаблон домена',
+    clash: 'DOMAIN-REGEX',
+    placeholder: '^(.+\\.)?ads\\.',
+    tone: 'green',
+    mono: true,
+    hint: 'Регулярное выражение'
+  },
+  GeoSite: { label: 'Набор сайтов', clash: 'GEOSITE', placeholder: 'youtube', tone: 'amber', mono: true },
+  GeoIP: { label: 'Страна по IP', clash: 'GEOIP', placeholder: 'ru', tone: 'amber', mono: true },
+  IPCIDR: {
+    label: 'IP-подсеть',
+    clash: 'IP-CIDR',
+    placeholder: '10.0.0.0/8',
+    tone: 'neutral',
+    mono: true
+  },
+  DstPort: {
+    label: 'Порт',
+    clash: 'DST-PORT',
+    placeholder: '443 или 6881-6889',
+    tone: 'neutral',
+    mono: true
+  }
 }
 
 export const CONDITION_TYPES = Object.keys(CONDITION_META) as RuleConditionType[]
 
-// A practical subset of geosite categories shipped with the v2fly/loyalsoldier
-// datasets, for autocomplete. Not exhaustive — users can type any value.
+// A practical subset of sing-geosite categories for autocomplete.
 export const GEOSITE_CATEGORIES = [
   'category-ads-all',
-  'category-ads',
   'google',
   'youtube',
   'telegram',
+  'discord',
   'twitter',
   'facebook',
   'instagram',
@@ -43,37 +83,35 @@ export const GEOSITE_CATEGORIES = [
   'cloudflare',
   'microsoft',
   'apple',
+  'steam',
   'yandex',
   'vk',
   'mailru',
-  'sberbank',
   'category-ru',
   'category-gov-ru',
   'private'
 ]
 
 // ISO country codes commonly used with geoip:<cc>.
-export const GEOIP_CATEGORIES = [
-  'ru',
-  'cn',
-  'us',
-  'ir',
-  'by',
-  'ua',
-  'kz',
-  'de',
-  'nl',
-  'private',
-  'telegram'
-]
+export const GEOIP_CATEGORIES = ['ru', 'private', 'by', 'kz', 'ua', 'cn', 'us', 'de', 'nl', 'fi']
 
-export function actionTone(action: string): 'blue' | 'green' | 'red' | 'neutral' {
+export type ActionTone = 'blue' | 'green' | 'red' | 'neutral'
+
+export function actionTone(action: string): ActionTone {
   if (action === 'DIRECT') return 'green'
   if (action === 'REJECT' || action === 'BLOCK') return 'red'
-  if (action === 'PROXY') return 'blue'
-  return 'blue' // named outbound profile
+  return 'blue'
 }
 
 export function actionLabel(action: string): string {
-  return action
+  if (action === 'PROXY') return 'Через VPN'
+  if (action === 'DIRECT') return 'Напрямую'
+  if (action === 'REJECT' || action === 'BLOCK') return 'Блокировать'
+  return `VPN · ${action}`
+}
+
+export const DEFAULT_BEHAVIOR_LABEL: Record<DefaultBehavior, string> = {
+  proxy: 'Через VPN',
+  direct: 'Напрямую',
+  auto: 'Авто: Россия напрямую'
 }

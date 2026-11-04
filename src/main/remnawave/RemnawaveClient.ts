@@ -6,6 +6,7 @@ import { getSubscriptionUrl, setSubscriptionUrl } from '../secrets'
 import { parseOutbounds } from './parsers'
 import { buildSubscriptionHeaders, getDeviceInfo } from './device'
 import { filterSubscription, httpStatusError, hwidHeaderError } from './subscriptionGuard'
+import { parseSubscriptionHeaders } from './headers'
 
 /** Persistent random id, used for x-hwid only if MachineGuid is unreadable. */
 function fallbackDeviceId(): string {
@@ -17,41 +18,19 @@ function fallbackDeviceId(): string {
   return id
 }
 
-/**
- * Parses the standard `subscription-userinfo` header that most panels
- * (Remnawave included) expose, e.g.:
- *   upload=12345; download=67890; total=10737418240; expire=1735689600
- */
-export function parseUserInfoHeader(header: string | null): SubscriptionData['userInfo'] {
-  if (!header) return undefined
-  const out: NonNullable<SubscriptionData['userInfo']> = {}
-  for (const part of header.split(';')) {
-    const [k, v] = part.split('=').map((s) => s.trim())
-    const n = Number(v)
-    if (Number.isNaN(n)) continue
-    if (k === 'upload') out.upload = n
-    else if (k === 'download') out.download = n
-    else if (k === 'total') out.total = n
-    else if (k === 'expire') out.expire = n
-  }
-  return Object.keys(out).length ? out : undefined
-}
-
-function decodeTitle(header: string | null): string | undefined {
-  if (!header) return undefined
-  // panels sometimes base64-encode the title in `profile-title: base64:...`
-  if (header.startsWith('base64:')) {
-    try {
-      return Buffer.from(header.slice(7), 'base64').toString('utf8')
-    } catch {
-      return header
-    }
-  }
-  return header
-}
-
 export class RemnawaveClient {
   private timer: NodeJS.Timeout | null = null
+  private listeners = new Set<(d: SubscriptionData) => void>()
+
+  /** Called after every successful fetch (manual or background). */
+  onUpdate(cb: (d: SubscriptionData) => void): () => void {
+    this.listeners.add(cb)
+    return () => this.listeners.delete(cb)
+  }
+
+  private notify(d: SubscriptionData): void {
+    for (const cb of this.listeners) cb(d)
+  }
 
   /** Fetch a subscription by URL, parse outbounds, persist URL + cache. */
   async fetchSubscription(url: string): Promise<SubscriptionData> {
@@ -73,15 +52,16 @@ export class RemnawaveClient {
     const outbounds = guarded.outbounds
 
     const data: SubscriptionData = {
-      url,
+      // the link itself lives encrypted in secrets.ts, never in the plain cache
+      url: '',
       fetchedAt: Date.now(),
       outbounds,
-      userInfo: parseUserInfoHeader(res.headers.get('subscription-userinfo')),
-      rawTitle: decodeTitle(res.headers.get('profile-title'))
+      ...parseSubscriptionHeaders((n) => res.headers.get(n))
     }
 
     setSubscriptionUrl(url)
     store.set('subscriptionCache', data)
+    this.notify(data)
     return data
   }
 
@@ -102,20 +82,18 @@ export class RemnawaveClient {
     const data = store.get('subscriptionCache')
     if (!data) return null
     // caches written by ≤0.2.x may still hold panel placeholders (0.0.0.0:1)
-    return { ...data, outbounds: filterSubscription(data.outbounds).outbounds }
+    return { ...data, url: '', outbounds: filterSubscription(data.outbounds).outbounds }
   }
 
   /** Start periodic background refresh every N hours. */
-  startAutoRefresh(hours: number, onUpdate?: (d: SubscriptionData) => void): void {
+  startAutoRefresh(hours: number): void {
     this.stopAutoRefresh()
     if (!getSubscriptionUrl()) return
     const ms = Math.max(1, hours) * 60 * 60 * 1000
     this.timer = setInterval(() => {
-      this.refreshSubscription()
-        .then((d) => onUpdate?.(d))
-        .catch(() => {
-          /* offline — keep cache, retry next interval */
-        })
+      this.refreshSubscription().catch(() => {
+        /* offline — keep cache, retry next interval */
+      })
     }, ms)
   }
 

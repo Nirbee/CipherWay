@@ -11,19 +11,22 @@ import {
   Tray
 } from 'electron'
 import { IPC } from '@shared/ipc'
-import type { ImportRequest, StatusUpdate } from '@shared/types'
+import type { ImportRequest, RoutingMode, StatusUpdate } from '@shared/types'
 import {
   activeManager,
   appUpdater,
   connectVpn,
   disconnectVpn,
   getVpnStatus,
+  onSettingsChange,
   onVpnStatus,
-  registerIpcHandlers
+  registerIpcHandlers,
+  setRoutingMode
 } from './ipc/handlers'
 import { remnawave } from './remnawave/RemnawaveClient'
-import { store } from './store'
+import { getSettings, store } from './store'
 import { findDeepLinkArg, parseDeepLink, PROTOCOL } from './deeplink'
+import { clearStaleProxy } from './system/proxy'
 
 const APP_ID = 'com.cipherway.vpn' // = appId in electron-builder.yml (toast notifications)
 
@@ -146,12 +149,22 @@ const STATE_LABEL: Record<StatusUpdate['state'], string> = {
   error: 'ошибка'
 }
 
-function updateTray(s: StatusUpdate): void {
+const MODE_LABEL: Record<RoutingMode, string> = {
+  rule: 'По правилам',
+  global: 'Весь трафик через VPN',
+  direct: 'Всё напрямую'
+}
+
+function updateTray(): void {
   if (!tray) return
+  const s: StatusUpdate = getVpnStatus()
+  const routingMode = getSettings().routingMode
   const connected = s.state === 'connected'
   const busy = s.state === 'connecting'
   tray.setImage(trayIcon(connected))
-  tray.setToolTip(`CipherWay VPN — ${STATE_LABEL[s.state]}`)
+  tray.setToolTip(
+    `CipherWay VPN — ${STATE_LABEL[s.state]}${connected ? ` · ${MODE_LABEL[routingMode]}` : ''}`
+  )
   tray.setContextMenu(
     Menu.buildFromTemplate([
       { label: 'Открыть', click: showWindow },
@@ -170,6 +183,14 @@ function updateTray(s: StatusUpdate): void {
         }
       },
       { type: 'separator' },
+      { label: 'Режим трафика', enabled: false },
+      ...(Object.keys(MODE_LABEL) as RoutingMode[]).map((m) => ({
+        label: MODE_LABEL[m],
+        type: 'radio' as const,
+        checked: routingMode === m,
+        click: () => void setRoutingMode(m)
+      })),
+      { type: 'separator' },
       {
         label: 'Выход',
         click: () => {
@@ -184,8 +205,9 @@ function updateTray(s: StatusUpdate): void {
 function createTray(): void {
   tray = new Tray(trayIcon(false))
   tray.on('double-click', showWindow)
-  updateTray(getVpnStatus())
-  onVpnStatus(updateTray)
+  updateTray()
+  onVpnStatus(() => updateTray())
+  onSettingsChange(() => updateTray())
 }
 
 function showTrayHintOnce(): void {
@@ -256,9 +278,14 @@ if (!app.requestSingleInstanceLock()) {
     // launched via a cipherway:// link
     handleDeepLink(findDeepLinkArg(process.argv), false)
 
+    // a previous run that was killed may have left the system proxy on our port
+    if (getSettings().proxyMode === 'system') {
+      void clearStaleProxy(getSettings().httpPort).catch(() => undefined)
+    }
+
     // resume periodic subscription refresh if one was configured previously
     remnawave.prefetchDevice()
-    remnawave.startAutoRefresh(store.get('settings').subscriptionRefreshHours)
+    remnawave.startAutoRefresh(getSettings().subscriptionRefreshHours)
 
     // quiet update check in the background (no-op in dev / unpackaged)
     void appUpdater?.checkSilently()

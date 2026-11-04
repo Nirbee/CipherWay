@@ -1,5 +1,8 @@
 import { create } from 'zustand'
 import type { DefaultBehavior, RoutingRule, RulesConfig } from '@shared/types'
+import { applyImport, type ImportPosition, type ParseResult } from '@shared/rulesText'
+import { errorText } from '../lib/format'
+import { toast } from './toastStore'
 
 interface RulesStore {
   rules: RoutingRule[]
@@ -21,6 +24,8 @@ interface RulesStore {
 
   exportRules: () => Promise<string | null>
   importRules: () => Promise<boolean>
+  /** apply a parsed text import (Clash / YAML / JSON); returns the number of added rules */
+  importParsed: (parsed: ParseResult, position: ImportPosition) => Promise<number>
 }
 
 function newId(): string {
@@ -40,13 +45,17 @@ export const useRules = create<RulesStore>((set, get) => ({
 
   loadOutbounds: async () => {
     const sub = await window.api.subscription.get()
-    set({ outboundNames: sub?.outbounds.map((o) => o.name) ?? [] })
+    set({ outboundNames: sub?.servers.map((o) => o.name) ?? [] })
   },
 
   persist: async () => {
     const { rules, defaultBehavior } = get()
     const cfg: RulesConfig = { rules, defaultBehavior }
-    await window.api.rules.set(cfg)
+    try {
+      await window.api.rules.set(cfg)
+    } catch (e) {
+      toast(`Правила не сохранены: ${errorText(e)}`, 'error')
+    }
   },
 
   addRule: async (rule) => {
@@ -87,9 +96,25 @@ export const useRules = create<RulesStore>((set, get) => ({
   exportRules: () => window.api.rules.export(),
 
   importRules: async () => {
-    const cfg = await window.api.rules.import()
-    if (!cfg) return false
-    set({ rules: cfg.rules, defaultBehavior: cfg.defaultBehavior })
-    return true
+    try {
+      const cfg = await window.api.rules.import()
+      if (!cfg) return false
+      set({ rules: cfg.rules, defaultBehavior: cfg.defaultBehavior })
+      toast(`Импортировано правил: ${cfg.rules.length}`, 'success')
+      return true
+    } catch (e) {
+      toast(`Файл не подошёл: ${errorText(e)}`, 'error')
+      return false
+    }
+  },
+
+  importParsed: async (parsed, position) => {
+    const next = applyImport(get().rules, parsed, position, newId)
+    set({
+      rules: next,
+      ...(parsed.defaultBehavior ? { defaultBehavior: parsed.defaultBehavior } : {})
+    })
+    await get().persist()
+    return parsed.items.length
   }
 }))

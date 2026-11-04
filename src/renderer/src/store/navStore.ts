@@ -3,9 +3,9 @@ import { create } from 'zustand'
 export type PageKey =
   | 'home'
   | 'servers'
-  | 'subscription'
-  | 'connectors'
+  | 'connections'
   | 'rules'
+  | 'subscription'
   | 'logs'
   | 'settings'
 
@@ -15,6 +15,6 @@ interface NavState {
 }
 
 export const useNav = create<NavState>((set) => ({
-  page: 'rules', // matches the active screen in the reference mockup
+  page: 'home',
   setPage: (page) => set({ page })
 }))

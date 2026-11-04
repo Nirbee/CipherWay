@@ -4,13 +4,13 @@ import type { ConnectionState, StatusUpdate, TrafficStats } from '@shared/types'
 interface ConnectionStore {
   state: ConnectionState
   activeOutboundId?: string
+  /** node picked by «Лучший сервер (авто)» while connected */
+  autoSelectedId?: string
   message?: string
   traffic: TrafficStats
-  globalMode: boolean // true = global, false = split-tunnel
   connectedAt: number | null // ms timestamp when the tunnel came up
   setStatus: (s: StatusUpdate) => void
   setTraffic: (t: TrafficStats) => void
-  setGlobalMode: (v: boolean) => void
   connect: (outboundId?: string) => Promise<void>
   disconnect: () => Promise<void>
 }
@@ -25,13 +25,14 @@ const ZERO_TRAFFIC: TrafficStats = {
 export const useConnection = create<ConnectionStore>((set, get) => ({
   state: 'disconnected',
   traffic: ZERO_TRAFFIC,
-  globalMode: false,
   connectedAt: null,
   setStatus: (s) =>
     set((prev) => ({
       state: s.state,
       activeOutboundId: s.activeOutboundId,
+      autoSelectedId: s.autoSelectedId,
       message: s.message,
+      traffic: s.state === 'connected' ? prev.traffic : ZERO_TRAFFIC,
       connectedAt:
         s.state === 'connected'
           ? (prev.connectedAt ?? Date.now())
@@ -40,15 +41,13 @@ export const useConnection = create<ConnectionStore>((set, get) => ({
             : null
     })),
   setTraffic: (t) => set({ traffic: t }),
-  setGlobalMode: (v) => set({ globalMode: v }),
   connect: async (outboundId) => {
-    set({ state: 'connecting' })
-    const s = await window.api.vpn.connect(outboundId ?? get().activeOutboundId)
+    set({ state: 'connecting', message: undefined })
+    const s = await window.api.vpn.connect(outboundId)
     get().setStatus(s)
   },
   disconnect: async () => {
     const s = await window.api.vpn.disconnect()
     get().setStatus(s)
-    set({ traffic: ZERO_TRAFFIC })
   }
 }))

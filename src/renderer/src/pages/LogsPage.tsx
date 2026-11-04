@@ -2,6 +2,9 @@ import { useEffect, useRef } from 'react'
 import { PageHeader } from '../components/PageHeader'
 import { Button } from '../components/ui'
 import { useLogs } from '../store/logsStore'
+import { toast } from '../store/toastStore'
+import { EmptyState } from '../components/EmptyState'
+import { LogsIcon } from '../components/icons'
 import { cn } from '../lib/cn'
 
 const LEVEL_COLOR: Record<string, string> = {
@@ -23,15 +26,14 @@ export function LogsPage() {
     const text = entries
       .map((e) => `${new Date(e.ts).toISOString()} [${e.source}/${e.level}] ${e.message}`)
       .join('\n')
-    void navigator.clipboard.writeText(text)
+    void navigator.clipboard.writeText(text).then(() => toast('Журнал скопирован', 'success'))
   }
 
   return (
     <div className="flex h-full flex-col">
       <PageHeader
-        overline="Диагностика"
         title="Логи"
-        subtitle="Вывод ядер sing-box, Xray и приложения"
+        subtitle="Журнал ядер sing-box, Xray и приложения. Адреса серверов и ссылка подписки скрыты."
         actions={
           <>
             <Button variant="secondary" size="sm" onClick={copyAll} disabled={entries.length === 0}>
@@ -44,11 +46,14 @@ export function LogsPage() {
         }
       />
 
-      <div className="mx-6 mb-6 min-h-0 flex-1 overflow-y-auto rounded-card border border-border-default bg-bg-panel-alt p-3">
+      <div className="mx-7 mb-6 min-h-0 flex-1 overflow-y-auto rounded-card border border-border-default bg-bg-panel-alt p-3">
         {entries.length === 0 ? (
-          <div className="flex h-full items-center justify-center text-sm text-text-muted">
-            Логи появятся после подключения
-          </div>
+          <EmptyState
+            className="h-full"
+            icon={<LogsIcon width={24} height={24} />}
+            title="Журнал пуст"
+            text="Записи появятся, когда вы подключитесь или проверите серверы."
+          />
         ) : (
           <div className="space-y-0.5 font-mono text-[11.5px] leading-relaxed">
             {entries.map((e, i) => (

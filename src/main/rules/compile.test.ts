@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { OutboundConfig, RulesConfig } from '@shared/types'
-import { compileRules } from './compile'
+import { compileRules, normalizeCidr, portMatcher } from './compile'
 
 const outbounds: OutboundConfig[] = [
   { id: 'ob_a', name: 'Remnawave', protocol: 'vless', server: 'a.com', port: 443 },
@@ -21,8 +21,7 @@ describe('compileRules (sing-box)', () => {
           { id: '3', enabled: true, conditionType: 'DomainKeyword', value: 'z', action: 'DIRECT' }
         ]
       }),
-      outbounds,
-      'ob_a'
+      outbounds
     )
     expect(rules[0]).toMatchObject({ domain: ['x.com'], action: 'route', outbound: 'direct' })
     expect(rules[1].domain_suffix).toEqual(['y.com'])
@@ -37,10 +36,9 @@ describe('compileRules (sing-box)', () => {
           { id: '2', enabled: true, conditionType: 'ProcessPath', value: 'C:\\app.exe', action: 'DIRECT' }
         ]
       }),
-      outbounds,
-      'ob_a'
+      outbounds
     )
-    expect(rules[0]).toMatchObject({ process_name: ['firefox.exe'], outbound: 'ob_a' })
+    expect(rules[0]).toMatchObject({ process_name: ['firefox.exe'], outbound: 'proxy' })
     expect(rules[1]).toMatchObject({ process_path: ['C:\\app.exe'], outbound: 'direct' })
   })
 
@@ -52,8 +50,7 @@ describe('compileRules (sing-box)', () => {
           { id: '2', enabled: true, conditionType: 'GeoIP', value: 'ru', action: 'DIRECT' }
         ]
       }),
-      outbounds,
-      'ob_a'
+      outbounds
     )
     expect(rules[0].rule_set).toEqual(['geosite-yandex'])
     expect(rules[1].rule_set).toEqual(['geoip-ru'])
@@ -70,23 +67,22 @@ describe('compileRules (sing-box)', () => {
           { id: '3', enabled: true, conditionType: 'Domain', value: 'r.com', action: 'REJECT' }
         ]
       }),
-      outbounds,
-      'ob_a'
+      outbounds
     )
-    expect(rules[0].outbound).toBe('ob_a')
+    expect(rules[0].outbound).toBe('proxy')
     expect(rules[1].outbound).toBe('ob_b')
     expect(rules[2]).toMatchObject({ action: 'reject' })
     expect(rules[2].outbound).toBeUndefined()
   })
 
   it('skips disabled rules and sets default final tag', () => {
-    const proxy = compileRules(cfg({ defaultBehavior: 'proxy' }), outbounds, 'ob_a')
-    expect(proxy.final).toBe('ob_a')
-    const direct = compileRules(cfg({ defaultBehavior: 'direct' }), outbounds, 'ob_a')
+    const proxy = compileRules(cfg({ defaultBehavior: 'proxy' }), outbounds)
+    expect(proxy.final).toBe('proxy')
+    const direct = compileRules(cfg({ defaultBehavior: 'direct' }), outbounds)
     expect(direct.final).toBe('direct')
 
-    const auto = compileRules(cfg({ defaultBehavior: 'auto' }), outbounds, 'ob_a')
-    expect(auto.final).toBe('ob_a')
+    const auto = compileRules(cfg({ defaultBehavior: 'auto' }), outbounds)
+    expect(auto.final).toBe('proxy')
     expect(auto.ruleSets.some((r) => r.tag === 'geoip-ru')).toBe(true)
     // no geoip-private rule-set (doesn't exist upstream); LAN via ip_is_private
     expect(auto.ruleSets.some((r) => r.tag === 'geoip-private')).toBe(false)
@@ -94,5 +90,50 @@ describe('compileRules (sing-box)', () => {
     expect(auto.rules.some((r) => r.rule_set?.includes('geoip-ru') && r.outbound === 'direct')).toBe(
       true
     )
+  })
+
+  it('unknown server names fall back to the proxy selector', () => {
+    const { rules } = compileRules(
+      cfg({
+        rules: [{ id: '1', enabled: true, conditionType: 'Domain', value: 'x.com', action: 'Gone' }]
+      }),
+      outbounds
+    )
+    expect(rules[0].outbound).toBe('proxy')
+  })
+
+  it('compiles DOMAIN-REGEX, DST-PORT and IP-CIDR6 rules', () => {
+    const { rules } = compileRules(
+      cfg({
+        rules: [
+          { id: '1', enabled: true, conditionType: 'DomainRegex', value: '^ads\\.', action: 'REJECT' },
+          { id: '2', enabled: true, conditionType: 'DstPort', value: '443', action: 'PROXY' },
+          { id: '3', enabled: true, conditionType: 'DstPort', value: '6881-6889', action: 'DIRECT' },
+          { id: '4', enabled: true, conditionType: 'IPCIDR', value: '2001:db8::/32', action: 'DIRECT' },
+          { id: '5', enabled: true, conditionType: 'IPCIDR', value: '192.0.2.7', action: 'DIRECT' },
+          { id: '6', enabled: true, conditionType: 'DstPort', value: 'abc', action: 'DIRECT' },
+          { id: '7', enabled: true, conditionType: 'GeoIP', value: 'LAN', action: 'DIRECT' }
+        ]
+      }),
+      outbounds
+    )
+    expect(rules[0]).toEqual({ domain_regex: ['^ads\\.'], action: 'reject' })
+    expect(rules[1]).toEqual({ port: [443], action: 'route', outbound: 'proxy' })
+    expect(rules[2]).toEqual({ port_range: ['6881:6889'], action: 'route', outbound: 'direct' })
+    expect(rules[3].ip_cidr).toEqual(['2001:db8::/32'])
+    expect(rules[4].ip_cidr).toEqual(['192.0.2.7/32'])
+    // invalid port rule is dropped, GEOIP,LAN = built-in private matcher
+    expect(rules).toHaveLength(6)
+    expect(rules[5]).toMatchObject({ ip_is_private: true, outbound: 'direct' })
+  })
+
+  it('port and CIDR helpers', () => {
+    expect(portMatcher('80/443')).toEqual({ port: [80, 443] })
+    expect(portMatcher('1000-2000|53')).toEqual({ port: [53], port_range: ['1000:2000'] })
+    expect(portMatcher('0')).toBeNull()
+    expect(portMatcher('70000')).toBeNull()
+    expect(portMatcher('9-1')).toBeNull()
+    expect(normalizeCidr('::1')).toBe('::1/128')
+    expect(normalizeCidr('10.0.0.0/8')).toBe('10.0.0.0/8')
   })
 })

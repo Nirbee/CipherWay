@@ -1,31 +1,58 @@
 import { create } from 'zustand'
+import { AUTO_OUTBOUND_ID } from '@shared/types'
+import { errorText } from '../lib/format'
+import { toast } from './toastStore'
+
+/** automatic re-test (page open / picker open) at most once a minute */
+const AUTO_TEST_MIN_INTERVAL_MS = 60_000
 
 interface ServersStore {
+  /** latency in ms per server id; null = no response; missing = not tested */
   pings: Record<string, number | null>
-  pinging: boolean
-  activeId: string | null
-  setActive: (id: string) => Promise<void>
-  ping: () => Promise<void>
+  testing: boolean
+  testedAt: number | null
+  activeId: string
+  /** run the core-based latency test (force = ignore the 1/min limit) */
+  test: (force?: boolean) => Promise<void>
+  select: (id: string) => Promise<void>
   loadActive: () => Promise<void>
+  setActiveLocal: (id: string | undefined) => void
 }
 
-export const useServers = create<ServersStore>((set) => ({
+export const useServers = create<ServersStore>((set, get) => ({
   pings: {},
-  pinging: false,
-  activeId: null,
-  setActive: async (id) => {
-    await window.api.servers.select(id)
-    set({ activeId: id })
+  testing: false,
+  testedAt: null,
+  activeId: AUTO_OUTBOUND_ID,
+  test: async (force = false) => {
+    const { testing, testedAt } = get()
+    if (testing) return
+    if (!force && testedAt && Date.now() - testedAt < AUTO_TEST_MIN_INTERVAL_MS) return
+    set({ testing: true })
+    try {
+      const results = await window.api.servers.ping()
+      const pings: Record<string, number | null> = {}
+      for (const r of results) pings[r.outboundId] = r.latencyMs
+      set({ pings, testedAt: Date.now() })
+    } catch (e) {
+      toast(`Проверка не удалась: ${errorText(e)}`, 'error')
+    } finally {
+      set({ testing: false })
+    }
   },
-  ping: async () => {
-    set({ pinging: true })
-    const results = await window.api.servers.ping()
-    const pings: Record<string, number | null> = {}
-    for (const r of results) pings[r.outboundId] = r.latencyMs
-    set({ pings, pinging: false })
+  select: async (id) => {
+    const prev = get().activeId
+    set({ activeId: id })
+    try {
+      await window.api.servers.select(id)
+    } catch (e) {
+      set({ activeId: prev })
+      toast(`Не удалось выбрать сервер: ${errorText(e)}`, 'error')
+    }
   },
   loadActive: async () => {
     const status = await window.api.vpn.getStatus()
-    if (status.activeOutboundId) set({ activeId: status.activeOutboundId })
-  }
+    set({ activeId: status.activeOutboundId ?? AUTO_OUTBOUND_ID })
+  },
+  setActiveLocal: (id) => set({ activeId: id ?? AUTO_OUTBOUND_ID })
 }))

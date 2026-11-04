@@ -1,103 +1,132 @@
 import { useEffect, useState } from 'react'
+import type { AppSettings } from '@shared/types'
 import { PageHeader } from '../components/PageHeader'
-import { Button, Card, Toggle } from '../components/ui'
+import { Button, Card, Input, Toggle } from '../components/ui'
+import { CheckIcon, CopyIcon } from '../components/icons'
 import { useSettings } from '../store/settingsStore'
 import { useLogs } from '../store/logsStore'
 import { useUpdater } from '../store/updaterStore'
+import { useConnection } from '../store/connectionStore'
+import { useSubscription } from '../store/subscriptionStore'
+import { toast } from '../store/toastStore'
+import { errorText } from '../lib/format'
 import { cn } from '../lib/cn'
 
 export function SettingsPage() {
   const { settings, load, update } = useSettings()
   const logs = useLogs((s) => s.entries)
+  const state = useConnection((s) => s.state)
+  const servers = useSubscription((s) => s.data?.servers.length ?? 0)
   const [version, setVersion] = useState('')
+  const [support, setSupport] = useState('')
 
   useEffect(() => {
     void load()
     void window.api.app.getVersion().then(setVersion)
   }, [load])
+  useEffect(() => {
+    if (settings) setSupport(settings.supportUrl)
+  }, [settings?.supportUrl]) // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!settings) return null
 
-  const exportDiagnostics = () => {
-    const blob = [
-      `CipherWay VPN diagnostics`,
-      `date: ${new Date().toISOString()}`,
-      `settings: ${JSON.stringify(settings)}`,
-      `--- last logs ---`,
-      ...logs.slice(-200).map((e) => `${new Date(e.ts).toISOString()} [${e.source}/${e.level}] ${e.message}`)
-    ].join('\n')
-    void navigator.clipboard.writeText(blob)
+  const save = async (patch: Partial<AppSettings>, ok?: string) => {
+    try {
+      await update(patch)
+      if (ok) toast(ok, 'success')
+    } catch (e) {
+      toast(errorText(e), 'error')
+    }
   }
+
+  const copyDiagnostics = async () => {
+    // log lines arrive already masked by the main process (no node addresses,
+    // no subscription link); settings hold nothing secret
+    const safe = { ...settings, supportUrl: settings.supportUrl ? 'задана' : '' }
+    const blob = [
+      'CipherWay VPN — диагностика',
+      `версия: ${version}`,
+      `дата: ${new Date().toISOString()}`,
+      `состояние: ${state}`,
+      `серверов в подписке: ${servers}`,
+      `настройки: ${JSON.stringify(safe)}`,
+      '--- последние записи журнала ---',
+      ...logs
+        .slice(-300)
+        .map((e) => `${new Date(e.ts).toISOString()} [${e.source}/${e.level}] ${e.message}`)
+    ].join('\n')
+    await navigator.clipboard.writeText(blob)
+    toast('Диагностика скопирована — адреса серверов и ссылка подписки в ней скрыты', 'success')
+  }
+
+  const supportDirty = support.trim() !== settings.supportUrl
 
   return (
     <div className="flex h-full flex-col overflow-y-auto">
-      <PageHeader overline="Конфигурация" title="Настройки" />
+      <PageHeader title="Настройки" />
 
-      <div className="space-y-5 px-6 pb-8">
-        {/* proxy mode */}
-        <Section title="Режим подключения">
+      <div className="space-y-6 px-7 pb-8">
+        <Section
+          title="Способ подключения"
+          hint={state === 'connected' ? 'Смена способа переподключит VPN.' : undefined}
+        >
           <div className="grid grid-cols-2 gap-3">
             <ModeCard
-              active={settings.proxyMode === 'tun'}
-              onClick={() => update({ proxyMode: 'tun' })}
-              title="TUN"
-              desc="Системный перехват, работают правила по процессам. Требует прав администратора (UAC) и драйвер wintun."
+              active={settings.proxyMode === 'system'}
+              onClick={() => void save({ proxyMode: 'system' })}
+              title="Системный прокси"
+              desc="Без прав администратора. Через VPN идут программы, которые используют прокси Windows: браузеры, большинство приложений."
             />
             <ModeCard
-              active={settings.proxyMode === 'system'}
-              onClick={() => update({ proxyMode: 'system' })}
-              title="System Proxy"
-              desc="Проще, без прав администратора. Правила по процессам недоступны."
+              active={settings.proxyMode === 'tun'}
+              onClick={() => void save({ proxyMode: 'tun' })}
+              title="TUN — весь компьютер"
+              desc="Перехватывает трафик всех программ, включая игры. При подключении Windows спросит права администратора."
             />
           </div>
-          {settings.proxyMode === 'tun' && (
-            <p className="mt-2 text-[11px] text-accent-amber">
-              При подключении появится запрос прав администратора (UAC).
-            </p>
-          )}
         </Section>
 
-        {/* toggles */}
         <Section title="Запуск">
-          <Row label="Автозапуск с Windows" hint="Запускать CipherWay при входе в систему">
-            <Toggle checked={settings.autoLaunch} onChange={(v) => update({ autoLaunch: v })} />
+          <Row label="Запускать вместе с Windows" hint="CipherWay стартует при входе в систему и ждёт в трее">
+            <Toggle checked={settings.autoLaunch} onChange={(v) => void save({ autoLaunch: v })} />
           </Row>
-          <Row label="Автоподключение" hint="Подключаться к VPN при старте приложения">
-            <Toggle checked={settings.autoConnect} onChange={(v) => update({ autoConnect: v })} />
+          <Row label="Подключаться при запуске" hint="Сразу включать VPN после старта приложения">
+            <Toggle checked={settings.autoConnect} onChange={(v) => void save({ autoConnect: v })} />
           </Row>
         </Section>
 
-        {/* language */}
-        <Section title="Язык интерфейса">
-          <div className="flex w-fit rounded-pill border border-border-default p-0.5">
-            {(['ru', 'en'] as const).map((l) => (
-              <button
-                key={l}
-                onClick={() => update({ language: l })}
-                className={cn(
-                  'rounded-pill px-4 py-1.5 text-sm transition-colors',
-                  settings.language === l
-                    ? 'bg-accent-blue text-white'
-                    : 'text-text-muted hover:text-text-primary'
-                )}
-              >
-                {l === 'ru' ? 'Русский' : 'English'}
-              </button>
-            ))}
+        <Section
+          title="Поддержка"
+          hint="Ссылка для кнопки «Поддержка», если ваша подписка не передаёт свою. Подойдёт https:// или tg://."
+        >
+          <div className="flex gap-2">
+            <Input
+              mono
+              placeholder="https://t.me/…"
+              value={support}
+              onChange={(e) => setSupport(e.target.value)}
+            />
+            <Button
+              className="shrink-0"
+              variant="secondary"
+              disabled={!supportDirty}
+              onClick={() => void save({ supportUrl: support.trim() }, 'Ссылка поддержки сохранена')}
+            >
+              Сохранить
+            </Button>
           </div>
         </Section>
 
-        {/* updates */}
         <Section title="Обновления">
-          <Row label="Версия приложения" hint="CipherWay VPN">
+          <Row label="Версия приложения" hint="Обновления приходят с GitHub автоматически">
             <span className="font-mono text-sm text-text-secondary">{version ? `v${version}` : '—'}</span>
           </Row>
           <UpdaterControls />
         </Section>
 
-        {/* diagnostics */}
-        <Section title="Диагностика">
-          <Button variant="secondary" size="sm" onClick={exportDiagnostics}>
+        <Section title="Диагностика" hint="Пригодится, если пишете в поддержку.">
+          <Button variant="secondary" size="sm" onClick={() => void copyDiagnostics()}>
+            <CopyIcon width={14} height={14} />
             Скопировать диагностику
           </Button>
         </Section>
@@ -106,24 +135,19 @@ export function SettingsPage() {
   )
 }
 
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
+function Section({ title, hint, children }: { title: string; hint?: string; children: React.ReactNode }) {
   return (
-    <div>
-      <div className="mb-3 text-sm font-semibold text-text-primary">{title}</div>
-      <Card className="space-y-3 p-4">{children}</Card>
-    </div>
+    <section>
+      <div className="mb-2.5 px-1">
+        <div className="text-sm font-semibold text-text-primary">{title}</div>
+        {hint && <div className="mt-0.5 text-[11px] text-text-muted">{hint}</div>}
+      </div>
+      <Card className="space-y-4 p-4">{children}</Card>
+    </section>
   )
 }
 
-function Row({
-  label,
-  hint,
-  children
-}: {
-  label: string
-  hint?: string
-  children: React.ReactNode
-}) {
+function Row({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
   return (
     <div className="flex items-center justify-between gap-4">
       <div>
@@ -140,12 +164,10 @@ function UpdaterControls() {
 
   if (phase === 'available') {
     return (
-      <div className="space-y-2">
-        <div className="rounded-xl border border-accent-blue bg-accent-blue/10 px-3 py-2 text-sm text-accent-blue-bright">
-          Доступно обновление {version ? `v${version}` : ''}
-        </div>
+      <div className="flex items-center justify-between gap-3 rounded-xl border border-accent-green/40 bg-accent-green/10 px-3 py-2.5">
+        <span className="text-sm text-accent-green">Доступна версия {version ? `v${version}` : ''}</span>
         <Button size="sm" onClick={download}>
-          Скачать обновление
+          Скачать
         </Button>
       </div>
     )
@@ -154,11 +176,8 @@ function UpdaterControls() {
   if (phase === 'downloading') {
     return (
       <div className="space-y-2">
-        <div className="h-2 overflow-hidden rounded-pill bg-bg-elevated">
-          <div
-            className="h-full rounded-pill bg-accent-blue transition-all"
-            style={{ width: `${percent}%` }}
-          />
+        <div className="h-1.5 overflow-hidden rounded-pill bg-bg-elevated">
+          <div className="h-full rounded-pill bg-accent-blue transition-all" style={{ width: `${percent}%` }} />
         </div>
         <div className="font-mono text-xs text-text-muted">Загрузка… {percent}%</div>
       </div>
@@ -167,10 +186,8 @@ function UpdaterControls() {
 
   if (phase === 'downloaded') {
     return (
-      <div className="space-y-2">
-        <div className="rounded-xl border border-accent-green bg-accent-green/10 px-3 py-2 text-sm text-accent-green">
-          Обновление {version ? `v${version}` : ''} загружено
-        </div>
+      <div className="flex items-center justify-between gap-3 rounded-xl border border-accent-green/40 bg-accent-green/10 px-3 py-2.5">
+        <span className="text-sm text-accent-green">Версия {version ? `v${version}` : ''} готова к установке</span>
         <Button size="sm" onClick={install}>
           Перезапустить и установить
         </Button>
@@ -179,14 +196,17 @@ function UpdaterControls() {
   }
 
   return (
-    <div className="space-y-2">
+    <div className="flex items-center gap-3">
       <Button variant="secondary" size="sm" onClick={check} disabled={phase === 'checking'}>
         {phase === 'checking' ? 'Проверка…' : 'Проверить обновления'}
       </Button>
       {phase === 'not-available' && (
-        <div className="text-xs text-text-muted">У вас последняя версия.</div>
+        <span className="flex items-center gap-1 text-xs text-accent-green">
+          <CheckIcon width={14} height={14} />
+          Установлена последняя версия
+        </span>
       )}
-      {phase === 'error' && <div className="text-xs text-accent-red">{error}</div>}
+      {phase === 'error' && <span className="text-xs text-accent-red">{error}</span>}
     </div>
   )
 }
@@ -206,15 +226,24 @@ function ModeCard({
     <button
       onClick={onClick}
       className={cn(
-        'rounded-card border p-4 text-left transition-colors',
-        active ? 'border-accent-blue bg-accent-blue/10' : 'border-border-default bg-bg-panel-alt hover:bg-bg-elevated'
+        'rounded-2xl border p-4 text-left transition-all duration-200',
+        active
+          ? 'border-accent-green/50 bg-accent-green/[0.07]'
+          : 'border-border-subtle bg-bg-panel-alt hover:border-border-default hover:bg-bg-elevated'
       )}
     >
       <div className="flex items-center gap-2">
-        <span className="font-semibold text-text-primary">{title}</span>
-        {active && <span className="h-2 w-2 rounded-full bg-accent-blue" />}
+        <span
+          className={cn(
+            'flex h-4 w-4 items-center justify-center rounded-full border-2 transition-colors',
+            active ? 'border-accent-green' : 'border-text-faint'
+          )}
+        >
+          {active && <span className="h-1.5 w-1.5 rounded-full bg-accent-green" />}
+        </span>
+        <span className="text-sm font-semibold text-text-primary">{title}</span>
       </div>
-      <p className="mt-1.5 text-[11px] leading-relaxed text-text-muted">{desc}</p>
+      <p className="mt-2 text-[11px] leading-relaxed text-text-muted">{desc}</p>
     </button>
   )
 }

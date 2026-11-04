@@ -9,13 +9,18 @@ export interface SbRouteRule {
   domain?: string[]
   domain_suffix?: string[]
   domain_keyword?: string[]
+  domain_regex?: string[]
   ip_cidr?: string[]
+  port?: number[]
+  port_range?: string[]
   ip_is_private?: boolean
   process_name?: string[]
   process_path?: string[]
   rule_set?: string[]
   inbound?: string[]
   protocol?: string[]
+  /** Clash API mode this rule is active in (Rule / Global / Direct) */
+  clash_mode?: string
   // action
   action?: SbAction
   outbound?: string // when action === 'route'
@@ -55,13 +60,24 @@ export interface SbConfig {
     rule_set?: SbRuleSet[]
     final?: string
     auto_detect_interface?: boolean
+    find_process?: boolean
     default_mark?: number
     default_domain_resolver?: { server: string }
   }
 }
 
 export const TAG_DIRECT = 'direct'
-export const TAG_PROXY_GROUP = 'proxy' // selector over all subscription nodes
+/** selector over «auto» + every node; PROXY rules and route.final point here */
+export const TAG_PROXY_GROUP = 'proxy'
+/** urltest over every node («Лучший сервер (авто)») — same id as AUTO_OUTBOUND_ID */
+export const TAG_AUTO = 'auto'
+
+/** probe target for url-test and the «Проверить» button */
+export const LATENCY_URL = 'https://www.gstatic.com/generate_204'
+export const LATENCY_TIMEOUT_MS = 5000
+
+/** Clash API mode names (sing-box compares them case-insensitively) */
+export const CLASH_MODE = { rule: 'Rule', global: 'Global', direct: 'Direct' } as const
 
 // rule-set source repos (SagerNet official, .srs binary format)
 const GEOSITE_BASE = 'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set'

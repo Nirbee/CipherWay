@@ -16,6 +16,8 @@ interface Schema {
 
 export const DEFAULT_SETTINGS: AppSettings = {
   proxyMode: 'system',
+  routingMode: 'rule',
+  supportUrl: '',
   autoLaunch: false,
   autoConnect: false,
   language: 'ru',
@@ -46,3 +48,8 @@ export const store = new Store<Schema>({
     trayHintShown: false
   }
 })
+
+/** Settings merged over the defaults (stores written by older versions lack new keys). */
+export function getSettings(): AppSettings {
+  return { ...DEFAULT_SETTINGS, ...store.get('settings') }
+}

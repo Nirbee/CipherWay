@@ -3,13 +3,15 @@
 
 import type {
   AppSettings,
+  ConnSnapshot,
   ImportRequest,
   LogEntry,
+  RoutingMode,
   RoutingRule,
   RulesConfig,
   ServerPing,
   StatusUpdate,
-  SubscriptionData,
+  SubscriptionView,
   TrafficStats
 } from './types'
 
@@ -28,6 +30,14 @@ export const IPC = {
   connect: 'vpn:connect',
   disconnect: 'vpn:disconnect',
   getStatus: 'vpn:getStatus',
+  /** switch Правила / Весь трафик / Напрямую (hot, via the Clash API) */
+  setRoutingMode: 'vpn:setRoutingMode',
+
+  // live connections (Clash API)
+  connectionsList: 'conn:list',
+  connectionsClose: 'conn:close',
+  connectionsCloseAll: 'conn:closeAll',
+  processIcon: 'conn:processIcon',
 
   // subscription
   subscriptionFetch: 'sub:fetch',
@@ -35,6 +45,7 @@ export const IPC = {
   subscriptionGet: 'sub:get',
 
   // servers
+  /** real latency through the cores (url-test), not a TCP ping */
   serversPing: 'servers:ping',
   serverSelect: 'servers:select',
 
@@ -43,6 +54,8 @@ export const IPC = {
   rulesSet: 'rules:set',
   rulesExport: 'rules:export',
   rulesImport: 'rules:import',
+  rulesOpenText: 'rules:openText',
+  rulesSaveText: 'rules:saveText',
   processList: 'rules:processList',
   pickExecutable: 'rules:pickExecutable',
 
@@ -52,6 +65,9 @@ export const IPC = {
 
   // cipherway:// deep links (import a subscription)
   deeplinkTakePending: 'deeplink:takePending',
+
+  // open an https:// / tg:// link from the subscription in the system browser
+  openExternal: 'app:openExternal',
 
   // updater
   updaterCheck: 'updater:check',
@@ -63,6 +79,10 @@ export const IPC = {
   evtTraffic: 'evt:traffic',
   evtLog: 'evt:log',
   evtUpdater: 'evt:updater',
+  /** settings changed outside the renderer (tray mode switch) */
+  evtSettings: 'evt:settings',
+  /** subscription data changed (background refresh) */
+  evtSubscription: 'evt:subscription',
   /** payload-less ping: a deep-link import is pending, call deeplink.takePending() */
   evtImportRequest: 'evt:importRequest'
 } as const
@@ -78,6 +98,7 @@ export interface UpdaterEvent {
 export interface ExposedApi {
   app: {
     getVersion: () => Promise<string>
+    openExternal: (url: string) => Promise<void>
   }
   window: {
     minimize: () => void
@@ -89,11 +110,19 @@ export interface ExposedApi {
     connect: (outboundId?: string) => Promise<StatusUpdate>
     disconnect: () => Promise<StatusUpdate>
     getStatus: () => Promise<StatusUpdate>
+    setRoutingMode: (mode: RoutingMode) => Promise<AppSettings>
   }
   subscription: {
-    fetch: (url: string) => Promise<SubscriptionData>
-    refresh: () => Promise<SubscriptionData>
-    get: () => Promise<SubscriptionData | null>
+    fetch: (url: string) => Promise<SubscriptionView>
+    refresh: () => Promise<SubscriptionView>
+    get: () => Promise<SubscriptionView | null>
+  }
+  connections: {
+    list: () => Promise<ConnSnapshot>
+    close: (id: string) => Promise<void>
+    closeAll: () => Promise<void>
+    /** data: URL of the exe icon, null if unavailable */
+    icon: (exePath: string) => Promise<string | null>
   }
   servers: {
     ping: () => Promise<ServerPing[]>
@@ -104,6 +133,10 @@ export interface ExposedApi {
     set: (config: RulesConfig) => Promise<void>
     export: () => Promise<string | null>
     import: () => Promise<RulesConfig | null>
+    /** read a rules file chosen by the user as text (for the text editor) */
+    openText: () => Promise<string | null>
+    /** save Clash rule lines to a file chosen by the user */
+    saveText: (text: string) => Promise<string | null>
     processList: () => Promise<{ name: string; path: string; pid: number }[]>
     pickExecutable: () => Promise<{ name: string; path: string } | null>
   }
@@ -127,6 +160,8 @@ export interface ExposedApi {
     updater: (cb: (e: UpdaterEvent) => void) => () => void
     windowMaximized: (cb: (maximized: boolean) => void) => () => void
     importRequest: (cb: () => void) => () => void
+    settings: (cb: (s: AppSettings) => void) => () => void
+    subscription: (cb: (s: SubscriptionView | null) => void) => () => void
   }
 }
 

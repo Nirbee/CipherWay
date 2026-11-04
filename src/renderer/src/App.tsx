@@ -5,6 +5,11 @@ import { useNav } from './store/navStore'
 import { useConnection } from './store/connectionStore'
 import { useLogs } from './store/logsStore'
 import { useUpdater } from './store/updaterStore'
+import { useSettings } from './store/settingsStore'
+import { useSubscription } from './store/subscriptionStore'
+import { useServers } from './store/serversStore'
+import { ConnectionsPage } from './pages/ConnectionsPage'
+import { Toaster } from './components/Toaster'
 import { RulesPage } from './pages/RulesPage'
 import { HomePage } from './pages/HomePage'
 import { ServersPage } from './pages/ServersPage'
@@ -19,22 +24,35 @@ export default function App() {
   const { setStatus, setTraffic } = useConnection()
   const addLog = useLogs((s) => s.add)
   const applyUpdater = useUpdater((s) => s.apply)
+  const applySettings = useSettings((s) => s.apply)
+  const loadSettings = useSettings((s) => s.load)
+  const setSubscription = useSubscription((s) => s.set)
+  const setActiveLocal = useServers((s) => s.setActiveLocal)
   const [maximized, setMaximized] = useState(false)
 
   // wire main-process push events into the stores once
   useEffect(() => {
-    const offStatus = window.api.on.status(setStatus)
+    const offStatus = window.api.on.status((s) => {
+      setStatus(s)
+      setActiveLocal(s.activeOutboundId)
+    })
+    const offSettings = window.api.on.settings(applySettings)
+    const offSub = window.api.on.subscription(setSubscription)
+    void loadSettings()
     const offTraffic = window.api.on.traffic(setTraffic)
     const offLog = window.api.on.log(addLog)
     const offUpdater = window.api.on.updater(applyUpdater)
     const offMax = window.api.on.windowMaximized(setMaximized)
-    void window.api.vpn.getStatus().then(setStatus)
+    void window.api.vpn.getStatus().then((s) => {
+      setStatus(s)
+      setActiveLocal(s.activeOutboundId)
+    })
     void window.api.window.isMaximized().then(setMaximized)
     // auto-connect on launch if enabled and a server is configured
     void window.api.settings.get().then(async (s) => {
       if (!s.autoConnect) return
       const sub = await window.api.subscription.get()
-      if (sub?.outbounds.length) void window.api.vpn.connect()
+      if (sub?.servers.length) void window.api.vpn.connect()
     })
     return () => {
       offStatus()
@@ -42,13 +60,16 @@ export default function App() {
       offLog()
       offUpdater()
       offMax()
+      offSettings()
+      offSub()
     }
-  }, [setStatus, setTraffic, addLog, applyUpdater])
+  }, [setStatus, setTraffic, addLog, applyUpdater, applySettings, loadSettings, setSubscription, setActiveLocal])
 
   return (
     <div className={cn('app-shell flex text-text-primary', maximized && 'maximized')}>
       <Sidebar />
       <ImportSubscriptionDialog />
+      <Toaster />
       <div className="flex min-w-0 flex-1 flex-col">
         <TitleBar />
         <main className="min-h-0 flex-1 overflow-y-auto">
@@ -67,6 +88,8 @@ function PageView({ page }: { page: string }) {
       return <HomePage />
     case 'servers':
       return <ServersPage />
+    case 'connections':
+      return <ConnectionsPage />
     case 'subscription':
       return <SubscriptionPage />
     case 'rules':

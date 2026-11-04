@@ -1,34 +1,33 @@
 import { create } from 'zustand'
-import type { SubscriptionData } from '@shared/types'
-
-/** ipcRenderer.invoke wraps errors: "Error invoking remote method 'sub:fetch': Error: …" */
-function errorText(e: unknown): string {
-  const msg = e instanceof Error ? e.message : String(e)
-  return msg.replace(/^Error invoking remote method '[^']*':\s*(Error:\s*)?/, '')
-}
+import type { SubscriptionView } from '@shared/types'
+import { errorText } from '../lib/format'
 
 interface SubscriptionStore {
-  data: SubscriptionData | null
+  data: SubscriptionView | null
+  loaded: boolean
   loading: boolean
   error: string | null
   load: () => Promise<void>
+  set: (data: SubscriptionView | null) => void
   fetch: (url: string) => Promise<boolean>
   refresh: () => Promise<void>
 }
 
 export const useSubscription = create<SubscriptionStore>((set) => ({
   data: null,
+  loaded: false,
   loading: false,
   error: null,
   load: async () => {
     const data = await window.api.subscription.get()
-    set({ data })
+    set({ data, loaded: true })
   },
+  set: (data) => set({ data, loaded: true }),
   fetch: async (url) => {
     set({ loading: true, error: null })
     try {
       const data = await window.api.subscription.fetch(url)
-      set({ data, loading: false })
+      set({ data, loading: false, loaded: true })
       return true
     } catch (e) {
       set({ loading: false, error: errorText(e) })

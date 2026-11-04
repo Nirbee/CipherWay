@@ -6,7 +6,13 @@ import { afterAll, describe, expect, it } from 'vitest'
 import type { AppSettings } from '@shared/types'
 import { parseOutbounds } from '../remnawave/parsers'
 import { filterSubscription } from '../remnawave/subscriptionGuard'
-import { buildOutbound, generateSingboxConfig, serverDomains } from './configGen'
+import {
+  buildOutbound,
+  generateProbeConfig,
+  generateSingboxConfig,
+  groupOutbounds,
+  serverDomains
+} from './configGen'
 import { buildXrayOutbound, generateXrayConfig, isXrayHandled, type XrayBridge } from './xrayGen'
 import { MIXED_SUB_BODY, TEST_RULES, TEST_SETTINGS } from './fixtures'
 
@@ -123,7 +129,9 @@ describe('generateSingboxConfig with xray bridges', () => {
       obfs: { type: 'salamander', password: 'obfs-pass' }
     })
     expect(byTag.direct).toEqual({ type: 'direct', tag: 'direct' })
-    expect(cfg.route.final).toBe(vlessA.id)
+    // unmatched traffic goes to the selector, which defaults to the active node
+    expect(cfg.route.final).toBe('proxy')
+    expect(byTag.proxy).toMatchObject({ type: 'selector', default: vlessA.id })
   })
 
   it('throws if a VLESS node has no xray port', () => {
@@ -139,7 +147,7 @@ describe('generateSingboxConfig with xray bridges', () => {
   it('never sets a DNS detour to the empty direct outbound (sing-box refuses to start)', () => {
     const servers = (singbox().dns as { servers: { tag: string; detour?: string }[] }).servers
     expect(servers.find((s) => s.tag === 'local')?.detour).toBeUndefined()
-    expect(servers.find((s) => s.tag === 'remote')?.detour).toBe(vlessA.id)
+    expect(servers.find((s) => s.tag === 'remote')?.detour).toBe('proxy')
     const direct = generateSingboxConfig({
       ...{ outbounds, activeOutboundId: vlessA.id, settings: TEST_SETTINGS, xrayPorts },
       rules: { defaultBehavior: 'direct', rules: [] },
@@ -171,6 +179,91 @@ describe('generateSingboxConfig with xray bridges', () => {
   })
 })
 
+describe('server groups: «Лучший сервер (авто)» + selector', () => {
+  const ids = outbounds.map((o) => o.id)
+
+  it('urltest over every node, 5 min interval, 50 ms tolerance, gstatic probe', () => {
+    const byTag = Object.fromEntries(singbox().outbounds.map((o) => [o.tag, o]))
+    expect(byTag.auto).toMatchObject({
+      type: 'urltest',
+      outbounds: ids,
+      url: 'https://www.gstatic.com/generate_204',
+      interval: '5m',
+      tolerance: 50
+    })
+    expect(byTag.proxy).toMatchObject({
+      type: 'selector',
+      outbounds: ['auto', ...ids],
+      interrupt_exist_connections: true
+    })
+  })
+
+  it('selector default: active node, «auto», or auto for an unknown/missing id', () => {
+    const sel = (active?: string) => groupOutbounds(ids, active)[1].default
+    expect(sel(vlessB.id)).toBe(vlessB.id)
+    expect(sel('auto')).toBe('auto')
+    expect(sel('ob_gone')).toBe('auto')
+    expect(sel(undefined)).toBe('auto')
+  })
+
+  it('PROXY rules route to the selector, not to a fixed node', () => {
+    const rule = singbox().route.rules.find((r) => r.process_name?.includes('telegram.exe'))
+    expect(rule).toMatchObject({ action: 'route', outbound: 'proxy' })
+  })
+})
+
+describe('routing modes (Правила / Весь трафик / Напрямую)', () => {
+  it('clash_mode switch sits before the user rules; LAN stays direct', () => {
+    const rules = singbox().route.rules
+    const idx = (pred: (r: (typeof rules)[number]) => boolean) => rules.findIndex(pred)
+    const direct = idx((r) => r.clash_mode === 'Direct')
+    const global = idx((r) => r.clash_mode === 'Global')
+    const firstUser = idx((r) => r.rule_set?.includes('geosite-category-ads-all') ?? false)
+    expect(rules[direct]).toEqual({ clash_mode: 'Direct', action: 'route', outbound: 'direct' })
+    expect(rules[global]).toEqual({ clash_mode: 'Global', action: 'route', outbound: 'proxy' })
+    expect(direct).toBeLessThan(firstUser)
+    expect(global).toBeLessThan(firstUser)
+    expect(idx((r) => r.ip_is_private === true)).toBeLessThan(global)
+  })
+
+  it('default_mode follows the saved routing mode', () => {
+    expect(singbox().experimental?.clash_api?.default_mode).toBe('Rule')
+    expect(singbox({ routingMode: 'global' }).experimental?.clash_api?.default_mode).toBe('Global')
+    expect(singbox({ routingMode: 'direct' }).experimental?.clash_api?.default_mode).toBe('Direct')
+  })
+
+  it('«Напрямую» resolves DNS locally, «Весь трафик» via the tunnel', () => {
+    const rules = (singbox().dns as { rules: { clash_mode?: string; server: string }[] }).rules
+    expect(rules).toContainEqual({ clash_mode: 'Direct', server: 'local' })
+    expect(rules).toContainEqual({ clash_mode: 'Global', server: 'remote' })
+  })
+
+  it('process lookup is on (Подключения screen) in both proxy modes', () => {
+    expect(singbox().route.find_process).toBe(true)
+    expect(singbox({ proxyMode: 'tun' }).route.find_process).toBe(true)
+  })
+})
+
+describe('generateProbeConfig (latency test while disconnected)', () => {
+  const probe = generateProbeConfig({
+    outbounds,
+    clashApiPort: 19091,
+    logFile: 'probe.log',
+    xrayPorts
+  })
+
+  it('has no inbounds — nothing on the machine is routed through it', () => {
+    expect(probe.inbounds).toEqual([])
+    expect(probe.route.final).toBe('direct')
+    expect(probe.experimental?.clash_api?.external_controller).toBe('127.0.0.1:19091')
+  })
+
+  it('contains every node under its own id', () => {
+    const tags = probe.outbounds.map((o) => o.tag)
+    expect(tags).toEqual([...outbounds.map((o) => o.id), 'direct'])
+  })
+})
+
 // --- validate against the real binaries when they are downloaded ----------
 
 const BIN = resolve(__dirname, '../../../resources/bin')
@@ -196,10 +289,46 @@ describe('real core validation', () => {
   })
 
   for (const mode of ['system', 'tun'] as const) {
-    it.skipIf(!existsSync(SINGBOX))(`sing-box check accepts the ${mode} config`, () => {
-      const file = join(tmp, `sing-box-${mode}.json`)
-      writeFileSync(file, JSON.stringify(singbox({ proxyMode: mode }), null, 2))
-      check(SINGBOX, ['check', '-c', file])
-    })
+    for (const routingMode of ['rule', 'global', 'direct'] as const) {
+      it.skipIf(!existsSync(SINGBOX))(`sing-box check accepts ${mode}/${routingMode}`, () => {
+        const file = join(tmp, `sing-box-${mode}-${routingMode}.json`)
+        writeFileSync(file, JSON.stringify(singbox({ proxyMode: mode, routingMode }), null, 2))
+        check(SINGBOX, ['check', '-c', file])
+      })
+    }
   }
+
+  it.skipIf(!existsSync(SINGBOX))('sing-box check accepts the latency probe config', () => {
+    const file = join(tmp, 'sing-box-probe.json')
+    const probe = generateProbeConfig({ outbounds, clashApiPort: 19091, logFile: 'p.log', xrayPorts })
+    writeFileSync(file, JSON.stringify(probe, null, 2))
+    check(SINGBOX, ['check', '-c', file])
+  })
+
+  it.skipIf(!existsSync(SINGBOX))('sing-box check accepts imported rule types', () => {
+    const file = join(tmp, 'sing-box-rules.json')
+    const cfg = generateSingboxConfig({
+      outbounds,
+      activeOutboundId: 'auto',
+      rules: {
+        defaultBehavior: 'proxy',
+        rules: [
+          { id: '1', enabled: true, conditionType: 'DomainRegex', value: '^(.+\\.)?ads\\.', action: 'REJECT' },
+          { id: '2', enabled: true, conditionType: 'DstPort', value: '6881-6889', action: 'DIRECT' },
+          { id: '3', enabled: true, conditionType: 'DstPort', value: '22', action: 'DIRECT' },
+          { id: '4', enabled: true, conditionType: 'IPCIDR', value: '2001:db8::/32', action: 'DIRECT' },
+          { id: '5', enabled: true, conditionType: 'GeoIP', value: 'lan', action: 'DIRECT' }
+        ]
+      },
+      settings: TEST_SETTINGS,
+      socksPort: 10808,
+      httpPort: 10809,
+      clashApiPort: 19090,
+      logFile: 'l',
+      cacheFile: 'c',
+      xrayPorts
+    })
+    writeFileSync(file, JSON.stringify(cfg, null, 2))
+    check(SINGBOX, ['check', '-c', file])
+  })
 })

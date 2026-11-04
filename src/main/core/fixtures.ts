@@ -23,6 +23,8 @@ export const MIXED_SUB_BODY = Buffer.from([VLESS_A, VLESS_B, HY2].join('\n')).to
 
 export const TEST_SETTINGS: AppSettings = {
   proxyMode: 'system',
+  routingMode: 'rule',
+  supportUrl: '',
   autoLaunch: false,
   autoConnect: false,
   language: 'ru',

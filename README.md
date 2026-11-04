@@ -2,7 +2,8 @@
 
 Windows desktop VPN client (Electron + React + TypeScript) for Remnawave-based
 infrastructure. Supports VLESS + REALITY (via Xray-core) and Hysteria2, with per-process
-and per-domain routing rules in the style of Clash / Koala Clash.
+and per-domain routing rules in the style of Clash / Koala Clash, one-click routing modes,
+an automatic best-server group, real (through-the-node) latency and a live connections view.
 
 ## Stack
 
@@ -154,6 +155,46 @@ A second launch (including via a link) hands its arguments to the running copy
 ## Tray
 
 Closing the window hides it to the tray — the VPN keeps running (a one-time
-notification says so). Tray menu: «Открыть», «Подключить/Отключить», «Выход»
-(stops the cores and reverts the system proxy). Double click opens the window;
-the icon differs for connected / disconnected.
+notification says so). Tray menu: «Открыть», «Подключить/Отключить», «Режим
+трафика» (По правилам / Весь трафик через VPN / Всё напрямую), «Выход» (stops
+the cores and reverts the system proxy — only if CipherWay set it). Double click
+opens the window; the icon differs for connected / disconnected.
+
+## 0.4.0: modes, auto server, real latency, connections
+
+- **Routing mode** (sidebar + tray): `rule` / `global` / `direct`, saved in
+  settings. sing-box rules `clash_mode: Direct → direct`, `clash_mode: Global →
+  proxy` sit before the user rules (LAN always direct); switching is a Clash
+  API `PATCH /configs {mode}` + closing open connections — no core restart, no
+  UAC in TUN.
+- **Server groups**: `auto` = `urltest` over every node (gstatic generate_204,
+  5 min, tolerance 50 ms) and `proxy` = `selector` [auto, …nodes]. PROXY rules
+  and `route.final` point at `proxy`; picking a server is `PUT /proxies/proxy`
+  (hot). After start the saved mode/server are applied explicitly because
+  `cache.db` would restore the previous ones.
+- **Latency** = `GET /proxies/<node>/delay` (real HTTPS request through the
+  node, 5 s, parallel), not a TCP ping. While disconnected a throw-away xray +
+  sing-box pair without inbounds (`generateProbeConfig`) is started for the
+  test and removed afterwards. Auto-test on opening Главная/Серверы at most
+  once a minute, «Проверить» forces it.
+- **Подключения**: `/connections` polled once a second while the screen is
+  open, grouped by process (exe icon via `app.getFileIcon`) or by site.
+  `route.find_process: true` — on Windows sing-box finds the process in
+  system-proxy mode too (checked on 1.13.14). Our own `xray.exe` sockets and
+  anything aimed at a node address are dropped; the chain is reduced to the
+  server *name*. Rejected connections are not tracked by sing-box at all.
+- **No node addresses in the UI**: the renderer receives `SubscriptionView`
+  (id, name, protocol — no host/port/keys); log lines and error messages are
+  masked in main (`mask.ts`: node hosts/IPs with port, UUIDs, passwords, the
+  subscription link and its token → first characters + `***`).
+- **Subscription headers**: `subscription-userinfo`, `profile-title`,
+  `support-url`, `profile-web-page-url`, `announce` (plain or `base64:`),
+  `profile-update-interval`. «Поддержка» falls back to Настройки → Поддержка.
+- **Rules text editor** (Правила → Текст): Clash lines, Koala / Clash Verge YAML
+  (`prepend` / `append` / `delete`, `rules:`, `payload:`) and our JSON; unknown
+  lines are listed with line numbers and reasons. Export as Clash lines. New
+  rule types: `DomainRegex` (`domain_regex`), `DstPort` (`port` / `port_range`),
+  IPv6 CIDR.
+
+Opt-in end-to-end test with the real cores (local VLESS test server, system
+proxy mocked): `CW_E2E=1 npx vitest run src/main/core/sidecar.e2e.test.ts`.

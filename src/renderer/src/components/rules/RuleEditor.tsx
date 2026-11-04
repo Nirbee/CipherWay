@@ -8,6 +8,7 @@ import {
   GEOSITE_CATEGORIES
 } from '../../lib/ruleMeta'
 import { ProcessPicker } from './ProcessPicker'
+import { validateValue } from '@shared/rulesText'
 
 type Draft = Omit<RoutingRule, 'id'>
 
@@ -43,15 +44,16 @@ export function RuleEditor({ open, initial, outboundNames, onClose, onSave }: Pr
 
   const actionOptions = useMemo(
     () => [
-      { value: 'PROXY', label: 'PROXY (через туннель)' },
-      { value: 'DIRECT', label: 'DIRECT (напрямую)' },
-      { value: 'REJECT', label: 'REJECT (блокировать)' },
-      ...outboundNames.map((n) => ({ value: n, label: n }))
+      { value: 'PROXY', label: 'Через VPN (текущий сервер)' },
+      { value: 'DIRECT', label: 'Напрямую' },
+      { value: 'REJECT', label: 'Блокировать' },
+      ...outboundNames.map((n) => ({ value: n, label: `Через VPN · только ${n}` }))
     ],
     [outboundNames]
   )
 
-  const valid = draft.value.trim().length > 0
+  const check = draft.value.trim() ? validateValue(draft.conditionType, draft.value) : null
+  const valid = check?.ok === true
 
   return (
     <Modal
@@ -63,7 +65,10 @@ export function RuleEditor({ open, initial, outboundNames, onClose, onSave }: Pr
           <Button variant="secondary" onClick={onClose}>
             Отмена
           </Button>
-          <Button disabled={!valid} onClick={() => onSave({ ...draft, value: draft.value.trim() })}>
+          <Button
+            disabled={!valid}
+            onClick={() => check?.ok && onSave({ ...draft, value: check.value })}
+          >
             Сохранить
           </Button>
         </>
@@ -73,18 +78,31 @@ export function RuleEditor({ open, initial, outboundNames, onClose, onSave }: Pr
         <Field label="Тип условия">
           <Select
             value={draft.conditionType}
-            options={CONDITION_TYPES.map((t) => ({ value: t, label: CONDITION_META[t].label }))}
+            options={CONDITION_TYPES.map((t) => ({
+              value: t,
+              label: `${CONDITION_META[t].label} — ${CONDITION_META[t].clash}`
+            }))}
             onChange={(v) =>
               setDraft((d) => ({ ...d, conditionType: v as RuleConditionType, value: '' }))
             }
           />
         </Field>
 
-        <Field label="Значение" hint={isProcess ? 'Введите вручную или выберите процесс' : undefined}>
+        <Field
+          label="Значение"
+          hint={
+            check && !check.ok
+              ? `Ошибка: ${check.reason}`
+              : isProcess
+                ? 'Введите вручную или выберите запущенную программу'
+                : meta.hint
+          }
+        >
           <div className="flex gap-2">
             <Input
               list={datalist.length ? 'rule-autocomplete' : undefined}
               mono={meta.mono}
+              invalid={!!check && !check.ok}
               placeholder={meta.placeholder}
               value={draft.value}
               onChange={(e) => setDraft((d) => ({ ...d, value: e.target.value }))}

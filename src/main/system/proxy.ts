@@ -29,3 +29,28 @@ async function reg(name: string, type: string, data: string): Promise<void> {
     windowsHide: true
   })
 }
+
+/** Current WinInet proxy (HKCU), or null if it can't be read. */
+export async function readSystemProxy(): Promise<{ enabled: boolean; server: string } | null> {
+  if (process.platform !== 'win32') return null
+  try {
+    const { stdout } = await exec('reg', ['query', REG_PATH], { windowsHide: true })
+    const enabled = /ProxyEnable\s+REG_DWORD\s+0x1\b/i.test(stdout)
+    const server = /ProxyServer\s+REG_SZ\s+(\S+)/i.exec(stdout)?.[1] ?? ''
+    return { enabled, server }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * After a crash / kill the registry may still point at our dead local port
+ * (no internet in browsers). Called on startup while disconnected: switches
+ * the proxy off only if it is exactly our 127.0.0.1:<port>.
+ */
+export async function clearStaleProxy(port: number): Promise<boolean> {
+  const cur = await readSystemProxy()
+  if (!cur?.enabled || cur.server !== `127.0.0.1:${port}`) return false
+  await disableSystemProxy()
+  return true
+}

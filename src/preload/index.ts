@@ -10,7 +10,8 @@ function subscribe(channel: string, cb: (...args: unknown[]) => void): () => voi
 
 const api: ExposedApi = {
   app: {
-    getVersion: () => ipcRenderer.invoke(IPC.appGetVersion)
+    getVersion: () => ipcRenderer.invoke(IPC.appGetVersion),
+    openExternal: (url) => ipcRenderer.invoke(IPC.openExternal, url)
   },
   window: {
     minimize: () => ipcRenderer.send(IPC.windowMinimize),
@@ -21,12 +22,19 @@ const api: ExposedApi = {
   vpn: {
     connect: (outboundId) => ipcRenderer.invoke(IPC.connect, outboundId),
     disconnect: () => ipcRenderer.invoke(IPC.disconnect),
-    getStatus: () => ipcRenderer.invoke(IPC.getStatus)
+    getStatus: () => ipcRenderer.invoke(IPC.getStatus),
+    setRoutingMode: (mode) => ipcRenderer.invoke(IPC.setRoutingMode, mode)
   },
   subscription: {
     fetch: (url) => ipcRenderer.invoke(IPC.subscriptionFetch, url),
     refresh: () => ipcRenderer.invoke(IPC.subscriptionRefresh),
     get: () => ipcRenderer.invoke(IPC.subscriptionGet)
+  },
+  connections: {
+    list: () => ipcRenderer.invoke(IPC.connectionsList),
+    close: (id) => ipcRenderer.invoke(IPC.connectionsClose, id),
+    closeAll: () => ipcRenderer.invoke(IPC.connectionsCloseAll),
+    icon: (exePath) => ipcRenderer.invoke(IPC.processIcon, exePath)
   },
   servers: {
     ping: () => ipcRenderer.invoke(IPC.serversPing),
@@ -37,6 +45,8 @@ const api: ExposedApi = {
     set: (config) => ipcRenderer.invoke(IPC.rulesSet, config),
     export: () => ipcRenderer.invoke(IPC.rulesExport),
     import: () => ipcRenderer.invoke(IPC.rulesImport),
+    openText: () => ipcRenderer.invoke(IPC.rulesOpenText),
+    saveText: (text) => ipcRenderer.invoke(IPC.rulesSaveText, text),
     processList: () => ipcRenderer.invoke(IPC.processList),
     pickExecutable: () => ipcRenderer.invoke(IPC.pickExecutable)
   },
@@ -58,7 +68,9 @@ const api: ExposedApi = {
     log: (cb) => subscribe(IPC.evtLog, (p) => cb(p as never)),
     updater: (cb) => subscribe(IPC.evtUpdater, (p) => cb(p as never)),
     windowMaximized: (cb) => subscribe(IPC.evtWindowMaximized, (p) => cb(p as never)),
-    importRequest: (cb) => subscribe(IPC.evtImportRequest, () => cb())
+    importRequest: (cb) => subscribe(IPC.evtImportRequest, () => cb()),
+    settings: (cb) => subscribe(IPC.evtSettings, (p) => cb(p as never)),
+    subscription: (cb) => subscribe(IPC.evtSubscription, (p) => cb(p as never))
   }
 }
 
