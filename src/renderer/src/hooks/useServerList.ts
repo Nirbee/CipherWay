@@ -13,6 +13,10 @@ export interface ServerEntry {
   protocol?: Protocol
   /** undefined = not tested */
   latency: number | null | undefined
+  /** «auto» right after connecting: the core is checking the servers */
+  checking?: boolean
+  /** «auto»: no server answered */
+  dead?: boolean
 }
 
 /**
@@ -29,26 +33,42 @@ export function useServerList(): {
   const pings = useServers((s) => s.pings)
   const activeId = useServers((s) => s.activeId)
   const autoSelectedId = useConnection((s) => s.autoSelectedId)
+  const autoDelayMs = useConnection((s) => s.autoDelayMs)
+  const autoChecking = useConnection((s) => s.autoChecking)
+  const autoDead = useConnection((s) => s.autoDead)
 
   return useMemo(() => {
     const list: ServerEntry[] = (servers ?? []).map((s) => {
       const { code, label } = parseServerName(s.name)
       return { id: s.id, label, code, protocol: s.protocol, latency: pings[s.id] }
     })
+    // connected: the node the core uses right now, with *its* latency
     let autoPick = list.find((e) => e.id === autoSelectedId)
-    if (!autoPick) {
+    if (autoPick && autoDelayMs !== undefined) autoPick = { ...autoPick, latency: autoDelayMs }
+    if (!autoPick && !autoChecking && !autoDead) {
       const measured = list.filter((e) => typeof e.latency === 'number')
       autoPick = measured.sort((a, b) => (a.latency as number) - (b.latency as number))[0]
     }
     const tested = list.some((e) => e.latency !== undefined)
+    const latency = autoChecking
+      ? undefined
+      : autoDead
+        ? null
+        : autoPick
+          ? autoPick.latency
+          : tested
+            ? null
+            : undefined
     const auto: ServerEntry = {
       id: AUTO_OUTBOUND_ID,
       label: 'Лучший сервер (авто)',
       auto: true,
-      latency: autoPick ? autoPick.latency : tested ? null : undefined
+      latency,
+      checking: !!autoChecking,
+      dead: !!autoDead
     }
     const entries = list.length ? [auto, ...list] : []
     const active = entries.find((e) => e.id === activeId) ?? (list.length ? auto : undefined)
-    return { entries, active, autoPick }
-  }, [servers, pings, activeId, autoSelectedId])
+    return { entries, active, autoPick: autoChecking || autoDead ? undefined : autoPick }
+  }, [servers, pings, activeId, autoSelectedId, autoDelayMs, autoChecking, autoDead])
 }

@@ -30,7 +30,9 @@ export const TEST_SETTINGS: AppSettings = {
   language: 'ru',
   socksPort: 10808,
   httpPort: 10809,
-  subscriptionRefreshHours: 12
+  subscriptionRefreshHours: 12,
+  verboseLog: false,
+  apiBase: 'https://cabinet.example.com'
 }
 
 export const TEST_RULES: RulesConfig = {

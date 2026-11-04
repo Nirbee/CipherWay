@@ -36,10 +36,13 @@ export function LatencyBadge({ ms, testing, className }: Props) {
   if (testing && ms === undefined) {
     return (
       <span
-        className={cn('inline-flex items-center gap-1.5 font-mono text-xs text-text-muted', className)}
+        className={cn(
+          'inline-flex items-center gap-1.5 font-mono text-xs text-text-muted',
+          className
+        )}
       >
         <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-text-muted" />
-        проверка
+        проверяем…
       </span>
     )
   }

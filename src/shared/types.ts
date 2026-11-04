@@ -146,7 +146,13 @@ export interface AppSettings {
   socksPort: number
   httpPort: number
   subscriptionRefreshHours: number
+  /** «Подробный журнал (для поддержки)»: cores log every connection (info) */
+  verboseLog: boolean
+  /** in-app support API (cabinet), https only */
+  apiBase: string
 }
+
+export const DEFAULT_API_BASE = 'https://cabinet.cipherway.net.ru'
 
 // ---------------------------------------------------------------------------
 // Runtime status / telemetry pushed from main -> renderer
@@ -164,7 +170,21 @@ export interface StatusUpdate {
   activeOutboundId?: string
   /** node currently picked by «Лучший сервер (авто)» (urltest `now`) */
   autoSelectedId?: string
+  /** last measured latency of autoSelectedId; null = no answer */
+  autoDelayMs?: number | null
+  /** the first server check after connecting is still running */
+  autoChecking?: boolean
+  /** the check finished and no server answered */
+  autoDead?: boolean
   message?: string
+}
+
+/** What the urltest group is doing right now (main-process internal → StatusUpdate). */
+export interface AutoInfo {
+  nodeId?: string
+  delayMs?: number | null
+  checking: boolean
+  dead: boolean
 }
 
 export interface LogEntry {
@@ -219,4 +239,57 @@ export interface ConnSnapshot {
   running: boolean
   proxyMode: ProxyMode
   items: ConnItem[]
+}
+
+// ---------------------------------------------------------------------------
+// In-app support chat (cabinet API /api/app/v1/support)
+// ---------------------------------------------------------------------------
+
+export interface SupportMessage {
+  /** stable key for React lists (index + time) */
+  key: string
+  from: 'you' | 'support'
+  text: string
+  /** absolute image URL on the support server; load via support.image() */
+  image?: string
+  /** ISO date */
+  at: string
+}
+
+export interface SupportThread {
+  ticketId: number | null
+  status: string | null
+  messages: SupportMessage[]
+}
+
+export interface SupportMe {
+  username: string | null
+  hasTelegram: boolean
+}
+
+export interface SupportView {
+  /** false = no subscription yet, support needs one to log in */
+  available: boolean
+  thread: SupportThread | null
+  me: SupportMe | null
+  /** support messages newer than the last time the page was open */
+  unread: number
+  /** readable error of the last request (Russian), null = OK */
+  error: string | null
+  /** ms timestamp of the last successful fetch */
+  updatedAt: number | null
+}
+
+export interface SupportSendResult {
+  ticketId: number
+  aiOutcome: string | null
+  aiReply: string | null
+}
+
+export type SupportImageMime = 'image/jpeg' | 'image/png' | 'image/webp'
+
+export interface SupportPhoto {
+  data: Uint8Array
+  mime: SupportImageMime
+  caption: string
 }

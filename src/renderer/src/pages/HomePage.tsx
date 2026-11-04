@@ -94,7 +94,7 @@ function Announcement({ text }: { text: string }) {
 function ProfileCard() {
   const data = useSubscription((s) => s.data)
   const setPage = useNav((s) => s.setPage)
-  const { supportUrl, renewUrl } = useLinks()
+  const { renewUrl } = useLinks()
 
   if (!data) {
     return (
@@ -136,12 +136,10 @@ function ProfileCard() {
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          {supportUrl && (
-            <Button variant="ghost" size="sm" onClick={() => openLink(supportUrl)}>
-              <SupportIcon width={15} height={15} />
-              Поддержка
-            </Button>
-          )}
+          <Button variant="ghost" size="sm" onClick={() => setPage('support')}>
+            <SupportIcon width={15} height={15} />
+            Поддержка
+          </Button>
           {renewUrl && (
             <Button
               variant={soon || expired ? 'primary' : 'secondary'}
@@ -197,11 +195,22 @@ function ProfileCard() {
   )
 }
 
-function StatusPill({ expired, soon, days }: { expired: boolean; soon: boolean; days: number | null }) {
+function StatusPill({
+  expired,
+  soon,
+  days
+}: {
+  expired: boolean
+  soon: boolean
+  days: number | null
+}) {
   const [tone, text] = expired
     ? ['bg-accent-red/15 text-accent-red', 'истекла']
     : soon
-      ? ['bg-accent-amber/15 text-accent-amber', days === 0 ? 'истекает сегодня' : `ещё ${formatDays(days ?? 0)}`]
+      ? [
+          'bg-accent-amber/15 text-accent-amber',
+          days === 0 ? 'истекает сегодня' : `ещё ${formatDays(days ?? 0)}`
+        ]
       : ['bg-accent-green/15 text-accent-green', 'активна']
   return (
     <span className={cn('shrink-0 rounded-pill px-2 py-0.5 text-[11px] font-medium', tone)}>
@@ -289,7 +298,14 @@ function ConnectHero({ hasServers }: { hasServers: boolean }) {
               <stop offset="100%" stopColor="#34d399" />
             </linearGradient>
           </defs>
-          <circle cx="98" cy="98" r="90" fill="none" stroke="rgba(255,255,255,0.05)" strokeWidth="5" />
+          <circle
+            cx="98"
+            cy="98"
+            r="90"
+            fill="none"
+            stroke="rgba(255,255,255,0.05)"
+            strokeWidth="5"
+          />
           <circle
             cx="98"
             cy="98"
@@ -372,14 +388,22 @@ function ConnectHero({ hasServers }: { hasServers: boolean }) {
         {error && message && (
           <div className="mx-auto mt-1.5 max-w-md text-xs leading-relaxed text-accent-red/90">
             {message}{' '}
-            <button onClick={() => setPage('logs')} className="text-text-muted underline-offset-2 hover:underline">
+            <button
+              onClick={() => setPage('logs')}
+              className="text-text-muted underline-offset-2 hover:underline"
+            >
               Логи
             </button>
           </div>
         )}
+        {connecting && message && (
+          <div className="animate-fade mt-1.5 text-xs text-accent-amber">{message}</div>
+        )}
         {!connected && !connecting && !error && (
           <div className="mt-1.5 text-xs text-text-muted">
-            {hasServers ? 'Нажмите на кнопку, чтобы подключиться' : 'Нет серверов — добавьте подписку'}
+            {hasServers
+              ? 'Нажмите на кнопку, чтобы подключиться'
+              : 'Нет серверов — добавьте подписку'}
           </div>
         )}
       </div>

@@ -57,6 +57,15 @@ const api: ExposedApi = {
   deeplink: {
     takePending: () => ipcRenderer.invoke(IPC.deeplinkTakePending)
   },
+  support: {
+    get: () => ipcRenderer.invoke(IPC.supportGet),
+    refresh: () => ipcRenderer.invoke(IPC.supportRefresh),
+    send: (text) => ipcRenderer.invoke(IPC.supportSend, text),
+    sendPhoto: (photo) => ipcRenderer.invoke(IPC.supportSendPhoto, photo),
+    image: (url) => ipcRenderer.invoke(IPC.supportImage, url),
+    setActive: (active) => ipcRenderer.send(IPC.supportSetActive, active),
+    markRead: () => ipcRenderer.send(IPC.supportMarkRead)
+  },
   updater: {
     check: () => ipcRenderer.invoke(IPC.updaterCheck),
     download: () => ipcRenderer.invoke(IPC.updaterDownload),
@@ -66,6 +75,9 @@ const api: ExposedApi = {
     status: (cb) => subscribe(IPC.evtStatus, (p) => cb(p as never)),
     traffic: (cb) => subscribe(IPC.evtTraffic, (p) => cb(p as never)),
     log: (cb) => subscribe(IPC.evtLog, (p) => cb(p as never)),
+    pings: (cb) => subscribe(IPC.evtPings, (p) => cb(p as never)),
+    support: (cb) => subscribe(IPC.evtSupport, (p) => cb(p as never)),
+    navigate: (cb) => subscribe(IPC.evtNavigate, (p) => cb(p as never)),
     updater: (cb) => subscribe(IPC.evtUpdater, (p) => cb(p as never)),
     windowMaximized: (cb) => subscribe(IPC.evtWindowMaximized, (p) => cb(p as never)),
     importRequest: (cb) => subscribe(IPC.evtImportRequest, () => cb()),

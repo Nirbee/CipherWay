@@ -198,3 +198,38 @@ opens the window; the icon differs for connected / disconnected.
 
 Opt-in end-to-end test with the real cores (local VLESS test server, system
 proxy mocked): `CW_E2E=1 npx vitest run src/main/core/sidecar.e2e.test.ts`.
+
+## 0.4.1: TUN fast path, quick first DNS, quiet logs, in-app support
+
+- **xray bypasses the TUN**: before a TUN start the node hosts are resolved
+  (system DNS, the TUN is not up yet). Their IPs go into
+  `tun.route_exclude_address` (v4 `/32`, v6 `/128`) and into xray `dns.hosts`
+  with `sockopt.domainStrategy: UseIP`, so xray dials exactly the excluded IPs
+  and its sockets leave through the physical NIC instead of looping through
+  sing-box. `process_name: xray.exe → direct` stays as a safety net. (Xray 26.7
+  also accepts `sockopt.interface` on Windows, but a bound NIC breaks on a
+  Wi-Fi/Ethernet switch — not used.) Resolved IPs are masked in logs.
+- **First seconds after connecting**: until a urltest member has a test result,
+  sing-box sends everything (DoH included) through the *first* member. The
+  members are now ordered by the last measured latency (persisted,
+  `latencyCache`): answered → never measured → dead. Right after start the
+  group is checked (`GET /group/auto/delay`), «Лучший сервер» shows «проверяем…»,
+  then the chosen node with *its* latency, or «ни один сервер не отвечает».
+  xray must accept connections on every node port before sing-box starts.
+- **Logs**: sing-box `warn` / xray `warning` by default; Настройки →
+  «Подробный журнал (для поддержки)» → `info`. Main sends log lines in batches
+  (≤ 400 per 300 ms, overflow is counted), the «Логи» screen keeps 1000 lines.
+- **TUN start**: «connected» only once the wintun adapter (172.19.0.1) exists,
+  up to 45 s («Создаём сетевой адаптер…»); one retry via `restart.signal`
+  (no second UAC). The broker writes `core.exit` when sing-box dies on its own
+  (the app reports it) and exits when the app process is gone.
+- **Поддержка** page: chat with the cabinet API (`apiBase`, default
+  `https://cabinet.cipherway.net.ru`): `GET/POST /api/app/v1/support`,
+  `POST /api/app/v1/support/photo` (multipart, JPG/PNG/WebP ≤ 10 MB),
+  `GET /api/app/v1/me`; auth `X-Subscription-Token` (last path segment of the
+  subscription link) + the subscription's device headers. Requests and image
+  downloads are made by main (images reach the renderer as `data:` URLs, the
+  token never does; redirects only within the same origin). Polling: 10 s on
+  the page, 60 s in the background with an open ticket, 10 min without one;
+  a new reply → Windows notification + badge. «Написать в Telegram»
+  (`support-url`) stays as a fallback.

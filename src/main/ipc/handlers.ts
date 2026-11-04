@@ -1,18 +1,22 @@
 import { writeFile, readFile, stat } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
-import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, shell, Notification } from 'electron'
 import { z } from 'zod'
 import { IPC } from '@shared/ipc'
 import type {
   AppSettings,
+  AutoInfo,
   ConnSnapshot,
+  LogEntry,
   RoutingMode,
   RulesConfig,
   ServerPing,
   StatusUpdate,
   SubscriptionData,
-  SubscriptionView
+  SubscriptionView,
+  SupportView
 } from '@shared/types'
+import { LogBatcher } from '@shared/logBuffer'
 import { DEFAULT_SETTINGS, getSettings, store } from '../store'
 import { listProcesses } from '../system/processes'
 import { remnawave } from '../remnawave/RemnawaveClient'
@@ -22,12 +26,29 @@ import { createMasker, type Masker } from '../mask'
 import { SidecarManager } from '../core/SidecarManager'
 import { toConnItems } from '../core/connections'
 import { AppUpdater } from '../updater/AppUpdater'
+import {
+  SUPPORT_CAPTION_MAX,
+  SUPPORT_IMAGE_MAX_BYTES,
+  SUPPORT_IMAGE_MIMES,
+  SUPPORT_TEXT_MAX,
+  SupportClient,
+  subscriptionToken
+} from '../support/client'
+import { SupportService } from '../support/SupportService'
 
 /** Set once handlers are registered; used for graceful shutdown / startup. */
 export let activeManager: SidecarManager | null = null
 export let appUpdater: AppUpdater | null = null
+export let supportService: SupportService | null = null
 
 type GetWindow = () => BrowserWindow | null
+
+export interface HandlerHooks {
+  /** bring the main window to the front (notification click) */
+  showWindow: () => void
+  /** icon for Windows notifications */
+  notificationIcon?: string
+}
 
 // --- zod validation schemas for inbound IPC payloads ----------------------
 
@@ -72,6 +93,19 @@ const externalUrlSchema = z
     }
   }, 'unsupported link')
 
+/** support API base: https only, no credentials / query in it */
+const apiBaseSchema = z
+  .string()
+  .max(300)
+  .refine((v) => {
+    try {
+      const u = new URL(v)
+      return u.protocol === 'https:' && !u.username && !u.password && !u.search && !u.hash
+    } catch {
+      return false
+    }
+  }, 'нужен адрес https://')
+
 const settingsPatchSchema = z
   .object({
     proxyMode: z.enum(['system', 'tun']),
@@ -82,9 +116,22 @@ const settingsPatchSchema = z
     language: z.enum(['ru', 'en']),
     socksPort: z.number().int().min(1).max(65535),
     httpPort: z.number().int().min(1).max(65535),
-    subscriptionRefreshHours: z.number().int().min(1).max(168)
+    subscriptionRefreshHours: z.number().int().min(1).max(168),
+    verboseLog: z.boolean(),
+    apiBase: apiBaseSchema
   })
   .partial()
+
+const supportPhotoSchema = z.object({
+  data: z
+    .instanceof(Uint8Array)
+    .refine(
+      (d) => d.byteLength > 0 && d.byteLength <= SUPPORT_IMAGE_MAX_BYTES,
+      'Картинка больше 10 МБ'
+    ),
+  mime: z.enum(SUPPORT_IMAGE_MIMES as [string, ...string[]]),
+  caption: z.string().max(SUPPORT_CAPTION_MAX)
+})
 
 const exePathSchema = z
   .string()
@@ -118,8 +165,18 @@ function buildStartParams() {
     outbounds: sub?.outbounds ?? [],
     activeOutboundId: store.get('activeOutboundId') ?? undefined,
     rules: store.get('rules'),
-    settings: getSettings()
+    settings: getSettings(),
+    latencies: store.get('latencyCache') ?? {}
   }
+}
+
+/** Remembers latencies across runs (orders «Лучший сервер (авто)» next time). */
+function saveLatencies(pings: ServerPing[], known: Set<string>): void {
+  const next: Record<string, number | null> = {}
+  const prev = store.get('latencyCache') ?? {}
+  for (const [id, v] of Object.entries(prev)) if (known.has(id)) next[id] = v
+  for (const p of pings) next[p.outboundId] = p.latencyMs
+  store.set('latencyCache', next)
 }
 
 let connectImpl: ((outboundId?: string) => Promise<StatusUpdate>) | null = null
@@ -138,7 +195,7 @@ export function setRoutingMode(mode: RoutingMode): Promise<AppSettings> {
   return routingModeImpl ? routingModeImpl(mode) : Promise.resolve(getSettings())
 }
 
-export function registerIpcHandlers(getWindow: GetWindow): void {
+export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks): void {
   const send = (channel: string, payload: unknown): void => {
     const win = getWindow()
     if (win && !win.isDestroyed()) win.webContents.send(channel, payload)
@@ -156,40 +213,71 @@ export function registerIpcHandlers(getWindow: GetWindow): void {
 
   // node addresses / credentials / the subscription link never reach the UI log
   let mask: Masker = (t) => t
+  let serverIps: string[] = []
   const rebuildMask = (data: SubscriptionData | null): void => {
     mask = createMasker({
       outbounds: data?.outbounds ?? [],
-      subscriptionUrl: getSubscriptionUrl()
+      subscriptionUrl: getSubscriptionUrl(),
+      extraHosts: serverIps
     })
   }
   rebuildMask(remnawave.getCached())
   const view = (data: SubscriptionData | null): SubscriptionView | null =>
     toSubscriptionView(data, getSubscriptionUrl())
+  let supportToken = subscriptionToken(getSubscriptionUrl())
   remnawave.onUpdate((d) => {
     rebuildMask(d)
     send(IPC.evtSubscription, view(remnawave.getCached()))
+    // another subscription = another support account
+    const token = subscriptionToken(getSubscriptionUrl())
+    if (token !== supportToken) {
+      supportToken = token
+      supportService?.reset()
+    }
   })
+
+  // the cores can print thousands of lines a minute: one IPC message per batch
+  const logBatcher = new LogBatcher((batch: LogEntry[]) => send(IPC.evtLog, batch))
 
   ipcMain.handle(IPC.appGetVersion, () => app.getVersion())
   ipcMain.handle(IPC.openExternal, async (_e, url: unknown) => {
     await shell.openExternal(externalUrlSchema.parse(url))
   })
 
-  let autoSelectedId: string | undefined
+  let auto: AutoInfo = { checking: false, dead: false }
+  const autoFields = (connected: boolean): Partial<StatusUpdate> =>
+    connected
+      ? {
+          autoSelectedId: auto.nodeId,
+          autoDelayMs: auto.delayMs,
+          autoChecking: auto.checking,
+          autoDead: auto.dead
+        }
+      : {}
+  const knownIds = (): Set<string> =>
+    new Set((remnawave.getCached()?.outbounds ?? []).map((o) => o.id))
   const manager = new SidecarManager(
-    (entry) => send(IPC.evtLog, { ...entry, message: mask(entry.message) }),
+    (entry) => logBatcher.push({ ...entry, message: mask(entry.message) }),
     (state, message) => {
       publish({
         state,
         activeOutboundId: store.get('activeOutboundId') ?? undefined,
-        autoSelectedId: state === 'connected' ? autoSelectedId : undefined,
+        ...autoFields(state === 'connected'),
         message: message ? mask(message) : undefined
       })
     },
     (traffic) => send(IPC.evtTraffic, traffic),
-    (nodeId) => {
-      autoSelectedId = nodeId
-      if (status.state === 'connected') publish({ ...status, autoSelectedId: nodeId })
+    (info) => {
+      auto = info
+      if (status.state === 'connected') publish({ ...status, ...autoFields(true) })
+    },
+    (pings) => {
+      saveLatencies(pings, knownIds())
+      send(IPC.evtPings, pings)
+    },
+    (ips) => {
+      serverIps = ips
+      rebuildMask(remnawave.getCached())
     }
   )
 
@@ -261,7 +349,10 @@ export function registerIpcHandlers(getWindow: GetWindow): void {
   // ---- servers -----------------------------------------------------------
   ipcMain.handle(IPC.serversPing, async (): Promise<ServerPing[]> => {
     const outbounds = remnawave.getCached()?.outbounds ?? []
-    return manager.testLatency(outbounds)
+    const res = await manager.testLatency(outbounds)
+    // a «nothing answered» probe (e.g. offline) must not reorder the group
+    if (res.some((r) => r.latencyMs !== null)) saveLatencies(res, knownIds())
+    return res
   })
 
   ipcMain.handle(IPC.serverSelect, async (_e, outboundId: unknown) => {
@@ -367,7 +458,10 @@ export function registerIpcHandlers(getWindow: GetWindow): void {
       title: 'Открыть файл правил',
       properties: ['openFile'],
       filters: [
-        { name: 'Правила (YAML, JSON, текст)', extensions: ['yaml', 'yml', 'json', 'txt', 'list', 'conf'] },
+        {
+          name: 'Правила (YAML, JSON, текст)',
+          extensions: ['yaml', 'yml', 'json', 'txt', 'list', 'conf']
+        },
         { name: 'Все файлы', extensions: ['*'] }
       ]
     })
@@ -378,7 +472,10 @@ export function registerIpcHandlers(getWindow: GetWindow): void {
   })
 
   ipcMain.handle(IPC.rulesSaveText, async (_e, text: unknown): Promise<string | null> => {
-    const body = z.string().max(4 * 1024 * 1024).parse(text)
+    const body = z
+      .string()
+      .max(4 * 1024 * 1024)
+      .parse(text)
     const win = getWindow()
     const { canceled, filePath } = await dialog.showSaveDialog(win ?? undefined!, {
       title: 'Сохранить правила',
@@ -426,8 +523,71 @@ export function registerIpcHandlers(getWindow: GetWindow): void {
     if (parsed.proxyMode && parsed.proxyMode !== prev.proxyMode && manager.isRunning) {
       void manager.reload(buildStartParams()).catch(() => undefined)
     }
+    if (parsed.apiBase && parsed.apiBase !== prev.apiBase) support.reset()
     return next
   })
+
+  // ---- support chat ------------------------------------------------------
+  const client = new SupportClient(async () => ({
+    apiBase: getSettings().apiBase,
+    subscriptionUrl: getSubscriptionUrl(),
+    deviceHeaders: await remnawave.deviceHeaders()
+  }))
+  const support = new SupportService({
+    client,
+    hasSubscription: () => !!subscriptionToken(getSubscriptionUrl()),
+    getReadAt: () => store.get('supportReadAt') ?? null,
+    setReadAt: (v) => store.set('supportReadAt', v),
+    getNotifiedAt: () => store.get('supportNotifiedAt') ?? null,
+    setNotifiedAt: (v) => store.set('supportNotifiedAt', v),
+    publish: (v: SupportView) => send(IPC.evtSupport, v),
+    notify: (text) => {
+      if (!Notification.isSupported()) return
+      const n = new Notification({
+        title: 'Ответ поддержки CipherWay',
+        body: text,
+        ...(hooks?.notificationIcon ? { icon: hooks.notificationIcon } : {})
+      })
+      n.on('click', () => {
+        hooks?.showWindow()
+        send(IPC.evtNavigate, 'support')
+      })
+      n.show()
+    },
+    isWindowFocused: () => {
+      const win = getWindow()
+      return !!win && !win.isDestroyed() && win.isVisible() && win.isFocused()
+    }
+  })
+  supportService = support
+  support.start()
+
+  ipcMain.handle(IPC.supportGet, async (): Promise<SupportView> => support.view())
+  ipcMain.handle(IPC.supportRefresh, async (): Promise<SupportView> => support.refresh())
+  ipcMain.handle(IPC.supportSend, async (_e, text: unknown) => {
+    const body = z
+      .string()
+      .min(1)
+      .max(SUPPORT_TEXT_MAX * 2)
+      .parse(text)
+    // node addresses / the subscription link never leave the machine
+    return support.send(mask(body).slice(0, SUPPORT_TEXT_MAX))
+  })
+  ipcMain.handle(IPC.supportSendPhoto, async (_e, photo: unknown) => {
+    const p = supportPhotoSchema.parse(photo)
+    return support.sendPhoto({
+      data: p.data,
+      mime: p.mime as (typeof SUPPORT_IMAGE_MIMES)[number],
+      caption: mask(p.caption)
+    })
+  })
+  ipcMain.handle(IPC.supportImage, async (_e, url: unknown) =>
+    support.image(z.string().url().max(2000).parse(url))
+  )
+  ipcMain.on(IPC.supportSetActive, (_e, active: unknown) => {
+    support.setActive(z.boolean().parse(active))
+  })
+  ipcMain.on(IPC.supportMarkRead, () => support.markRead())
 
   // ---- updater -----------------------------------------------------------
   const updater = new AppUpdater((e) => send(IPC.evtUpdater, e))

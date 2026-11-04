@@ -1,13 +1,18 @@
 import { create } from 'zustand'
 
 export type PageKey =
-  | 'home'
-  | 'servers'
-  | 'connections'
-  | 'rules'
-  | 'subscription'
-  | 'logs'
-  | 'settings'
+  'home' | 'servers' | 'connections' | 'rules' | 'subscription' | 'support' | 'logs' | 'settings'
+
+export const PAGE_KEYS: readonly PageKey[] = [
+  'home',
+  'servers',
+  'connections',
+  'rules',
+  'subscription',
+  'support',
+  'logs',
+  'settings'
+]
 
 interface NavState {
   page: PageKey

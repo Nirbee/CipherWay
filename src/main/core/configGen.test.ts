@@ -11,9 +11,18 @@ import {
   generateProbeConfig,
   generateSingboxConfig,
   groupOutbounds,
-  serverDomains
+  orderByLatency,
+  serverDomains,
+  type GenParams
 } from './configGen'
-import { buildXrayOutbound, generateXrayConfig, isXrayHandled, type XrayBridge } from './xrayGen'
+import {
+  buildXrayOutbound,
+  generateXrayConfig,
+  isXrayHandled,
+  xrayHosts,
+  type XrayBridge
+} from './xrayGen'
+import type { ServerIps } from '../system/resolve'
 import { MIXED_SUB_BODY, TEST_RULES, TEST_SETTINGS } from './fixtures'
 
 const outbounds = filterSubscription(parseOutbounds(MIXED_SUB_BODY)).outbounds
@@ -24,7 +33,14 @@ const bridges: XrayBridge[] = [
 ]
 const xrayPorts = { [vlessA.id]: 20101, [vlessB.id]: 20102 }
 
-function singbox(settings: Partial<AppSettings> = {}) {
+/** what resolveServers() would return for the fixture (TEST-NET / doc ranges) */
+const SERVER_IPS: ServerIps = {
+  'nl.example.com': ['198.51.100.7', '2001:db8::7'],
+  '203.0.113.10': ['203.0.113.10'],
+  'hy.example.com': ['198.51.100.8']
+}
+
+function singbox(settings: Partial<AppSettings> = {}, extra: Partial<GenParams> = {}) {
   return generateSingboxConfig({
     outbounds,
     activeOutboundId: vlessA.id,
@@ -35,7 +51,8 @@ function singbox(settings: Partial<AppSettings> = {}) {
     clashApiPort: 19090,
     logFile: 'sing-box.log',
     cacheFile: 'cache.db',
-    xrayPorts
+    xrayPorts,
+    ...extra
   })
 }
 
@@ -264,6 +281,99 @@ describe('generateProbeConfig (latency test while disconnected)', () => {
   })
 })
 
+describe('TUN: node traffic of xray bypasses the TUN (0.4.1)', () => {
+  type Tun = { route_exclude_address?: string[]; auto_route?: boolean }
+
+  it('resolved node IPs (v4 + v6) are excluded from the TUN routes', () => {
+    const tun = singbox({ proxyMode: 'tun' }, { serverIps: SERVER_IPS }).inbounds[0] as Tun
+    expect(tun.auto_route).toBe(true)
+    expect(tun.route_exclude_address).toEqual([
+      '198.51.100.7/32',
+      '2001:db8::7/128',
+      '203.0.113.10/32',
+      '198.51.100.8/32'
+    ])
+  })
+
+  it('loopback / unresolved: no exclusion entries; system mode has no TUN at all', () => {
+    const tun = singbox({ proxyMode: 'tun' }, { serverIps: { localhost: ['127.0.0.1', '::1'] } })
+      .inbounds[0] as Tun
+    expect(tun.route_exclude_address).toBeUndefined()
+    expect(singbox({ proxyMode: 'tun' }).inbounds[0]).not.toHaveProperty('route_exclude_address')
+    expect(singbox({}, { serverIps: SERVER_IPS }).inbounds[0].type).toBe('mixed')
+  })
+
+  it('the process_name xray.exe → direct rule stays as a safety net', () => {
+    const rules = singbox({ proxyMode: 'tun' }, { serverIps: SERVER_IPS }).route.rules
+    expect(rules[0]).toEqual({ process_name: ['xray.exe'], action: 'route', outbound: 'direct' })
+  })
+
+  it('xray dials the pre-resolved IPs: dns.hosts (IPv4 only) + sockopt UseIP', () => {
+    const cfg = generateXrayConfig(bridges, { serverIps: SERVER_IPS })
+    expect(cfg.dns).toEqual({ hosts: { 'nl.example.com': ['198.51.100.7'] } })
+    const a = cfg.outbounds.find((o) => o.tag === `out-${vlessA.id}`) as {
+      streamSettings: { sockopt?: object; realitySettings: { serverName: string } }
+    }
+    expect(a.streamSettings.sockopt).toEqual({ domainStrategy: 'UseIP' })
+    // SNI is still the REALITY server name, not the IP
+    expect(a.streamSettings.realitySettings.serverName).toBe('www.example.org')
+    // an IP-literal node needs no pinning
+    const b = cfg.outbounds.find((o) => o.tag === `out-${vlessB.id}`) as { streamSettings: object }
+    expect(b.streamSettings).not.toHaveProperty('sockopt')
+  })
+
+  it('xrayHosts: IPv6 only when the host has no IPv4; unresolved hosts are left to xray', () => {
+    const v6only = { ...vlessA, server: 'v6.example.com' }
+    expect(xrayHosts([v6only], { 'v6.example.com': ['2001:db8::1'] })).toEqual({
+      'v6.example.com': ['2001:db8::1']
+    })
+    expect(xrayHosts([vlessA], {})).toEqual({})
+    expect(generateXrayConfig(bridges)).not.toHaveProperty('dns')
+  })
+})
+
+describe('log level (0.4.1)', () => {
+  it('warn by default, info with «Подробный журнал»', () => {
+    expect(singbox().log.level).toBe('warn')
+    expect(singbox({ verboseLog: true }).log.level).toBe('info')
+    expect(generateXrayConfig(bridges).log.loglevel).toBe('warning')
+    expect(generateXrayConfig(bridges, { verbose: true }).log.loglevel).toBe('info')
+  })
+})
+
+describe('«Лучший сервер (авто)»: member order by last latency (0.4.1)', () => {
+  it('answered fastest first, then never measured (subscription order), dead last', () => {
+    expect(
+      orderByLatency(['dead1', 'slow', 'new1', 'fast', 'dead2', 'new2'], {
+        dead1: null,
+        slow: 900,
+        fast: 120,
+        dead2: null
+      })
+    ).toEqual(['fast', 'slow', 'new1', 'new2', 'dead1', 'dead2'])
+  })
+
+  it('no measurements = subscription order; ties keep subscription order', () => {
+    expect(orderByLatency(['a', 'b', 'c'])).toEqual(['a', 'b', 'c'])
+    expect(orderByLatency(['a', 'b', 'c'], { c: 100, a: 100 })).toEqual(['a', 'c', 'b'])
+  })
+
+  it('a dead first node of the subscription («⚡ Автовыбор») is not urltest’s first member', () => {
+    const ids = outbounds.map((o) => o.id)
+    const cfg = singbox({}, { latencies: { [ids[0]]: null, [ids[1]]: 250, [ids[2]]: 400 } })
+    const auto = cfg.outbounds.find((o) => o.tag === 'auto') as unknown as { outbounds: string[] }
+    expect(auto.outbounds).toEqual([ids[1], ids[2], ids[0]])
+    // the selector keeps the subscription order for the UI / Clash API
+    const sel = cfg.outbounds.find((o) => o.tag === 'proxy') as unknown as { outbounds: string[] }
+    expect(sel.outbounds).toEqual(['auto', ...ids])
+    expect(groupOutbounds(ids, 'auto', { [ids[2]]: 10 })[0].outbounds).toEqual([
+      ids[2],
+      ids[0],
+      ids[1]
+    ])
+  })
+})
+
 // --- validate against the real binaries when they are downloaded ----------
 
 const BIN = resolve(__dirname, '../../../resources/bin')
@@ -288,11 +398,22 @@ describe('real core validation', () => {
     check(XRAY, ['run', '-test', '-c', file])
   })
 
+  it.skipIf(!existsSync(XRAY))('xray run -test accepts pinned IPs + verbose log', () => {
+    const file = join(tmp, 'xray-pinned.json')
+    const cfg = generateXrayConfig(bridges, { serverIps: SERVER_IPS, verbose: true })
+    writeFileSync(file, JSON.stringify(cfg, null, 2))
+    check(XRAY, ['run', '-test', '-c', file])
+  })
+
   for (const mode of ['system', 'tun'] as const) {
     for (const routingMode of ['rule', 'global', 'direct'] as const) {
       it.skipIf(!existsSync(SINGBOX))(`sing-box check accepts ${mode}/${routingMode}`, () => {
         const file = join(tmp, `sing-box-${mode}-${routingMode}.json`)
-        writeFileSync(file, JSON.stringify(singbox({ proxyMode: mode, routingMode }), null, 2))
+        const cfg = singbox(
+          { proxyMode: mode, routingMode, verboseLog: routingMode === 'global' },
+          { serverIps: SERVER_IPS, latencies: { [outbounds[0].id]: null } }
+        )
+        writeFileSync(file, JSON.stringify(cfg, null, 2))
         check(SINGBOX, ['check', '-c', file])
       })
     }
@@ -300,7 +421,12 @@ describe('real core validation', () => {
 
   it.skipIf(!existsSync(SINGBOX))('sing-box check accepts the latency probe config', () => {
     const file = join(tmp, 'sing-box-probe.json')
-    const probe = generateProbeConfig({ outbounds, clashApiPort: 19091, logFile: 'p.log', xrayPorts })
+    const probe = generateProbeConfig({
+      outbounds,
+      clashApiPort: 19091,
+      logFile: 'p.log',
+      xrayPorts
+    })
     writeFileSync(file, JSON.stringify(probe, null, 2))
     check(SINGBOX, ['check', '-c', file])
   })
@@ -313,10 +439,28 @@ describe('real core validation', () => {
       rules: {
         defaultBehavior: 'proxy',
         rules: [
-          { id: '1', enabled: true, conditionType: 'DomainRegex', value: '^(.+\\.)?ads\\.', action: 'REJECT' },
-          { id: '2', enabled: true, conditionType: 'DstPort', value: '6881-6889', action: 'DIRECT' },
+          {
+            id: '1',
+            enabled: true,
+            conditionType: 'DomainRegex',
+            value: '^(.+\\.)?ads\\.',
+            action: 'REJECT'
+          },
+          {
+            id: '2',
+            enabled: true,
+            conditionType: 'DstPort',
+            value: '6881-6889',
+            action: 'DIRECT'
+          },
           { id: '3', enabled: true, conditionType: 'DstPort', value: '22', action: 'DIRECT' },
-          { id: '4', enabled: true, conditionType: 'IPCIDR', value: '2001:db8::/32', action: 'DIRECT' },
+          {
+            id: '4',
+            enabled: true,
+            conditionType: 'IPCIDR',
+            value: '2001:db8::/32',
+            action: 'DIRECT'
+          },
           { id: '5', enabled: true, conditionType: 'GeoIP', value: 'lan', action: 'DIRECT' }
         ]
       },

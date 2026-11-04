@@ -10,8 +10,34 @@ import type { RawConnections } from './connections'
  *   GET    /proxies/<tag>               → { type, now, all }
  *   PUT    /proxies/<selector> { name } → 204 / 400 for an unknown member
  *   GET    /proxies/<tag>/delay?url&timeout → { delay } / 503 «An error occurred…»
+ *   GET    /proxies                    → { proxies: { <tag>: { now?, history: [{delay}] } } }
+ *          (a group's history is the one of its current `now`; a member
+ *           whose last test failed has an empty history)
+ *   GET    /group/<tag>/delay?url&timeout → { <member>: delay } of the members
+ *          it actually tested (a no-op `{}` while a check is already running)
  *   GET    /connections · DELETE /connections[/<id>]
+ * Note (1.13.x): a urltest group checks its members right after start; until
+ * that finishes `now` is "" and traffic uses the first member.
  */
+
+export interface ProxyState {
+  now?: string
+  /** last successful test, undefined = none (failed / not tested yet) */
+  delay?: number
+}
+
+interface RawProxy {
+  now?: string
+  history?: { delay?: number }[]
+}
+
+function toState(p: RawProxy | undefined): ProxyState {
+  const last = p?.history?.at(-1)?.delay
+  return {
+    ...(p?.now ? { now: p.now } : {}),
+    ...(typeof last === 'number' && last > 0 ? { delay: last } : {})
+  }
+}
 export class ClashApi {
   constructor(private port: number) {}
 
@@ -65,6 +91,50 @@ export class ClashApi {
       if (!res.ok) return null
       const json = (await res.json()) as { now?: string }
       return json.now ?? null
+    } catch {
+      return null
+    }
+  }
+
+  /** `now` + latest delay of one proxy / group; null = API unreachable. */
+  async proxyState(tag: string): Promise<ProxyState | null> {
+    try {
+      const res = await this.req(`/proxies/${encodeURIComponent(tag)}`, {}, 1000)
+      if (!res.ok) return null
+      return toState((await res.json()) as RawProxy)
+    } catch {
+      return null
+    }
+  }
+
+  /** Every proxy's `now` + latest delay; null = API unreachable. */
+  async proxies(): Promise<Record<string, ProxyState> | null> {
+    try {
+      const res = await this.req('/proxies', {}, 1500)
+      if (!res.ok) return null
+      const json = (await res.json()) as { proxies?: Record<string, RawProxy> }
+      const out: Record<string, ProxyState> = {}
+      for (const [tag, p] of Object.entries(json.proxies ?? {})) out[tag] = toState(p)
+      return out
+    } catch {
+      return null
+    }
+  }
+
+  /** Forces a check of a urltest group; returns member → delay of the answered ones. */
+  async groupDelay(
+    group: string,
+    timeoutMs = LATENCY_TIMEOUT_MS
+  ): Promise<Record<string, number> | null> {
+    const q = new URLSearchParams({ url: LATENCY_URL, timeout: String(timeoutMs) })
+    try {
+      const res = await this.req(
+        `/group/${encodeURIComponent(group)}/delay?${q.toString()}`,
+        {},
+        timeoutMs + 3000
+      )
+      if (!res.ok) return null
+      return (await res.json()) as Record<string, number>
     } catch {
       return null
     }

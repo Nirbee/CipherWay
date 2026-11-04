@@ -6,6 +6,7 @@ import { toast } from '../store/toastStore'
 import { EmptyState } from '../components/EmptyState'
 import { LogsIcon } from '../components/icons'
 import { cn } from '../lib/cn'
+import { formatLogLine } from '@shared/diagnostics'
 
 const LEVEL_COLOR: Record<string, string> = {
   info: 'text-text-tertiary',
@@ -19,13 +20,11 @@ export function LogsPage() {
   const endRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: 'smooth' })
+    endRef.current?.scrollIntoView({ behavior: 'auto' })
   }, [entries.length])
 
   const copyAll = () => {
-    const text = entries
-      .map((e) => `${new Date(e.ts).toISOString()} [${e.source}/${e.level}] ${e.message}`)
-      .join('\n')
+    const text = entries.map(formatLogLine).join('\n')
     void navigator.clipboard.writeText(text).then(() => toast('Журнал скопирован', 'success'))
   }
 
@@ -33,7 +32,7 @@ export function LogsPage() {
     <div className="flex h-full flex-col">
       <PageHeader
         title="Логи"
-        subtitle="Журнал ядер sing-box, Xray и приложения. Адреса серверов и ссылка подписки скрыты."
+        subtitle="Журнал ядер sing-box, Xray и приложения (последние 1000 строк). Адреса серверов и ссылка подписки скрыты."
         actions={
           <>
             <Button variant="secondary" size="sm" onClick={copyAll} disabled={entries.length === 0}>

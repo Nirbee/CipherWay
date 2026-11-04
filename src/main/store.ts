@@ -1,5 +1,10 @@
 import Store from 'electron-store'
-import type { AppSettings, RulesConfig, SubscriptionData } from '@shared/types'
+import {
+  DEFAULT_API_BASE,
+  type AppSettings,
+  type RulesConfig,
+  type SubscriptionData
+} from '@shared/types'
 
 interface Schema {
   settings: AppSettings
@@ -12,6 +17,12 @@ interface Schema {
   deviceIdFallback: string | null
   /** «CipherWay работает в трее» notification already shown once */
   trayHintShown: boolean
+  /** last measured latency per node id (orders «Лучший сервер (авто)») */
+  latencyCache: Record<string, number | null>
+  /** ISO time of the newest support reply the user has seen on «Поддержка» */
+  supportReadAt: string | null
+  /** ISO time of the newest support reply a Windows notification was shown for */
+  supportNotifiedAt: string | null
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -23,13 +34,21 @@ export const DEFAULT_SETTINGS: AppSettings = {
   language: 'ru',
   socksPort: 10808,
   httpPort: 10809,
-  subscriptionRefreshHours: 12
+  subscriptionRefreshHours: 12,
+  verboseLog: false,
+  apiBase: DEFAULT_API_BASE
 }
 
 export const DEFAULT_RULES: RulesConfig = {
   defaultBehavior: 'auto',
   rules: [
-    { id: 'r1', enabled: true, conditionType: 'GeoSite', value: 'category-ads-all', action: 'REJECT' },
+    {
+      id: 'r1',
+      enabled: true,
+      conditionType: 'GeoSite',
+      value: 'category-ads-all',
+      action: 'REJECT'
+    },
     { id: 'r2', enabled: true, conditionType: 'GeoIP', value: 'ru', action: 'DIRECT' },
     { id: 'r3', enabled: true, conditionType: 'GeoSite', value: 'yandex', action: 'DIRECT' },
     { id: 'r4', enabled: true, conditionType: 'ProcessName', value: 'firefox.exe', action: 'PROXY' }
@@ -45,7 +64,10 @@ export const store = new Store<Schema>({
     activeOutboundId: null,
     subscriptionUrlEnc: null,
     deviceIdFallback: null,
-    trayHintShown: false
+    trayHintShown: false,
+    latencyCache: {},
+    supportReadAt: null,
+    supportNotifiedAt: null
   }
 })
 

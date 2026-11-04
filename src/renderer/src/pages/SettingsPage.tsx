@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
-import type { AppSettings } from '@shared/types'
+import { DEFAULT_API_BASE, type AppSettings } from '@shared/types'
+import { buildDiagnostics } from '@shared/diagnostics'
 import { PageHeader } from '../components/PageHeader'
 import { Button, Card, Input, Toggle } from '../components/ui'
 import { CheckIcon, CopyIcon } from '../components/icons'
@@ -19,6 +20,7 @@ export function SettingsPage() {
   const servers = useSubscription((s) => s.data?.servers.length ?? 0)
   const [version, setVersion] = useState('')
   const [support, setSupport] = useState('')
+  const [apiBase, setApiBase] = useState('')
 
   useEffect(() => {
     void load()
@@ -27,6 +29,9 @@ export function SettingsPage() {
   useEffect(() => {
     if (settings) setSupport(settings.supportUrl)
   }, [settings?.supportUrl]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (settings) setApiBase(settings.apiBase)
+  }, [settings?.apiBase]) // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!settings) return null
 
@@ -42,24 +47,13 @@ export function SettingsPage() {
   const copyDiagnostics = async () => {
     // log lines arrive already masked by the main process (no node addresses,
     // no subscription link); settings hold nothing secret
-    const safe = { ...settings, supportUrl: settings.supportUrl ? 'задана' : '' }
-    const blob = [
-      'CipherWay VPN — диагностика',
-      `версия: ${version}`,
-      `дата: ${new Date().toISOString()}`,
-      `состояние: ${state}`,
-      `серверов в подписке: ${servers}`,
-      `настройки: ${JSON.stringify(safe)}`,
-      '--- последние записи журнала ---',
-      ...logs
-        .slice(-300)
-        .map((e) => `${new Date(e.ts).toISOString()} [${e.source}/${e.level}] ${e.message}`)
-    ].join('\n')
+    const blob = buildDiagnostics({ version, state, servers, settings, logs })
     await navigator.clipboard.writeText(blob)
     toast('Диагностика скопирована — адреса серверов и ссылка подписки в ней скрыты', 'success')
   }
 
   const supportDirty = support.trim() !== settings.supportUrl
+  const apiDirty = apiBase.trim() !== settings.apiBase
 
   return (
     <div className="flex h-full flex-col overflow-y-auto">
@@ -87,17 +81,23 @@ export function SettingsPage() {
         </Section>
 
         <Section title="Запуск">
-          <Row label="Запускать вместе с Windows" hint="CipherWay стартует при входе в систему и ждёт в трее">
+          <Row
+            label="Запускать вместе с Windows"
+            hint="CipherWay стартует при входе в систему и ждёт в трее"
+          >
             <Toggle checked={settings.autoLaunch} onChange={(v) => void save({ autoLaunch: v })} />
           </Row>
           <Row label="Подключаться при запуске" hint="Сразу включать VPN после старта приложения">
-            <Toggle checked={settings.autoConnect} onChange={(v) => void save({ autoConnect: v })} />
+            <Toggle
+              checked={settings.autoConnect}
+              onChange={(v) => void save({ autoConnect: v })}
+            />
           </Row>
         </Section>
 
         <Section
           title="Поддержка"
-          hint="Ссылка для кнопки «Поддержка», если ваша подписка не передаёт свою. Подойдёт https:// или tg://."
+          hint="Чат поддержки — на странице «Поддержка». Ссылка ниже — запасной вариант «Написать в Telegram», если подписка не передаёт свою (https:// или tg://)."
         >
           <div className="flex gap-2">
             <Input
@@ -110,21 +110,55 @@ export function SettingsPage() {
               className="shrink-0"
               variant="secondary"
               disabled={!supportDirty}
-              onClick={() => void save({ supportUrl: support.trim() }, 'Ссылка поддержки сохранена')}
+              onClick={() =>
+                void save({ supportUrl: support.trim() }, 'Ссылка поддержки сохранена')
+              }
             >
               Сохранить
             </Button>
+          </div>
+          <div>
+            <div className="mb-1.5 text-[11px] text-text-muted">Сервер чата поддержки</div>
+            <div className="flex gap-2">
+              <Input
+                mono
+                placeholder={DEFAULT_API_BASE}
+                value={apiBase}
+                onChange={(e) => setApiBase(e.target.value)}
+              />
+              <Button
+                className="shrink-0"
+                variant="secondary"
+                disabled={!apiDirty}
+                onClick={() =>
+                  void save(
+                    { apiBase: apiBase.trim() || DEFAULT_API_BASE },
+                    'Адрес сервера поддержки сохранён'
+                  )
+                }
+              >
+                Сохранить
+              </Button>
+            </div>
           </div>
         </Section>
 
         <Section title="Обновления">
           <Row label="Версия приложения" hint="Обновления приходят с GitHub автоматически">
-            <span className="font-mono text-sm text-text-secondary">{version ? `v${version}` : '—'}</span>
+            <span className="font-mono text-sm text-text-secondary">
+              {version ? `v${version}` : '—'}
+            </span>
           </Row>
           <UpdaterControls />
         </Section>
 
         <Section title="Диагностика" hint="Пригодится, если пишете в поддержку.">
+          <Row
+            label="Подробный журнал (для поддержки)"
+            hint="Записывать каждое соединение. Включайте только по просьбе поддержки — журнал растёт очень быстро. Применится при следующем подключении."
+          >
+            <Toggle checked={settings.verboseLog} onChange={(v) => void save({ verboseLog: v })} />
+          </Row>
           <Button variant="secondary" size="sm" onClick={() => void copyDiagnostics()}>
             <CopyIcon width={14} height={14} />
             Скопировать диагностику
@@ -135,7 +169,15 @@ export function SettingsPage() {
   )
 }
 
-function Section({ title, hint, children }: { title: string; hint?: string; children: React.ReactNode }) {
+function Section({
+  title,
+  hint,
+  children
+}: {
+  title: string
+  hint?: string
+  children: React.ReactNode
+}) {
   return (
     <section>
       <div className="mb-2.5 px-1">
@@ -147,7 +189,15 @@ function Section({ title, hint, children }: { title: string; hint?: string; chil
   )
 }
 
-function Row({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
+function Row({
+  label,
+  hint,
+  children
+}: {
+  label: string
+  hint?: string
+  children: React.ReactNode
+}) {
   return (
     <div className="flex items-center justify-between gap-4">
       <div>
@@ -165,7 +215,9 @@ function UpdaterControls() {
   if (phase === 'available') {
     return (
       <div className="flex items-center justify-between gap-3 rounded-xl border border-accent-green/40 bg-accent-green/10 px-3 py-2.5">
-        <span className="text-sm text-accent-green">Доступна версия {version ? `v${version}` : ''}</span>
+        <span className="text-sm text-accent-green">
+          Доступна версия {version ? `v${version}` : ''}
+        </span>
         <Button size="sm" onClick={download}>
           Скачать
         </Button>
@@ -177,7 +229,10 @@ function UpdaterControls() {
     return (
       <div className="space-y-2">
         <div className="h-1.5 overflow-hidden rounded-pill bg-bg-elevated">
-          <div className="h-full rounded-pill bg-accent-blue transition-all" style={{ width: `${percent}%` }} />
+          <div
+            className="h-full rounded-pill bg-accent-blue transition-all"
+            style={{ width: `${percent}%` }}
+          />
         </div>
         <div className="font-mono text-xs text-text-muted">Загрузка… {percent}%</div>
       </div>
@@ -187,7 +242,9 @@ function UpdaterControls() {
   if (phase === 'downloaded') {
     return (
       <div className="flex items-center justify-between gap-3 rounded-xl border border-accent-green/40 bg-accent-green/10 px-3 py-2.5">
-        <span className="text-sm text-accent-green">Версия {version ? `v${version}` : ''} готова к установке</span>
+        <span className="text-sm text-accent-green">
+          Версия {version ? `v${version}` : ''} готова к установке
+        </span>
         <Button size="sm" onClick={install}>
           Перезапустить и установить
         </Button>

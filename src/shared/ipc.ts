@@ -12,6 +12,9 @@ import type {
   ServerPing,
   StatusUpdate,
   SubscriptionView,
+  SupportPhoto,
+  SupportSendResult,
+  SupportView,
   TrafficStats
 } from './types'
 
@@ -69,6 +72,17 @@ export const IPC = {
   // open an https:// / tg:// link from the subscription in the system browser
   openExternal: 'app:openExternal',
 
+  // in-app support chat (requests are made by main; the token stays there)
+  supportGet: 'support:get',
+  supportRefresh: 'support:refresh',
+  supportSend: 'support:send',
+  supportSendPhoto: 'support:sendPhoto',
+  /** support-server image → data: URL (CSP allows only those) */
+  supportImage: 'support:image',
+  /** «Поддержка» is on screen → poll every 10 s, replies count as read */
+  supportSetActive: 'support:setActive',
+  supportMarkRead: 'support:markRead',
+
   // updater
   updaterCheck: 'updater:check',
   updaterDownload: 'updater:download',
@@ -77,7 +91,13 @@ export const IPC = {
   // events (main -> renderer)
   evtStatus: 'evt:status',
   evtTraffic: 'evt:traffic',
+  /** batches of log entries (LogEntry[]) */
   evtLog: 'evt:log',
+  /** latencies measured by the running core (startup check of «auto») */
+  evtPings: 'evt:pings',
+  evtSupport: 'evt:support',
+  /** main asks the renderer to open a page (notification click) */
+  evtNavigate: 'evt:navigate',
   evtUpdater: 'evt:updater',
   /** settings changed outside the renderer (tray mode switch) */
   evtSettings: 'evt:settings',
@@ -148,6 +168,17 @@ export interface ExposedApi {
     /** returns (and clears) the pending cipherway:// import, if any */
     takePending: () => Promise<ImportRequest | null>
   }
+  support: {
+    /** last known state, no request */
+    get: () => Promise<SupportView>
+    /** fetch the thread now */
+    refresh: () => Promise<SupportView>
+    send: (text: string) => Promise<SupportSendResult>
+    sendPhoto: (photo: SupportPhoto) => Promise<SupportSendResult>
+    image: (url: string) => Promise<string>
+    setActive: (active: boolean) => void
+    markRead: () => void
+  }
   updater: {
     check: () => Promise<void>
     download: () => Promise<void>
@@ -156,7 +187,10 @@ export interface ExposedApi {
   on: {
     status: (cb: (s: StatusUpdate) => void) => () => void
     traffic: (cb: (s: TrafficStats) => void) => () => void
-    log: (cb: (e: LogEntry) => void) => () => void
+    log: (cb: (batch: LogEntry[]) => void) => () => void
+    pings: (cb: (pings: ServerPing[]) => void) => () => void
+    support: (cb: (v: SupportView) => void) => () => void
+    navigate: (cb: (page: string) => void) => () => void
     updater: (cb: (e: UpdaterEvent) => void) => () => void
     windowMaximized: (cb: (maximized: boolean) => void) => () => void
     importRequest: (cb: () => void) => () => void

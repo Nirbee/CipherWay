@@ -8,6 +8,8 @@ import { useUpdater } from './store/updaterStore'
 import { useSettings } from './store/settingsStore'
 import { useSubscription } from './store/subscriptionStore'
 import { useServers } from './store/serversStore'
+import { useSupport } from './store/supportStore'
+import { PAGE_KEYS, type PageKey } from './store/navStore'
 import { ConnectionsPage } from './pages/ConnectionsPage'
 import { Toaster } from './components/Toaster'
 import { RulesPage } from './pages/RulesPage'
@@ -16,13 +18,17 @@ import { ServersPage } from './pages/ServersPage'
 import { LogsPage } from './pages/LogsPage'
 import { SubscriptionPage } from './pages/SubscriptionPage'
 import { SettingsPage } from './pages/SettingsPage'
+import { SupportPage } from './pages/SupportPage'
 import { ImportSubscriptionDialog } from './components/ImportSubscriptionDialog'
 import { cn } from './lib/cn'
 
 export default function App() {
   const page = useNav((s) => s.page)
+  const setPage = useNav((s) => s.setPage)
   const { setStatus, setTraffic } = useConnection()
-  const addLog = useLogs((s) => s.add)
+  const addLogs = useLogs((s) => s.addBatch)
+  const applyPings = useServers((s) => s.applyPings)
+  const applySupport = useSupport((s) => s.apply)
   const applyUpdater = useUpdater((s) => s.apply)
   const applySettings = useSettings((s) => s.apply)
   const loadSettings = useSettings((s) => s.load)
@@ -40,7 +46,13 @@ export default function App() {
     const offSub = window.api.on.subscription(setSubscription)
     void loadSettings()
     const offTraffic = window.api.on.traffic(setTraffic)
-    const offLog = window.api.on.log(addLog)
+    const offLog = window.api.on.log(addLogs)
+    const offPings = window.api.on.pings(applyPings)
+    const offSupport = window.api.on.support(applySupport)
+    const offNav = window.api.on.navigate((p) => {
+      if ((PAGE_KEYS as readonly string[]).includes(p)) setPage(p as PageKey)
+    })
+    void window.api.support.get().then(applySupport)
     const offUpdater = window.api.on.updater(applyUpdater)
     const offMax = window.api.on.windowMaximized(setMaximized)
     void window.api.vpn.getStatus().then((s) => {
@@ -62,8 +74,23 @@ export default function App() {
       offMax()
       offSettings()
       offSub()
+      offPings()
+      offSupport()
+      offNav()
     }
-  }, [setStatus, setTraffic, addLog, applyUpdater, applySettings, loadSettings, setSubscription, setActiveLocal])
+  }, [
+    setStatus,
+    setTraffic,
+    addLogs,
+    applyPings,
+    applySupport,
+    setPage,
+    applyUpdater,
+    applySettings,
+    loadSettings,
+    setSubscription,
+    setActiveLocal
+  ])
 
   return (
     <div className={cn('app-shell flex text-text-primary', maximized && 'maximized')}>
@@ -94,6 +121,8 @@ function PageView({ page }: { page: string }) {
       return <SubscriptionPage />
     case 'rules':
       return <RulesPage />
+    case 'support':
+      return <SupportPage />
     case 'logs':
       return <LogsPage />
     case 'settings':

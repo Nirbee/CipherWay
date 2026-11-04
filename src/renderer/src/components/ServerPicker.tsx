@@ -54,9 +54,9 @@ export function ServerPicker() {
               <PickerRow
                 key={e.id}
                 entry={e}
-                hint={e.auto && autoPick ? `${pickLabel.toLowerCase()}: ${autoPick.label}` : undefined}
+                hint={e.auto ? autoHint(e, autoPick?.label, pickLabel.toLowerCase()) : undefined}
                 selected={e.id === active.id}
-                testing={testing}
+                testing={testing || !!e.checking}
                 onClick={() => {
                   setOpen(false)
                   if (e.id !== active.id) void select(e.id)
@@ -77,15 +77,19 @@ export function ServerPicker() {
         <Flag code={active.code} auto={active.auto} size="lg" />
         <div className="min-w-0 flex-1">
           <div className="truncate text-sm font-semibold text-text-primary">{active.label}</div>
-          <div className="truncate text-[11px] text-text-muted">
+          <div
+            className={cn(
+              'truncate text-[11px]',
+              active.dead ? 'text-accent-red' : 'text-text-muted'
+            )}
+          >
             {active.auto
-              ? autoPick
-                ? `${pickLabel}: ${autoPick.label}`
-                : 'Самый быстрый из доступных, проверка каждые 5 минут'
+              ? (autoHint(active, autoPick?.label, pickLabel) ??
+                'Самый быстрый из доступных, проверка каждые 5 минут')
               : (PROTOCOL_LABEL[active.protocol ?? ''] ?? 'Сервер')}
           </div>
         </div>
-        <LatencyBadge ms={active.latency} testing={testing} />
+        <LatencyBadge ms={active.latency} testing={testing || !!active.checking} />
         <ChevronDownIcon
           width={18}
           height={18}
@@ -94,6 +98,13 @@ export function ServerPicker() {
       </button>
     </div>
   )
+}
+
+/** second line of «Лучший сервер (авто)» */
+function autoHint(e: ServerEntry, pick: string | undefined, prefix: string): string | undefined {
+  if (e.checking) return 'Проверяем серверы…'
+  if (e.dead) return 'Ни один сервер не отвечает — проверьте интернет или выберите сервер вручную'
+  return pick ? `${prefix}: ${pick}` : undefined
 }
 
 function PickerRow({
@@ -119,7 +130,9 @@ function PickerRow({
     >
       <Flag code={entry.code} auto={entry.auto} />
       <div className="min-w-0 flex-1">
-        <div className={cn('truncate text-sm', selected ? 'text-accent-green' : 'text-text-primary')}>
+        <div
+          className={cn('truncate text-sm', selected ? 'text-accent-green' : 'text-text-primary')}
+        >
           {entry.label}
         </div>
         {hint && <div className="truncate text-[11px] text-text-muted">{hint}</div>}

@@ -270,7 +270,10 @@ if (!app.requestSingleInstanceLock()) {
   app.whenReady().then(() => {
     app.setAppUserModelId(APP_ID)
     registerProtocol()
-    registerIpcHandlers(() => mainWindow)
+    registerIpcHandlers(() => mainWindow, {
+      showWindow,
+      notificationIcon: resourcePath('tray', 'tray-on.ico')
+    })
     registerWindowIpc()
     createWindow()
     createTray()

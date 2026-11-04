@@ -28,6 +28,8 @@ const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 export interface MaskSource {
   outbounds: OutboundConfig[]
   subscriptionUrl?: string | null
+  /** more addresses to hide: node IPs resolved before a TUN start */
+  extraHosts?: string[]
 }
 
 export type Masker = (text: string) => string
@@ -43,6 +45,7 @@ export function createMasker(src: MaskSource): Masker {
     for (const s of [o.uuid, o.password, o.obfsPassword]) if (s && s.length >= 4) secrets.add(s)
     tagNames.set(o.id, o.name)
   }
+  for (const h of src.extraHosts ?? []) if (h.trim()) hosts.add(h.trim())
 
   const url = src.subscriptionUrl?.trim()
   // the token is the last path segment: catch it even without the host part

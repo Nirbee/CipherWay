@@ -1,4 +1,9 @@
-import { AUTO_OUTBOUND_ID, type AppSettings, type OutboundConfig, type RulesConfig } from '@shared/types'
+import {
+  AUTO_OUTBOUND_ID,
+  type AppSettings,
+  type OutboundConfig,
+  type RulesConfig
+} from '@shared/types'
 import { compileRules } from '../rules/compile'
 import {
   CLASH_MODE,
@@ -12,6 +17,10 @@ import {
   type SbRouteRule
 } from './sbTypes'
 import { isXrayHandled, XRAY_EXE } from './xrayGen'
+import { toExcludeCidrs, type ServerIps } from '../system/resolve'
+
+export const TUN_INTERFACE = 'CipherWay'
+export const TUN_ADDRESS4 = '172.19.0.1'
 
 export interface GenParams {
   outbounds: OutboundConfig[]
@@ -27,6 +36,10 @@ export interface GenParams {
   cacheFile: string
   /** outbound id -> loopback SOCKS port of its xray inbound (VLESS nodes) */
   xrayPorts: Record<string, number>
+  /** node host -> IPs resolved before start (TUN: excluded from the routes) */
+  serverIps?: ServerIps
+  /** last measured latency per node id (null = no answer) — urltest order */
+  latencies?: Record<string, number | null | undefined>
 }
 
 /**
@@ -74,7 +87,9 @@ export function buildOutbound(o: OutboundConfig, xrayPort?: number): SbOutbound 
     server_port: o.port,
     uuid: o.uuid ?? '',
     security: 'auto',
-    ...(o.security === 'tls' ? { tls: { enabled: true, server_name: o.serverName ?? o.server } } : {})
+    ...(o.security === 'tls'
+      ? { tls: { enabled: true, server_name: o.serverName ?? o.server } }
+      : {})
   }
 }
 
@@ -92,20 +107,51 @@ export function serverDomains(outbounds: OutboundConfig[]): string[] {
 }
 
 /**
+ * urltest members, best first: until its first check finishes sing-box sends
+ * everything (DNS included) through the *first* member, so a dead node there
+ * means 5–10 s of timeouts right after connecting. Order: answered (fastest
+ * first) → never measured (subscription order) → no answer.
+ */
+export function orderByLatency(
+  tags: string[],
+  latencies: Record<string, number | null | undefined> = {}
+): string[] {
+  const rank = (t: string): number => {
+    const v = latencies[t]
+    return typeof v === 'number' ? 0 : v === null ? 2 : 1
+  }
+  return tags
+    .map((t, i) => ({ t, i }))
+    .sort((a, b) => {
+      const ra = rank(a.t)
+      const rb = rank(b.t)
+      if (ra !== rb) return ra - rb
+      if (ra === 0) return (latencies[a.t] as number) - (latencies[b.t] as number) || a.i - b.i
+      return a.i - b.i
+    })
+    .map((x) => x.t)
+}
+
+/**
  * «Лучший сервер (авто)» + the selector everything proxied goes through.
  * Switching servers = Clash API `PUT /proxies/proxy` (no core restart);
  * interrupt_exist_connections moves open connections to the new node at once.
  */
-export function groupOutbounds(nodeTags: string[], activeOutboundId?: string): SbOutbound[] {
+export function groupOutbounds(
+  nodeTags: string[],
+  activeOutboundId?: string,
+  latencies?: Record<string, number | null | undefined>
+): SbOutbound[] {
   const def =
-    activeOutboundId && (activeOutboundId === AUTO_OUTBOUND_ID || nodeTags.includes(activeOutboundId))
+    activeOutboundId &&
+    (activeOutboundId === AUTO_OUTBOUND_ID || nodeTags.includes(activeOutboundId))
       ? activeOutboundId
       : TAG_AUTO
   return [
     {
       type: 'urltest',
       tag: TAG_AUTO,
-      outbounds: nodeTags,
+      outbounds: orderByLatency(nodeTags, latencies),
       url: LATENCY_URL,
       interval: '5m',
       tolerance: 50,
@@ -124,16 +170,20 @@ export function groupOutbounds(nodeTags: string[], activeOutboundId?: string): S
 
 function inbounds(p: GenParams): SbInbound[] {
   if (p.settings.proxyMode === 'tun') {
+    // the node IPs get no TUN route: xray.exe's connections to them leave via
+    // the physical NIC directly instead of looping through sing-box
+    const exclude = toExcludeCidrs(p.serverIps ?? {})
     return [
       {
         type: 'tun',
         tag: 'tun-in',
-        interface_name: 'CipherWay',
-        address: ['172.19.0.1/30', 'fdfe:dcba:9876::1/126'],
+        interface_name: TUN_INTERFACE,
+        address: [`${TUN_ADDRESS4}/30`, 'fdfe:dcba:9876::1/126'],
         mtu: 9000,
         auto_route: true,
         strict_route: true,
-        stack: 'system'
+        stack: 'system',
+        ...(exclude.length ? { route_exclude_address: exclude } : {})
       }
     ]
   }
@@ -160,17 +210,19 @@ export function generateSingboxConfig(p: GenParams): SbConfig {
   const geositeTags = ruleSets.filter((r) => r.tag.startsWith('geosite-')).map((r) => r.tag)
   const nodeDomains = serverDomains(p.outbounds)
 
-  // Loop protection in TUN mode: xray.exe dials the nodes itself, and with
-  // auto_route + strict_route its sockets land in our TUN. Send them straight
-  // out (sing-box binds `direct` to the physical NIC via auto_detect_interface).
-  // Node hostnames are resolved by the local (direct) DNS server so the first
-  // lookup doesn't depend on the tunnel that is being brought up.
+  // Loop protection in TUN mode: xray.exe dials the nodes itself. Normally its
+  // sockets never reach the TUN (node IPs are in route_exclude_address); if a
+  // node's IP changed after the pre-start lookup they would — send them
+  // straight out (sing-box binds `direct` to the physical NIC via
+  // auto_detect_interface). Node hostnames are resolved by the local (direct)
+  // DNS server so the first lookup doesn't depend on the tunnel.
   const loopGuard: SbRouteRule[] = tun
     ? [{ process_name: [XRAY_EXE], action: 'route', outbound: TAG_DIRECT }]
     : []
 
   return {
-    log: { level: 'info', output: p.logFile, timestamp: true },
+    // warn by default: info prints a line per connection (thousands a minute)
+    log: { level: p.settings.verboseLog ? 'info' : 'warn', output: p.logFile, timestamp: true },
     // new (1.12+) typed DNS server format
     dns: {
       servers: [
@@ -207,7 +259,8 @@ export function generateSingboxConfig(p: GenParams): SbConfig {
       ...proxyOutbounds,
       ...groupOutbounds(
         p.outbounds.map((o) => o.id),
-        p.activeOutboundId
+        p.activeOutboundId,
+        p.latencies
       ),
       { type: 'direct', tag: TAG_DIRECT }
     ],

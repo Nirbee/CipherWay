@@ -6,6 +6,12 @@ interface ConnectionStore {
   activeOutboundId?: string
   /** node picked by «Лучший сервер (авто)» while connected */
   autoSelectedId?: string
+  /** its latency from the core's own check; null = no answer */
+  autoDelayMs?: number | null
+  /** first check after connecting still running → «проверяем…» */
+  autoChecking?: boolean
+  /** no server answered the check */
+  autoDead?: boolean
   message?: string
   traffic: TrafficStats
   connectedAt: number | null // ms timestamp when the tunnel came up
@@ -31,6 +37,9 @@ export const useConnection = create<ConnectionStore>((set, get) => ({
       state: s.state,
       activeOutboundId: s.activeOutboundId,
       autoSelectedId: s.autoSelectedId,
+      autoDelayMs: s.autoDelayMs,
+      autoChecking: s.autoChecking,
+      autoDead: s.autoDead,
       message: s.message,
       traffic: s.state === 'connected' ? prev.traffic : ZERO_TRAFFIC,
       connectedAt:

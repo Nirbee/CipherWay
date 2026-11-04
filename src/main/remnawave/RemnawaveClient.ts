@@ -65,6 +65,12 @@ export class RemnawaveClient {
     return data
   }
 
+  /** The headers a subscription request carries (UA, x-hwid, x-device-*) — reused by support. */
+  async deviceHeaders(): Promise<Record<string, string>> {
+    const device = await getDeviceInfo(fallbackDeviceId)
+    return buildSubscriptionHeaders(device, app.getVersion())
+  }
+
   /** Warm the device-info cache (WMI query takes ~1–3 s on first call). */
   prefetchDevice(): void {
     void getDeviceInfo(fallbackDeviceId).catch(() => undefined)

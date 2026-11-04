@@ -1,6 +1,7 @@
 import { useNav, type PageKey } from '../store/navStore'
 import { useConnection } from '../store/connectionStore'
 import { useUpdater } from '../store/updaterStore'
+import { useSupport } from '../store/supportStore'
 import { cn } from '../lib/cn'
 import {
   ActivityIcon,
@@ -10,6 +11,7 @@ import {
   RulesIcon,
   ServerIcon,
   SettingsIcon,
+  SupportIcon,
   UpdateIcon
 } from './icons'
 import { ModeSwitch } from './ModeSwitch'
@@ -21,6 +23,7 @@ const NAV: { key: PageKey; label: string; Icon: typeof HomeIcon }[] = [
   { key: 'connections', label: 'Подключения', Icon: ActivityIcon },
   { key: 'rules', label: 'Правила', Icon: RulesIcon },
   { key: 'subscription', label: 'Подписка', Icon: CardIcon },
+  { key: 'support', label: 'Поддержка', Icon: SupportIcon },
   { key: 'logs', label: 'Логи', Icon: LogsIcon },
   { key: 'settings', label: 'Настройки', Icon: SettingsIcon }
 ]
@@ -35,6 +38,7 @@ const STATE_TEXT = {
 export function Sidebar() {
   const { page, setPage } = useNav()
   const state = useConnection((s) => s.state)
+  const unread = useSupport((s) => s.view?.unread ?? 0)
 
   return (
     <nav className="drag-region flex w-[216px] shrink-0 flex-col border-r border-border-subtle bg-bg-sidebar">
@@ -102,7 +106,15 @@ export function Sidebar() {
                   active && 'text-accent-green'
                 )}
               />
-              {label}
+              <span className="flex-1 text-left">{label}</span>
+              {key === 'support' && unread > 0 && (
+                <span
+                  className="animate-fade flex h-[18px] min-w-[18px] items-center justify-center rounded-pill bg-accent-green px-1.5 text-[10.5px] font-bold text-bg-sidebar"
+                  title="Новые ответы поддержки"
+                >
+                  {unread > 9 ? '9+' : unread}
+                </span>
+              )}
             </button>
           )
         })}

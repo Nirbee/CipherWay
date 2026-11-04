@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import { AUTO_OUTBOUND_ID } from '@shared/types'
+import { AUTO_OUTBOUND_ID, type ServerPing } from '@shared/types'
 import { errorText } from '../lib/format'
 import { toast } from './toastStore'
 
@@ -17,6 +17,8 @@ interface ServersStore {
   select: (id: string) => Promise<void>
   loadActive: () => Promise<void>
   setActiveLocal: (id: string | undefined) => void
+  /** results of the running core's own check (pushed by main) */
+  applyPings: (pings: ServerPing[]) => void
 }
 
 export const useServers = create<ServersStore>((set, get) => ({
@@ -54,5 +56,10 @@ export const useServers = create<ServersStore>((set, get) => ({
     const status = await window.api.vpn.getStatus()
     set({ activeId: status.activeOutboundId ?? AUTO_OUTBOUND_ID })
   },
-  setActiveLocal: (id) => set({ activeId: id ?? AUTO_OUTBOUND_ID })
+  setActiveLocal: (id) => set({ activeId: id ?? AUTO_OUTBOUND_ID }),
+  applyPings: (results) => {
+    const pings = { ...get().pings }
+    for (const r of results) pings[r.outboundId] = r.latencyMs
+    set({ pings, testedAt: Date.now() })
+  }
 }))

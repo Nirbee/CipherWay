@@ -1,4 +1,6 @@
+import { isIP } from 'node:net'
 import type { OutboundConfig } from '@shared/types'
+import { normalizeHost, type ServerIps } from '../system/resolve'
 
 // ---------------------------------------------------------------------------
 // Xray-core config generator.
@@ -33,6 +35,7 @@ export interface XrayBridge {
 
 export interface XrayConfig {
   log: { loglevel: string; access?: string }
+  dns?: { hosts: Record<string, string[]> }
   inbounds: Record<string, unknown>[]
   outbounds: Record<string, unknown>[]
   routing: { domainStrategy: string; rules: Record<string, unknown>[] }
@@ -73,7 +76,7 @@ function streamSettings(o: OutboundConfig): Record<string, unknown> {
 }
 
 /** Xray VLESS outbound for one subscription node. */
-export function buildXrayOutbound(o: OutboundConfig): Record<string, unknown> {
+export function buildXrayOutbound(o: OutboundConfig, pinned = false): Record<string, unknown> {
   if (!isXrayHandled(o)) throw new Error(`xray: unsupported protocol ${o.protocol}`)
   const user: Record<string, unknown> = {
     id: o.uuid ?? '',
@@ -84,14 +87,49 @@ export function buildXrayOutbound(o: OutboundConfig): Record<string, unknown> {
     tag: outTag(o.id),
     protocol: 'vless',
     settings: { vnext: [{ address: o.server, port: o.port, users: [user] }] },
-    streamSettings: streamSettings(o)
+    streamSettings: {
+      ...streamSettings(o),
+      // resolve the node through dns.hosts (the IPs pinned before start)
+      // instead of the system resolver; SNI / Host stay the domain
+      ...(pinned ? { sockopt: { domainStrategy: 'UseIP' } } : {})
+    }
   }
 }
 
-export function generateXrayConfig(bridges: XrayBridge[]): XrayConfig {
+/**
+ * dns.hosts for xray: node domain → its pre-resolved IPs. One address family
+ * only (IPv4 if there is any): xray picks a random address from the list and
+ * an IPv6 pick on a machine without IPv6 would just fail.
+ */
+export function xrayHosts(nodes: OutboundConfig[], ips: ServerIps): Record<string, string[]> {
+  const hosts: Record<string, string[]> = {}
+  for (const o of nodes) {
+    const h = normalizeHost(o.server)
+    if (!h || isIP(h) || hosts[o.server]) continue
+    const list = ips[h] ?? []
+    const v4 = list.filter((ip) => isIP(ip) === 4)
+    const pick = v4.length ? v4 : list.filter((ip) => isIP(ip) === 6)
+    if (pick.length) hosts[o.server] = pick
+  }
+  return hosts
+}
+
+export interface XrayGenOptions {
+  /** resolved node IPs (see system/resolve.ts); empty = xray resolves itself */
+  serverIps?: ServerIps
+  /** «Подробный журнал»: per-connection lines */
+  verbose?: boolean
+}
+
+export function generateXrayConfig(bridges: XrayBridge[], opts: XrayGenOptions = {}): XrayConfig {
+  const hosts = xrayHosts(
+    bridges.map((b) => b.outbound),
+    opts.serverIps ?? {}
+  )
   return {
     // stdout/stderr are piped into the app's «Журнал» screen
-    log: { loglevel: 'warning', access: 'none' },
+    log: { loglevel: opts.verbose ? 'info' : 'warning', access: 'none' },
+    ...(Object.keys(hosts).length ? { dns: { hosts } } : {}),
     inbounds: bridges.map((b) => ({
       tag: inTag(b.outbound.id),
       listen: '127.0.0.1',
@@ -102,7 +140,7 @@ export function generateXrayConfig(bridges: XrayBridge[]): XrayConfig {
     outbounds: [
       // first outbound = xray's default: anything unmatched is dropped
       { tag: XRAY_BLOCK_TAG, protocol: 'blackhole' },
-      ...bridges.map((b) => buildXrayOutbound(b.outbound))
+      ...bridges.map((b) => buildXrayOutbound(b.outbound, !!hosts[b.outbound.server]))
     ],
     routing: {
       domainStrategy: 'AsIs',

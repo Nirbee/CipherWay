@@ -327,3 +327,24 @@ export const SpinnerIcon = (p: P) => (
     <path d="M12 3a9 9 0 1 0 9 9" />
   </svg>
 )
+
+export const PaperclipIcon = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M20.5 11.5l-8.1 8.1a5 5 0 0 1-7.1-7.1l8.5-8.5a3.3 3.3 0 0 1 4.7 4.7l-8.5 8.5a1.7 1.7 0 0 1-2.4-2.4l7.8-7.8" />
+  </svg>
+)
+
+export const SendIcon = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M21 3L10 14" />
+    <path d="M21 3l-7 18-4-7-7-4 18-7z" />
+  </svg>
+)
+
+export const StethoscopeIcon = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M5 3v6a5 5 0 0 0 10 0V3" />
+    <path d="M10 14v2a5 5 0 0 0 10 0v-3" />
+    <circle cx="20" cy="11" r="2" />
+  </svg>
+)
