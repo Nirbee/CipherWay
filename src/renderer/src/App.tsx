@@ -9,6 +9,7 @@ import { useSettings } from './store/settingsStore'
 import { useSubscription } from './store/subscriptionStore'
 import { useServers } from './store/serversStore'
 import { useSupport } from './store/supportStore'
+import { toast } from './store/toastStore'
 import { PAGE_KEYS, type PageKey } from './store/navStore'
 import { ConnectionsPage } from './pages/ConnectionsPage'
 import { Toaster } from './components/Toaster'
@@ -44,6 +45,7 @@ export default function App() {
     })
     const offSettings = window.api.on.settings(applySettings)
     const offSub = window.api.on.subscription(setSubscription)
+    const offNotice = window.api.on.notice((n) => toast(n.text, n.tone))
     void loadSettings()
     const offTraffic = window.api.on.traffic(setTraffic)
     const offLog = window.api.on.log(addLogs)
@@ -74,6 +76,7 @@ export default function App() {
       offMax()
       offSettings()
       offSub()
+      offNotice()
       offPings()
       offSupport()
       offNav()

@@ -52,6 +52,47 @@ export function listProcesses(): Promise<ProcessInfo[]> {
   })
 }
 
+/** Other VPN clients: their TUN and ours fight over the routes. */
+const OTHER_VPN_CLIENTS: { re: RegExp; label: string }[] = [
+  { re: /^happ\.exe$/i, label: 'Happ' },
+  { re: /^(koala-clash|koala clash)\.exe$/i, label: 'Koala Clash' },
+  { re: /^flclash.*\.exe$/i, label: 'FlClash' },
+  { re: /^v2rayn\.exe$/i, label: 'v2rayN' }
+]
+
+/** Exe names → the VPN clients among them, each once. Pure. */
+export function findOtherVpnClients(names: string[]): string[] {
+  const found = new Set<string>()
+  for (const name of names) {
+    const hit = OTHER_VPN_CLIENTS.find((c) => c.re.test(name.trim()))
+    if (hit) found.add(hit.label)
+  }
+  return [...found]
+}
+
+/** `"Happ.exe","25496","Console","1","195 320 КБ"` → the first column. */
+export function parseTasklist(csv: string): string[] {
+  const names: string[] = []
+  for (const line of csv.split(/\r?\n/)) {
+    const m = /^"([^"]+)"/.exec(line.trim())
+    if (m) names.push(m[1])
+  }
+  return names
+}
+
+/** Names of running processes; quick (tasklist), [] if that fails. */
+export function runningProcessNames(): Promise<string[]> {
+  if (process.platform !== 'win32') return Promise.resolve([])
+  return new Promise((resolve) => {
+    execFile(
+      'tasklist',
+      ['/fo', 'csv', '/nh'],
+      { windowsHide: true, timeout: 10_000, maxBuffer: 8 * 1024 * 1024 },
+      (err, stdout) => resolve(err ? [] : parseTasklist(String(stdout)))
+    )
+  })
+}
+
 export function exeName(fullPath: string): string {
   return basename(fullPath)
 }

@@ -1,10 +1,11 @@
-import { execFile, spawn } from 'node:child_process'
+import { execFile, spawn, type ChildProcess } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import { createReadStream, existsSync } from 'node:fs'
-import { readFile, rm, stat, writeFile } from 'node:fs/promises'
+import { readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { TunServiceInfo } from '@shared/types'
-import { brokerScript, psQuote } from './broker'
+import { brokerScript, parseCoreExit, psQuote, type CoreExit } from './broker'
+import { CORE_EXE } from './coreNames'
 import {
   elevateCommand,
   installScript,
@@ -37,8 +38,10 @@ export interface TunLauncher {
   restartCore(): Promise<void>
   /** the rule files in the user's rules folder changed */
   syncRules(): Promise<void>
-  /** the core exited on its own */
+  /** the core exited on its own (never a report left over from another session) */
   exited(): Promise<boolean>
+  /** what the broker knows about that exit: code, time, stderr */
+  exitInfo(): Promise<CoreExit | null>
   /** launching failed for good (UAC refused, service refused) — readable reason */
   failure(): string | null
   stop(): Promise<void>
@@ -72,14 +75,28 @@ function run(
 
 // --- legacy: elevated broker per connect ----------------------------------
 
+/** Signal / report files older than this are left-overs of a crashed broker. */
+const STALE_SIGNAL_MS = 2 * 60_000
+const LEGACY_FILE_RE = /^(core(-[0-9a-f]+)?\.exit(\.tmp)?|restart(-[0-9a-f]+)?\.signal|stop(-[0-9a-f]+)?\.signal)$/
+
+export interface LegacyOpts {
+  /** tests: run the broker script without the UAC prompt */
+  spawnBroker?: (scriptPath: string) => ChildProcess
+  /** tests: the adapter the broker may wait for / remove */
+  tunName?: string
+}
+
 export class LegacyLauncher implements TunLauncher {
   readonly kind = 'legacy' as const
   private elevation: 'pending' | 'ok' | 'failed' = 'pending'
+  /** in every file name: a file of an earlier session can't be taken for ours */
+  private session = randomBytes(8).toString('hex')
 
   constructor(
     private p: LauncherPaths,
     private log: (level: 'info' | 'warn' | 'error', msg: string) => void,
-    private isCancelled: () => boolean
+    private isCancelled: () => boolean,
+    private opts: LegacyOpts = {}
   ) {}
 
   get coreRuleDir(): string {
@@ -89,33 +106,57 @@ export class LegacyLauncher implements TunLauncher {
     return this.p.logPath
   }
   private get stopFile(): string {
-    return join(this.p.runDir, 'stop.signal')
+    return join(this.p.runDir, `stop-${this.session}.signal`)
   }
   private get restartFile(): string {
-    return join(this.p.runDir, 'restart.signal')
+    return join(this.p.runDir, `restart-${this.session}.signal`)
   }
   private get exitFile(): string {
-    return join(this.p.runDir, 'core.exit')
+    return join(this.p.runDir, `core-${this.session}.exit`)
+  }
+
+  /**
+   * core.exit & co. of earlier sessions (0.4.2 used one fixed name). The stop
+   * signal of a broker that may still be finishing is left to it for a while.
+   */
+  private async clearLeftovers(): Promise<void> {
+    const names = await readdir(this.p.runDir).catch(() => [] as string[])
+    for (const name of names) {
+      if (!LEGACY_FILE_RE.test(name)) continue
+      const path = join(this.p.runDir, name)
+      if (name.startsWith('stop')) {
+        const age = await stat(path).then(
+          (s) => Date.now() - s.mtimeMs,
+          () => 0
+        )
+        if (age < STALE_SIGNAL_MS) continue
+      }
+      await rm(path, { force: true }).catch(() => undefined)
+    }
   }
 
   async launch(): Promise<void> {
-    for (const f of [this.stopFile, this.restartFile, this.exitFile]) {
-      await rm(f, { force: true }).catch(() => undefined)
-    }
+    await this.clearLeftovers()
     this.elevation = 'pending'
     const brokerPath = join(this.p.runDir, 'broker.ps1')
     const script = brokerScript({
-      exe: join(this.p.binDir, 'sing-box.exe'),
+      exe: join(this.p.binDir, CORE_EXE),
       config: this.p.configPath,
       workDir: this.p.binDir,
       stopFile: this.stopFile,
       restartFile: this.restartFile,
       exitFile: this.exitFile,
-      parentPid: process.pid
+      parentPid: process.pid,
+      ...(this.opts.tunName ? { tunName: this.opts.tunName } : {})
     })
     // BOM: Windows PowerShell 5.1 reads BOM-less scripts as ANSI (Cyrillic user names)
     await writeFile(brokerPath, `\ufeff${script}`, 'utf8')
     const launchCmd = `Start-Process -FilePath 'powershell.exe' -Verb RunAs -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',${psQuote(`"${brokerPath}"`)})`
+    if (this.opts.spawnBroker) {
+      this.opts.spawnBroker(brokerPath)
+      this.elevation = 'ok'
+      return
+    }
     const launcher = spawn(
       'powershell.exe',
       ['-NoProfile', '-NonInteractive', '-Command', launchCmd],
@@ -130,7 +171,7 @@ export class LegacyLauncher implements TunLauncher {
         this.log('error', `UAC отклонён или ошибка запуска (code=${code})`)
       }
     })
-    this.log('info', 'Запуск sing-box в режиме TUN (запрошены права администратора)')
+    this.log('info', 'Запуск ядра в режиме TUN (запрошены права администратора)')
   }
 
   failure(): string | null {
@@ -143,10 +184,16 @@ export class LegacyLauncher implements TunLauncher {
     return existsSync(this.exitFile)
   }
 
+  async exitInfo(): Promise<CoreExit | null> {
+    const text = await readFile(this.exitFile, 'utf8').catch(() => null)
+    return text === null ? null : parseCoreExit(text)
+  }
+
   async restartCore(): Promise<void> {
     await writeFile(this.restartFile, '1', 'utf8')
     // the broker removes the signal once the new sing-box is launched
-    for (let i = 0; i < 40 && existsSync(this.restartFile); i++) await sleep(200)
+    // (it may first have to wait for the old adapter to go, up to ~8 s)
+    for (let i = 0; i < 100 && existsSync(this.restartFile); i++) await sleep(200)
     if (existsSync(this.restartFile)) {
       await rm(this.restartFile, { force: true }).catch(() => undefined)
       throw new Error('Служебный процесс TUN не отвечает — попробуйте подключиться ещё раз')
@@ -173,6 +220,10 @@ interface BrokerState {
   restart?: number
   rules?: number
   exitCode?: number | null
+  uptimeMs?: number | null
+  stderr?: string
+  /** why the broker stopped the core itself */
+  stopReason?: string
   error?: string
   ts?: number
 }
@@ -188,7 +239,7 @@ interface Ctl {
 
 const hashCache = new Map<string, { key: string; hash: string }>()
 
-/** sha256 of a file, cached by size + mtime (sing-box.exe is ~40 MB). */
+/** sha256 of a file, cached by size + mtime (the core is ~40 MB). */
 export async function fileSha256(path: string): Promise<string> {
   const st = await stat(path)
   const key = `${st.size}:${st.mtimeMs}`
@@ -215,6 +266,10 @@ export interface TunServiceOpts {
   log: (level: 'info' | 'warn' | 'error', msg: string) => void
   /** tests: %ProgramData%\CipherWay replacement */
   rootOverride?: string
+  /** tests: instead of asking Task Scheduler */
+  taskExists?: () => Promise<boolean>
+  /** tests: the Windows user instead of `whoami` */
+  sidOverride?: string
 }
 
 /** Install / status / removal of the «Служба TUN» task. */
@@ -228,6 +283,7 @@ export class TunService {
   }
 
   async sid(): Promise<string> {
+    if (this.o.sidOverride) return this.o.sidOverride
     if (this.sidCache) return this.sidCache
     const { out } = await run('whoami', ['/user', '/fo', 'csv', '/nh'], 10_000)
     const sid = /S-1-5-21(-\d+){3,6}/.exec(out)?.[0]
@@ -242,7 +298,7 @@ export class TunService {
 
   private async hashes(): Promise<BrokerHashes> {
     return {
-      'sing-box.exe': await fileSha256(join(this.o.binDir, 'sing-box.exe')),
+      [CORE_EXE]: await fileSha256(join(this.o.binDir, CORE_EXE)),
       'wintun.dll': await fileSha256(join(this.o.binDir, 'wintun.dll'))
     }
   }
@@ -264,13 +320,16 @@ export class TunService {
           (t) => JSON.parse(t.replace(/^\ufeff/, '')) as { broker?: string; files?: BrokerHashes }
         )
         .catch(() => null)
-      const task = (await run('schtasks', ['/query', '/tn', taskName(sid)], 10_000)).code === 0
+      const task = this.o.taskExists
+        ? await this.o.taskExists()
+        : (await run('schtasks', ['/query', '/tn', taskName(sid)], 10_000)).code === 0
       if (!manifest || !task) return { state: 'missing' }
       const want = await this.hashes()
       const broker = sha256(await this.brokerText(sid))
       const same =
         manifest.broker === broker &&
-        manifest.files?.['sing-box.exe'] === want['sing-box.exe'] &&
+        // a manifest of ≤0.4.2 lists sing-box.exe → «outdated» → one UAC prompt
+        manifest.files?.[CORE_EXE] === want[CORE_EXE] &&
         manifest.files?.['wintun.dll'] === want['wintun.dll']
       return { state: same ? 'ok' : 'outdated' }
     } catch (err) {
@@ -353,6 +412,8 @@ export class ServiceLauncher implements TunLauncher {
       task: string
       log: (level: 'info' | 'warn' | 'error', msg: string) => void
       isCancelled: () => boolean
+      /** tests: instead of `schtasks /run` (a non-elevated broker) */
+      runTask?: () => Promise<{ code: number; out: string }>
     }
   ) {}
 
@@ -401,7 +462,12 @@ export class ServiceLauncher implements TunLauncher {
 
   private mine = (st: BrokerState): boolean => st.session === this.ctl?.session
 
+  private runTask(): Promise<{ code: number; out: string }> {
+    return this.s.runTask?.() ?? run('schtasks', ['/run', '/tn', this.s.task], 15_000)
+  }
+
   async launch(): Promise<void> {
+    this.reason = null
     // a broker of an earlier session that is still alive sees the new
     // session id in tun-ctl.json and stops; give it a moment
     const prev = await this.state()
@@ -420,14 +486,21 @@ export class ServiceLauncher implements TunLauncher {
         7000
       )
     }
-    const res = await run('schtasks', ['/run', '/tn', this.s.task], 15_000)
+    const res = await this.runTask()
     if (res.code !== 0) {
       this.reason = 'Служба TUN не запустилась — удалите её в Настройках и подключитесь снова'
       this.s.log('error', `schtasks /run: код ${res.code} ${res.out.trim()}`)
       return
     }
-    this.s.log('info', 'Запуск sing-box в режиме TUN через службу CipherWay (без запроса прав)')
-    const st = await this.waitState((x) => this.mine(x) && x.status !== 'starting', 20_000)
+    this.s.log('info', 'Запуск ядра в режиме TUN через службу CipherWay (без запроса прав)')
+    // the task only allows one instance: a /run while the previous broker is still
+    // exiting is silently ignored — no answer for this session → ask again
+    for (let i = 0; i < 2 && !(await this.waitState(this.mine, 3000)); i++) {
+      if (this.s.isCancelled()) return
+      await this.runTask()
+    }
+    // may include waiting for the previous adapter to go away
+    const st = await this.waitState((x) => this.mine(x) && x.status !== 'starting', 30_000)
     if (this.s.isCancelled()) return
     if (!st) this.reason = 'Служба TUN не ответила'
     else if (st.status !== 'running') {
@@ -446,12 +519,32 @@ export class ServiceLauncher implements TunLauncher {
     return st.restart === this.ctl?.restart && typeof st.exitCode === 'number'
   }
 
+  async exitInfo(): Promise<CoreExit | null> {
+    const st = await this.state()
+    if (!st || !this.mine(st)) return null
+    return {
+      code: typeof st.exitCode === 'number' ? st.exitCode : null,
+      uptimeMs: typeof st.uptimeMs === 'number' ? st.uptimeMs : null,
+      stderr: st.stderr ?? '',
+      ...(st.stopReason || st.error ? { note: st.stopReason || st.error } : {})
+    }
+  }
+
   async restartCore(): Promise<void> {
     if (!this.ctl) return
+    // the broker has already left (it refused, or a core stayed dead too long):
+    // running the task again needs no UAC prompt either
+    const cur = await this.state()
+    if (!cur || !this.mine(cur) || cur.status !== 'running') {
+      await this.launch()
+      if (this.reason) throw new Error(this.reason)
+      return
+    }
     this.ctl.restart++
     const n = this.ctl.restart
     await this.writeCtl()
-    const st = await this.waitState((x) => this.mine(x) && (x.restart ?? 0) >= n, 15_000)
+    // may include waiting for the old adapter to go away
+    const st = await this.waitState((x) => this.mine(x) && (x.restart ?? 0) >= n, 25_000)
     if (!st || st.status !== 'running') {
       throw new Error('Служебный процесс TUN не отвечает — попробуйте подключиться ещё раз')
     }

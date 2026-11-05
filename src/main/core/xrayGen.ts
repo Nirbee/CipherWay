@@ -19,7 +19,6 @@ import { normalizeHost, type ServerIps } from '../system/resolve'
 // `xray run -test -c` against Xray-core 26.7.x (see scripts/download-cores.ts).
 // ---------------------------------------------------------------------------
 
-export const XRAY_EXE = 'xray.exe'
 export const XRAY_BLOCK_TAG = 'block'
 
 /** Protocols whose connections are carried by xray (the rest stay in sing-box). */
@@ -117,8 +116,6 @@ export function xrayHosts(nodes: OutboundConfig[], ips: ServerIps): Record<strin
 export interface XrayGenOptions {
   /** resolved node IPs (see system/resolve.ts); empty = xray resolves itself */
   serverIps?: ServerIps
-  /** «Подробный журнал»: per-connection lines */
-  verbose?: boolean
 }
 
 export function generateXrayConfig(bridges: XrayBridge[], opts: XrayGenOptions = {}): XrayConfig {
@@ -127,8 +124,11 @@ export function generateXrayConfig(bridges: XrayBridge[], opts: XrayGenOptions =
     opts.serverIps ?? {}
   )
   return {
-    // stdout/stderr are piped into the app's «Журнал» screen
-    log: { loglevel: opts.verbose ? 'info' : 'warning', access: 'none' },
+    // Always `info`: at warning level `REALITY: received real certificate` can't be
+    // traced to a node — only `taking detour [out-<id>]` carries the id, with the
+    // same session number. SidecarManager drops info lines from «Журнал» unless
+    // «Подробный журнал» is on.
+    log: { loglevel: 'info', access: 'none' },
     ...(Object.keys(hosts).length ? { dns: { hosts } } : {}),
     inbounds: bridges.map((b) => ({
       tag: inTag(b.outbound.id),

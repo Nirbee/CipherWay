@@ -5,10 +5,16 @@ import type { OutboundConfig, Protocol } from '@shared/types'
 // All parsers are pure + side-effect free so they can be unit tested.
 // ---------------------------------------------------------------------------
 
-/** Stable-ish id derived from the raw URI (djb2) so ids survive refreshes. */
-function hashId(raw: string): string {
+/**
+ * Id derived from the server's *name* (djb2): the panel can rotate a node's key
+ * or move it to another address, and it may vary shortId / fingerprint on every
+ * request — the same server keeps its id, and with it the user's choice, its
+ * latency history and its tag in a running core. Repeated names are told apart
+ * in parseOutbounds.
+ */
+function hashId(name: string): string {
   let h = 5381
-  for (let i = 0; i < raw.length; i++) h = ((h << 5) + h + raw.charCodeAt(i)) >>> 0
+  for (let i = 0; i < name.length; i++) h = ((h << 5) + h + name.charCodeAt(i)) >>> 0
   return `ob_${h.toString(36)}`
 }
 
@@ -48,10 +54,11 @@ export function parseVless(uri: string): OutboundConfig | null {
   const q = url.searchParams
   const security = (q.get('security') as 'reality' | 'tls' | 'none' | null) ?? 'none'
   const network = (q.get('type') as OutboundConfig['network'] | null) ?? 'tcp'
+  const name = safeDecode(url.hash.slice(1)) || `${url.hostname}:${url.port}`
 
   return {
-    id: hashId(uri),
-    name: safeDecode(url.hash.slice(1)) || `${url.hostname}:${url.port}`,
+    id: hashId(name),
+    name,
     protocol: 'vless',
     server: url.hostname,
     port: Number(url.port) || 443,
@@ -85,10 +92,11 @@ export function parseHysteria2(uri: string): OutboundConfig | null {
   // password can live in either userinfo half: user:pass@ or pass@
   const password = decodeURIComponent(url.password || url.username || q.get('auth') || '')
   const insecure = q.get('insecure') === '1' || q.get('insecure') === 'true'
+  const name = safeDecode(url.hash.slice(1)) || `${url.hostname}:${url.port}`
 
   return {
-    id: hashId(uri),
-    name: safeDecode(url.hash.slice(1)) || `${url.hostname}:${url.port}`,
+    id: hashId(name),
+    name,
     protocol: 'hysteria2',
     server: url.hostname,
     port: Number(url.port) || 443,
@@ -120,9 +128,10 @@ export function parseVmess(uri: string): OutboundConfig | null {
   if (!uri.startsWith('vmess://')) return null
   try {
     const json = JSON.parse(decodeBase64(uri.slice('vmess://'.length))) as VmessJson
+    const name = json.ps || `${json.add}:${json.port}`
     return {
-      id: hashId(uri),
-      name: json.ps || `${json.add}:${json.port}`,
+      id: hashId(name),
+      name,
       protocol: 'vmess',
       server: String(json.add ?? ''),
       port: Number(json.port) || 443,
@@ -155,6 +164,16 @@ export function parseUri(uri: string): OutboundConfig | null {
   return null
 }
 
+/** Two servers with one name still need two tags: the second one is `<id>_2`. */
+function uniqueIds(list: OutboundConfig[]): OutboundConfig[] {
+  const seen = new Map<string, number>()
+  return list.map((o) => {
+    const n = (seen.get(o.id) ?? 0) + 1
+    seen.set(o.id, n)
+    return n === 1 ? o : { ...o, id: `${o.id}_${n}` }
+  })
+}
+
 /**
  * Parse a raw subscription body into outbounds. Handles:
  *  - base64-encoded blobs (decoded then re-parsed)
@@ -176,16 +195,18 @@ export function parseOutbounds(raw: string): OutboundConfig[] {
           if (parsed) out.push(parsed)
         }
       }
-      if (out.length) return out
+      if (out.length) return uniqueIds(out)
     } catch {
       // fall through to line parsing
     }
   }
 
-  return body
-    .split(/\r?\n/)
-    .map((l) => parseUri(l))
-    .filter((o): o is OutboundConfig => o !== null)
+  return uniqueIds(
+    body
+      .split(/\r?\n/)
+      .map((l) => parseUri(l))
+      .filter((o): o is OutboundConfig => o !== null)
+  )
 }
 
 export function protocolLabel(p: Protocol): string {

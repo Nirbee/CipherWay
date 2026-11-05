@@ -54,7 +54,7 @@ export function ServerPicker() {
               <PickerRow
                 key={e.id}
                 entry={e}
-                hint={e.auto ? autoHint(e, autoPick?.label, pickLabel.toLowerCase()) : undefined}
+                hint={e.auto ? autoHint(e, autoPick?.label, pickLabel.toLowerCase()) : e.hint}
                 selected={e.id === active.id}
                 testing={testing || !!e.checking}
                 onClick={() => {
@@ -80,13 +80,14 @@ export function ServerPicker() {
           <div
             className={cn(
               'truncate text-[11px]',
-              active.dead ? 'text-accent-red' : 'text-text-muted'
+              active.dead ? 'text-accent-red' : active.hint ? 'text-accent-amber' : 'text-text-muted'
             )}
+            title={active.hint}
           >
             {active.auto
               ? (autoHint(active, autoPick?.label, pickLabel) ??
                 'Самый быстрый из доступных, проверка каждые 5 минут')
-              : (PROTOCOL_LABEL[active.protocol ?? ''] ?? 'Сервер')}
+              : (active.hint ?? PROTOCOL_LABEL[active.protocol ?? ''] ?? 'Сервер')}
           </div>
         </div>
         <LatencyBadge ms={active.latency} testing={testing || !!active.checking} />
@@ -135,7 +136,17 @@ function PickerRow({
         >
           {entry.label}
         </div>
-        {hint && <div className="truncate text-[11px] text-text-muted">{hint}</div>}
+        {hint && (
+          <div
+            title={hint}
+            className={cn(
+              'truncate text-[11px]',
+              entry.hint ? 'text-accent-amber' : 'text-text-muted'
+            )}
+          >
+            {hint}
+          </div>
+        )}
       </div>
       <LatencyBadge ms={entry.latency} testing={testing} />
       <span className={cn('w-4 text-accent-green', !selected && 'invisible')}>

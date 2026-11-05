@@ -1,6 +1,6 @@
 import type { ConnItem, FailedDirect, OutboundConfig } from '@shared/types'
 import { TAG_AUTO, TAG_DIRECT, TAG_PROXY_GROUP } from './sbTypes'
-import { XRAY_EXE } from './xrayGen'
+import { CORE_EXE, XRAY_EXE } from './coreNames'
 import { SLOT_FINAL, TELEGRAM_CIDRS } from '../rules/compile'
 
 // ---------------------------------------------------------------------------
@@ -8,7 +8,7 @@ import { SLOT_FINAL, TELEGRAM_CIDRS } from '../rules/compile'
 // Destination hosts are the user's own sites and are kept; our node
 // addresses never are: the chain is reduced to a server *name*, the matched
 // rule loses its `=> route(<node id>)` tail, and connections of our own cores
-// (xray.exe dialing the nodes in TUN mode) or to node addresses are dropped.
+// (cipherway-xray.exe dialing the nodes in TUN mode) or to node addresses are dropped.
 // Pure — unit tested in connections.test.ts.
 // ---------------------------------------------------------------------------
 
@@ -49,7 +49,7 @@ export interface ConnContext {
 /** a direct connection that got nothing back for this long is probably blocked */
 export const STALL_MS = 4000
 
-const OWN_CORES = new Set([XRAY_EXE, 'sing-box.exe'])
+const OWN_CORES = new Set<string>([XRAY_EXE, CORE_EXE])
 
 export function exeOf(path: string | undefined): string | undefined {
   if (!path) return undefined

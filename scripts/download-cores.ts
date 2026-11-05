@@ -1,8 +1,11 @@
 /*
  * Downloads the runtime binaries CipherWay needs into resources/bin:
- *   - sing-box.exe  (SagerNet/sing-box, Windows amd64) — TUN, routing, DNS, Hysteria2
- *   - xray.exe      (XTLS/Xray-core, Windows amd64) — VLESS+REALITY connections
- *   - wintun.dll    (wintun.net, amd64) — required for the TUN inbound
+ *   - cipherway-core.exe  (sing-box, SagerNet/sing-box, Windows amd64) — TUN, routing, DNS, Hysteria2
+ *   - cipherway-xray.exe  (xray.exe, XTLS/Xray-core, Windows amd64) — VLESS+REALITY connections
+ *   - wintun.dll          (wintun.net, amd64) — required for the TUN inbound
+ *
+ * The cores get our own names: other VPN clients stop theirs with
+ * `taskkill /im xray.exe`, which must not hit ours (and the reverse).
  *
  * Run via `npm run download:cores` (also invoked before packaging).
  * Fetch only some cores: `npm run download:cores -- xray` (names: singbox, xray, wintun).
@@ -26,6 +29,8 @@ import { Readable } from 'node:stream'
 import { execFileSync } from 'node:child_process'
 
 const BIN_DIR = join(process.cwd(), 'resources', 'bin')
+const CORE_EXE = 'cipherway-core.exe' // = src/main/core/coreNames.ts
+const XRAY_EXE = 'cipherway-xray.exe'
 const SINGBOX_SERIES = /^v?1\.13\./
 const WINTUN_URL = 'https://www.wintun.net/builds/wintun-0.14.1.zip'
 // Xray-core: same series as the nodes (26.7.x). GitHub marks 26.7.x as
@@ -122,10 +127,11 @@ async function getSingbox(): Promise<void> {
   unzip(zip, tmp)
   const exe = await findFile(tmp, 'sing-box.exe')
   if (!exe) throw new Error('sing-box.exe not found in archive')
-  await writeFile(join(BIN_DIR, 'sing-box.exe'), await readFile(exe))
+  await writeFile(join(BIN_DIR, CORE_EXE), await readFile(exe))
+  await rm(join(BIN_DIR, 'sing-box.exe'), { force: true })
   await rm(tmp, { recursive: true, force: true })
   await rm(zip, { force: true })
-  console.log(`-> ${join(BIN_DIR, 'sing-box.exe')}`)
+  console.log(`-> ${join(BIN_DIR, CORE_EXE)}`)
 }
 
 async function getXray(): Promise<void> {
@@ -164,10 +170,11 @@ async function getXray(): Promise<void> {
   unzip(zip, tmp)
   const exe = await findFile(tmp, 'xray.exe')
   if (!exe) throw new Error('xray.exe not found in archive')
-  await writeFile(join(BIN_DIR, 'xray.exe'), await readFile(exe))
+  await writeFile(join(BIN_DIR, XRAY_EXE), await readFile(exe))
+  await rm(join(BIN_DIR, 'xray.exe'), { force: true })
   await rm(tmp, { recursive: true, force: true })
   await rm(zip, { force: true })
-  console.log(`-> ${join(BIN_DIR, 'xray.exe')}`)
+  console.log(`-> ${join(BIN_DIR, XRAY_EXE)}`)
 }
 
 async function getWintun(): Promise<void> {

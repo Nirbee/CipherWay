@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest'
-import { brokerScript, hasTunAdapter, psQuote } from './broker'
+import { brokerScript, hasTunAdapter, parseCoreExit, psQuote } from './broker'
 
 describe('TUN broker script', () => {
   const script = brokerScript({
-    exe: 'C:\\Program Files\\CipherWay VPN\\resources\\bin\\sing-box.exe',
+    exe: 'C:\\Program Files\\CipherWay VPN\\resources\\bin\\cipherway-core.exe',
     config: "C:\\Users\\O'Neil $user\\AppData\\Roaming\\cipherway\\run\\config.json",
     workDir: 'C:\\bin',
     stopFile: 'C:\\run\\stop.signal',
@@ -21,16 +21,44 @@ describe('TUN broker script', () => {
 
   it('restart signal: kills the core and starts a fresh one (no second UAC prompt)', () => {
     expect(script).toMatch(
-      /if \(Test-Path \$restart\)[\s\S]*Stop-Process -Id \$p\.Id -Force[\s\S]*\$p = Start-Core/
+      /if \(Test-Path \$restart\)[\s\S]*Stop-Process -Id \$p\.Id -Force[\s\S]*Clear-StaleAdapter[\s\S]*\$p = Start-CoreProcess/
     )
   })
 
-  it('reports a core that died on its own, and dies with the app', () => {
-    expect(script).toContain('Set-Content -Path $exitf -Value $p.ExitCode')
+  it('reports a core that died on its own: code, time, stderr; and dies with the app', () => {
+    expect(script).toContain('if (-not (Test-Path $exitf)) { Write-Exit $p }')
+    expect(script).toContain('@{ code = $c.ExitCode; uptimeMs =')
+    expect(script).toContain('stderr = (Core-Output)')
+    expect(script).toContain('$psi.RedirectStandardError = $true')
     expect(script).toContain('$parent = 4242')
     expect(script).toContain('Get-Process -Id $parent')
-    // keeps the process handle so ExitCode is readable after the exit
-    expect(script).toContain('$null = $c.Handle')
+  })
+
+  it('the report is written atomically: a half-written file is never read', () => {
+    expect(script).toContain("$tmp = $exitf + '.tmp'")
+    expect(script).toContain('[IO.File]::Move($tmp, $exitf)')
+  })
+
+  it('the old adapter goes first', () => {
+    expect(script).toMatch(/Clear-StaleAdapter\s+\$p = Start-CoreProcess\s+\$idle = 0/)
+    expect(script).toContain("$TunName = 'CipherWay'")
+  })
+})
+
+describe('parseCoreExit', () => {
+  it('reads the report of the broker', () => {
+    expect(parseCoreExit('{"code":1,"uptimeMs":12500,"stderr":"FATAL boom"}')).toEqual({
+      code: 1,
+      uptimeMs: 12500,
+      stderr: 'FATAL boom'
+    })
+    expect(parseCoreExit('\ufeff{"code":0}').code).toBe(0)
+  })
+  it('garbage gives no details rather than an error', () => {
+    const empty = { code: null, uptimeMs: null, stderr: '' }
+    expect(parseCoreExit('')).toEqual(empty)
+    expect(parseCoreExit('1')).toEqual(empty)
+    expect(parseCoreExit('{"code":"x","stderr":5}')).toEqual(empty)
   })
 })
 

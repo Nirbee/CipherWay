@@ -13,9 +13,9 @@ an automatic best-server group, real (through-the-node) latency and a live conne
 - **Tailwind CSS** — styling (design tokens in `tailwind.config.ts`)
 - **electron-builder** + **electron-updater** — packaging & auto-update
 - Cores (since 0.3.0 — two processes):
-  - `xray.exe` (XTLS/Xray-core, pinned to **26.7.28** — the same series as the
-    nodes) carries the **VLESS + REALITY / TLS** connections to the servers;
-  - `sing-box.exe` (SagerNet/sing-box 1.13.x) does **TUN / system proxy,
+  - `cipherway-xray.exe` (XTLS/Xray-core, pinned to **26.7.28** — the same series
+    as the nodes) carries the **VLESS + REALITY / TLS** connections to the servers;
+  - `cipherway-core.exe` (SagerNet/sing-box 1.13.x) does **TUN / system proxy,
     per-process & per-domain rules, DNS and Hysteria2**;
   - `wintun.dll` for the TUN inbound
 
@@ -33,7 +33,7 @@ src/
   renderer/    React app (pages, components, store, styles)
   shared/      types + IPC contract shared by main and renderer
 resources/
-  bin/         sing-box.exe / xray.exe / wintun.dll — downloaded, NOT committed
+  bin/         cipherway-core.exe / cipherway-xray.exe / wintun.dll — downloaded, NOT committed
   tray/        tray icons (connected / disconnected)
 build/
   installer.nsh       NSIS hook: registers the cipherway:// URL scheme
@@ -46,7 +46,7 @@ scripts/
 
 ```bash
 npm install
-npm run download:cores   # fetch sing-box.exe, xray.exe, wintun.dll into resources/bin
+npm run download:cores   # fetch both cores (under our names) + wintun.dll into resources/bin
 npm run download:cores -- xray   # only one core (names: singbox, xray, wintun)
 npm run dev              # launch the app in dev mode
 ```
@@ -118,10 +118,10 @@ apps -> sing-box (TUN "CipherWay" or mixed 127.0.0.1) -- rules / DNS --
      -> direct / reject
 ```
 
-- xray starts **before** sing-box and stops **after** it; if xray dies the whole
-  connection is stopped with an error (no silent fallback to direct). xray output
-  goes to the «Журнал» screen with source `XRAY`.
-- TUN loop guard: `process_name: xray.exe -> direct` is the first route rule, node
+- xray starts **before** sing-box and stops **after** it; if xray dies it is
+  restarted alone, on the same ports (see 0.4.3). xray output goes to the
+  «Журнал» screen with source `XRAY`.
+- TUN loop guard: `process_name: cipherway-xray.exe -> direct` is the first route rule, node
   host names are resolved by the direct DNS server, `auto_detect_interface` binds
   `direct` to the physical NIC.
 - Configs are validated in tests against the real binaries (`sing-box check`,
@@ -233,3 +233,35 @@ proxy mocked): `CW_E2E=1 npx vitest run src/main/core/sidecar.e2e.test.ts`.
   the page, 60 s in the background with an open ticket, 10 min without one;
   a new reply → Windows notification + badge. «Написать в Telegram»
   (`support-url`) stays as a fallback.
+
+## 0.4.3: the subscription follows the panel, cores come back by themselves
+
+- **Subscription refresh**: «Обновить» on Главная / Подписка; before every connect
+  (5 s, on failure the saved copy); on `profile-update-interval` (else the setting);
+  at start. A change while connected restarts the cores through the queue, the
+  selected server follows its *name* (ids are derived from it now) or falls back to
+  «Лучший сервер». shortId / fingerprint alone don't restart anything (the panel may
+  vary them). The request is ordinary app traffic: with the VPN on it goes through
+  the tunnel.
+- **`REALITY: received real certificate`**: at most once per 10 min the subscription
+  is fetched and whatever changed applied; if the same server keeps failing it gets a
+  hint in the list. xray always runs at log level `info` (session → node mapping
+  through `taking detour [out-<id>]`), info lines are dropped unless «Подробный журнал».
+- **«⚡ Автовыбор»** of the panel is hidden from the list and the urltest group: for
+  us it is one plain address, we have «Лучший сервер (авто)».
+- **Own file names** `cipherway-core.exe` / `cipherway-xray.exe`, so somebody else's
+  `taskkill /im xray.exe` doesn't hit us. Updating from 0.4.2: the manifest lists the
+  old name → «outdated» → one UAC prompt, the old file leaves `%ProgramData%\CipherWay\bin`.
+- **A core that died** while connected: restarted alone, 3 tries after 1/3/5 s, toast
+  «Ядро перезапущено». Xray keeps its ports (sing-box and TUN stay up). Only then an
+  error, with a reason only if the process itself reported one.
+- **First TUN start**: sing-box prints a start-time FATAL to **stderr only**, never to
+  `log.output`, and the brokers didn't capture it. They do now: exit code, time and
+  the last lines reach the app (`state.json` / `core-<session>.exit`, `broker.log` in
+  the service folder). A core that ends during the start gets one automatic retry
+  without UAC; a WARN is never shown as a reason. Report files carry the session in
+  their name. The brokers remove an adapter left over from the previous run.
+  Note: the Clash API opens only after the TUN inbound is up (`StartStateStarted`).
+- **Journal**: ordinary broken connections are hidden without «Подробный журнал»;
+  REALITY lines and «refused» to our own loopback ports are collapsed.
+- A warning (nothing blocked) when TUN is started next to Happ, Koala Clash, FlClash, v2rayN.

@@ -175,7 +175,11 @@ function ServerRow({
             </span>
           )}
         </div>
-        {sub && <div className="truncate text-[11px] text-text-muted">{sub}</div>}
+        {entry.hint ? (
+          <div className="text-[11px] leading-snug text-accent-amber">{entry.hint}</div>
+        ) : (
+          sub && <div className="truncate text-[11px] text-text-muted">{sub}</div>
+        )}
       </div>
       <LatencyBadge ms={entry.latency} testing={testing} />
       <span

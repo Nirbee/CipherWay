@@ -2,6 +2,7 @@
 // Keeping these in /shared guarantees main, preload and renderer stay in sync.
 
 import type {
+  AppNotice,
   AppSettings,
   ConnSnapshot,
   ImportRequest,
@@ -11,6 +12,7 @@ import type {
   RulesConfig,
   ServerPing,
   StatusUpdate,
+  SubscriptionRefreshResult,
   SubscriptionView,
   SupportPhoto,
   SupportSendResult,
@@ -111,6 +113,8 @@ export const IPC = {
   evtSettings: 'evt:settings',
   /** subscription data changed (background refresh) */
   evtSubscription: 'evt:subscription',
+  /** a toast from main («Ядро перезапущено», two VPNs at once…) */
+  evtNotice: 'evt:notice',
   /** payload-less ping: a deep-link import is pending, call deeplink.takePending() */
   evtImportRequest: 'evt:importRequest'
 } as const
@@ -142,7 +146,7 @@ export interface ExposedApi {
   }
   subscription: {
     fetch: (url: string) => Promise<SubscriptionView>
-    refresh: () => Promise<SubscriptionView>
+    refresh: () => Promise<SubscriptionRefreshResult>
     get: () => Promise<SubscriptionView | null>
   }
   connections: {
@@ -209,6 +213,7 @@ export interface ExposedApi {
     importRequest: (cb: () => void) => () => void
     settings: (cb: (s: AppSettings) => void) => () => void
     subscription: (cb: (s: SubscriptionView | null) => void) => () => void
+    notice: (cb: (n: AppNotice) => void) => () => void
   }
 }
 

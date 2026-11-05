@@ -4,6 +4,7 @@ import {
   filterSubscription,
   httpStatusError,
   hwidHeaderError,
+  isAutoSelectPseudo,
   isPlaceholderOutbound,
   MSG_DEVICE_LIMIT,
   MSG_HWID_NOT_SUPPORTED,
@@ -75,6 +76,36 @@ describe('placeholder ("stub") servers', () => {
 
   it('empty body', () => {
     expect(filterSubscription([]).error).toMatch(/не найдено/)
+  })
+})
+
+describe('«⚡ Автовыбор» (0.4.3)', () => {
+  const host = (name: string): string =>
+    `vless://${UUID}@khjvfcbtf.example.com:443?security=reality&pbk=K#${encodeURIComponent(name)}`
+
+  it('found by the name: any case, with or without an emoji', () => {
+    for (const name of ['⚡ Автовыбор', 'автовыбор', 'АВТОВЫБОР', '⚡Автовыбор (2)', '🚀 авТОвыБор']) {
+      expect(isAutoSelectPseudo({ name })).toBe(true)
+    }
+    for (const name of ['Лучший сервер', 'Германия', 'Авто', 'Auto']) {
+      expect(isAutoSelectPseudo({ name })).toBe(false)
+    }
+  })
+
+  it('hidden from the list (the urltest group is built from this list)', () => {
+    const res = filterSubscription(parseOutbounds(b64([host('⚡ Автовыбор'), REAL])))
+    expect(res.error).toBeUndefined()
+    expect(res.outbounds.map((o) => o.name)).toEqual(['NL'])
+  })
+
+  it('a subscription of nothing else keeps it — better than no server at all', () => {
+    const res = filterSubscription(parseOutbounds(b64([host('⚡ Автовыбор')])))
+    expect(res.outbounds.map((o) => o.name)).toEqual(['⚡ Автовыбор'])
+  })
+
+  it('stubs are still explained, not hidden behind it', () => {
+    const res = filterSubscription(parseOutbounds(b64([stub('Вы достигли лимита устройств!')])))
+    expect(res.error).toBe(MSG_DEVICE_LIMIT)
   })
 })
 

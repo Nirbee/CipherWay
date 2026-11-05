@@ -22,6 +22,7 @@ import {
   xrayHosts,
   type XrayBridge
 } from './xrayGen'
+import { CORE_EXE, XRAY_EXE } from './coreNames'
 import type { ServerIps } from '../system/resolve'
 import { MIXED_SUB_BODY, TEST_RULES, TEST_SETTINGS } from './fixtures'
 import { groupsFor, layoutRules, planRules, type HeadlessRule } from '../rules/compile'
@@ -211,10 +212,10 @@ describe('generateSingboxConfig with xray bridges', () => {
     }
   })
 
-  it('TUN mode: xray.exe goes direct before anything else (no loop)', () => {
+  it('TUN mode: cipherway-xray.exe goes direct before anything else (no loop)', () => {
     const cfg = singbox({ proxyMode: 'tun' })
     expect(cfg.route.rules[0]).toEqual({
-      process_name: ['xray.exe'],
+      process_name: ['cipherway-xray.exe'],
       action: 'route',
       outbound: 'direct'
     })
@@ -224,7 +225,7 @@ describe('generateSingboxConfig with xray bridges', () => {
 
   it('system mode: no process rule for xray (its traffic never enters sing-box)', () => {
     const cfg = singbox()
-    expect(cfg.route.rules.some((r) => r.process_name?.includes('xray.exe'))).toBe(false)
+    expect(cfg.route.rules.some((r) => r.process_name?.includes('cipherway-xray.exe'))).toBe(false)
     expect(cfg.inbounds[0]).toMatchObject({ type: 'mixed', listen: '127.0.0.1' })
   })
 })
@@ -261,6 +262,25 @@ describe('server groups: «Лучший сервер (авто)» + selector', (
     const rule = cfg.route.rules.find((r) => r.rule_set?.[0] === 'cw-0-p')
     expect(rule).toMatchObject({ action: 'route', outbound: 'cw-0' })
     expect(cfg.outbounds.find((o) => o.tag === 'cw-0')).toMatchObject({ default: 'proxy' })
+  })
+})
+
+describe('the «⚡ Автовыбор» of the panel (0.4.3)', () => {
+  it('reaches neither the urltest group nor the selector', () => {
+    const auto =
+      'vless://11111111-2222-4333-8444-555555555555@khjvfcbtf.example.com:443' +
+      '?security=reality&pbk=K&sni=a.example.org#%E2%9A%A1%20%D0%90%D0%B2%D1%82%D0%BE%D0%B2%D1%8B%D0%B1%D0%BE%D1%80'
+    const all = parseOutbounds(`${auto}\n${Buffer.from(MIXED_SUB_BODY, 'base64').toString()}`)
+    expect(all.map((o) => o.name)).toContain('⚡ Автовыбор')
+    const list = filterSubscription(all).outbounds
+    expect(list.map((o) => o.name)).not.toContain('⚡ Автовыбор')
+    const cfg = singbox({}, { outbounds: list })
+    const hidden = all.find((o) => o.name === '⚡ Автовыбор')!.id
+    const tags = (t: string) => cfg.outbounds.find((o) => o.tag === t)?.outbounds ?? []
+    expect(tags('auto')).toHaveLength(list.length)
+    expect(tags('auto')).not.toContain(hidden)
+    expect(tags('proxy')).not.toContain(hidden)
+    expect(JSON.stringify(cfg)).not.toContain('khjvfcbtf')
   })
 })
 
@@ -343,9 +363,13 @@ describe('TUN: node traffic of xray bypasses the TUN (0.4.1)', () => {
     expect(singbox({}, { serverIps: SERVER_IPS }).inbounds[0].type).toBe('mixed')
   })
 
-  it('the process_name xray.exe → direct rule stays as a safety net', () => {
+  it('the process_name cipherway-xray.exe → direct rule stays as a safety net', () => {
     const rules = singbox({ proxyMode: 'tun' }, { serverIps: SERVER_IPS }).route.rules
-    expect(rules[0]).toEqual({ process_name: ['xray.exe'], action: 'route', outbound: 'direct' })
+    expect(rules[0]).toEqual({
+      process_name: ['cipherway-xray.exe'],
+      action: 'route',
+      outbound: 'direct'
+    })
   })
 
   it('xray dials the pre-resolved IPs: dns.hosts (IPv4 only) + sockopt UseIP', () => {
@@ -376,8 +400,9 @@ describe('log level (0.4.1)', () => {
   it('warn by default, info with «Подробный журнал»', () => {
     expect(singbox().log.level).toBe('warn')
     expect(singbox({ verboseLog: true }).log.level).toBe('info')
-    expect(generateXrayConfig(bridges).log.loglevel).toBe('warning')
-    expect(generateXrayConfig(bridges, { verbose: true }).log.loglevel).toBe('info')
+    // xray: always info — the only way to trace a REALITY error to its node
+    // (filtered in SidecarManager unless «Подробный журнал» is on)
+    expect(generateXrayConfig(bridges).log.loglevel).toBe('info')
   })
 })
 
@@ -417,8 +442,8 @@ describe('«Лучший сервер (авто)»: member order by last latency
 // --- validate against the real binaries when they are downloaded ----------
 
 const BIN = resolve(__dirname, '../../../resources/bin')
-const SINGBOX = join(BIN, 'sing-box.exe')
-const XRAY = join(BIN, 'xray.exe')
+const SINGBOX = join(BIN, CORE_EXE)
+const XRAY = join(BIN, XRAY_EXE)
 const tmp = mkdtempSync(join(tmpdir(), 'cw-cfg-'))
 afterAll(() => rmSync(tmp, { recursive: true, force: true }))
 
@@ -438,9 +463,9 @@ describe('real core validation', () => {
     check(XRAY, ['run', '-test', '-c', file])
   })
 
-  it.skipIf(!existsSync(XRAY))('xray run -test accepts pinned IPs + verbose log', () => {
+  it.skipIf(!existsSync(XRAY))('xray run -test accepts pinned IPs', () => {
     const file = join(tmp, 'xray-pinned.json')
-    const cfg = generateXrayConfig(bridges, { serverIps: SERVER_IPS, verbose: true })
+    const cfg = generateXrayConfig(bridges, { serverIps: SERVER_IPS })
     writeFileSync(file, JSON.stringify(cfg, null, 2))
     check(XRAY, ['run', '-test', '-c', file])
   })

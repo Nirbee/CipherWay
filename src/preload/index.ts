@@ -87,7 +87,8 @@ const api: ExposedApi = {
     windowMaximized: (cb) => subscribe(IPC.evtWindowMaximized, (p) => cb(p as never)),
     importRequest: (cb) => subscribe(IPC.evtImportRequest, () => cb()),
     settings: (cb) => subscribe(IPC.evtSettings, (p) => cb(p as never)),
-    subscription: (cb) => subscribe(IPC.evtSubscription, (p) => cb(p as never))
+    subscription: (cb) => subscribe(IPC.evtSubscription, (p) => cb(p as never)),
+    notice: (cb) => subscribe(IPC.evtNotice, (p) => cb(p as never))
   }
 }
 

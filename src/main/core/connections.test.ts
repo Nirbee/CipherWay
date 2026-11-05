@@ -85,7 +85,7 @@ describe('toConnItems', () => {
     const items = toConnItems(
       {
         connections: [
-          conn({ id: 'x', ip: '203.0.113.10', path: 'C:\\CipherWay\\resources\\bin\\xray.exe' }),
+          conn({ id: 'x', ip: '203.0.113.10', path: 'C:\\CipherWay\\resources\\bin\\cipherway-xray.exe' }),
           conn({ id: 'y', host: 'fi.example.com', path: 'C:\\x\\curl.exe' }),
           conn({ id: 'z', ip: '203.0.113.10', path: 'C:\\x\\curl.exe' }),
           conn({ id: 'ok', host: 'example.org' })

@@ -3,6 +3,7 @@ import {
   elevateCommand,
   installScript,
   isValidSid,
+  legacyCleanupPs,
   serviceBrokerScript,
   taskName,
   uninstallScript
@@ -10,7 +11,7 @@ import {
 
 describe('«Служба TUN» scripts (0.4.2)', () => {
   const sid = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
-  const hashes = { 'sing-box.exe': 'a'.repeat(64), 'wintun.dll': 'b'.repeat(64) }
+  const hashes = { 'cipherway-core.exe': 'a'.repeat(64), 'wintun.dll': 'b'.repeat(64) }
   const broker = serviceBrokerScript({
     sid,
     userRunDir: "C:\\Users\\O'Нил $x\\AppData\\Roaming\\cipherway-vpn\\run",
@@ -60,13 +61,46 @@ describe('«Служба TUN» scripts (0.4.2)', () => {
     expect(broker).toMatch(
       /function Prepare[\s\S]*Sha \(Join-Path \$Bin \$k\)[\s\S]*Test-Config \$text[\s\S]*Write-Atomic \$CfgOut \$text/
     )
-    expect(broker).toContain(`$psi.Arguments = 'run -c "' + $CfgOut + '"'`)
-    expect(broker).toContain('$psi.FileName = $Exe')
+    expect(broker).toContain(`$CoreArgs = 'run -c "' + $CfgOut + '"'`)
+    expect(broker).toContain("$Exe = Join-Path $Bin 'cipherway-core.exe'")
+    expect(broker).toContain('$CoreExe = $Exe')
+    expect(broker).toContain('$psi.FileName = $CoreExe')
     for (const k of ['cache', 'path', '_ui', 'download', 'certificate', 'platform'])
       expect(broker).toMatch(new RegExp(`\\$Forbidden = .*${k}`))
     expect(broker).toContain("'^127\\.0\\.0\\.1:\\d{1,5}$'")
     expect(broker).toContain("if ($x.type -ne 'tun')")
     expect(broker).toContain("$x.type -ne 'local' -or $x.format -ne 'source'")
+  })
+
+  it('reports why a core ended: exit code, time, what it printed (a FATAL goes to stderr only)', () => {
+    expect(broker).toContain('$psi.RedirectStandardError = $true')
+    expect(broker).toContain('$c.StandardError.ReadToEndAsync()')
+    expect(broker).toMatch(
+      /function Report-Exit[\s\S]*\$State\.exitCode = \$p\.ExitCode[\s\S]*\$State\.uptimeMs =[\s\S]*\$State\.stderr = Core-Output/
+    )
+    expect(broker).toContain("[IO.File]::AppendAllText($BrokerLog,")
+    expect(broker).toContain("$BrokerLog = Join-Path $Dir 'broker.log'")
+    for (const why of ['нет файла запроса', 'новая сессия', 'команда остановки', 'приложение закрыто'])
+      expect(broker).toContain(`$State.stopReason = '${why}'`)
+  })
+
+  it('one failed read of the request file does not kill a working core', () => {
+    expect(broker).not.toContain("if ($null -eq $c -or $c.session -ne $State.session")
+    expect(broker).toMatch(/if \(\$null -eq \$c\) \{[\s\S]*\$miss\+\+[\s\S]*-gt 12\)[\s\S]*continue/)
+  })
+
+  it('a stale adapter and an orphaned core are dealt with before every start', () => {
+    expect(broker).toMatch(/Stop-Orphan[\s\S]*Save-State\s+Clear-StaleAdapter\s+Prepare\s+\$core = Start-Core/)
+    expect(broker).toMatch(/Stop-Core \$core\s+\$core = \$null\s+Clear-StaleAdapter\s+Prepare/)
+    // only our adapter; only a process running our protected file
+    expect(broker).toContain("$TunName = 'CipherWay'")
+    expect(broker).toContain('$o.MainModule.FileName -ieq $Exe')
+    expect(broker).toContain("'/remove-device' $id")
+  })
+
+  it('no trace of the old names in what runs as SYSTEM', () => {
+    expect(broker).not.toContain('sing-box.exe')
+    expect(broker).not.toContain('xray.exe')
   })
 
   it('needs a fresh request from a live app', () => {
@@ -111,6 +145,33 @@ describe('«Служба TUN» scripts (0.4.2)', () => {
       "Join-Path ([Environment]::GetFolderPath('System')) 'WindowsPowerShell\\v1.0\\powershell.exe'"
     )
     expect(install).toContain(`$TaskName = '${taskName(sid)}'`)
+  })
+
+  it('update from 0.4.2: the new core is copied, the old file removed only after everything else', () => {
+    expect(install).toContain("Put-File (Join-Path $SrcBin 'cipherway-core.exe') 'cipherway-core.exe'")
+    expect(install).toMatch(/RegisterTask[\s\S]*manifest\.json[\s\S]*try \{ Remove-LegacyCores \}/)
+    const cleanup = legacyCleanupPs()
+    expect(cleanup).toContain("@('sing-box.exe', 'xray.exe')")
+    // somebody else's sing-box.exe (Happ…) is never stopped
+    expect(cleanup).toContain('$p.Path -ieq $path')
+    expect(cleanup).toContain('$path = Join-Path $Bin $name')
+  })
+
+  it('the test mode of the installer is off by default', () => {
+    expect(install).toContain("[Environment]::GetFolderPath('CommonApplicationData')")
+    expect(install).toContain('Secure-Dir $Dir $Mine')
+    expect(install).toContain('RegisterTask')
+    const t = installScript({
+      sid,
+      srcBinDir: 'C:\\b',
+      brokerText: '',
+      hashes,
+      brokerHash: '',
+      appVersion: '',
+      testRoot: 'C:\\t'
+    })
+    expect(t).not.toContain('RegisterTask')
+    expect(t).not.toContain('Secure-Dir $Dir $Mine')
   })
 
   it('remover and the UAC launcher', () => {

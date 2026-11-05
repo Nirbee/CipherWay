@@ -44,6 +44,16 @@ export function isPlaceholderOutbound(o: OutboundConfig): boolean {
   return PLACEHOLDER_HOSTS.has(host) || host.startsWith('127.') || o.port <= 1
 }
 
+/**
+ * «⚡ Автовыбор»: for Happ the panel builds an Xray JSON with a balancer under
+ * this name; the plain link list we get has one ordinary address there. Showing
+ * it next to our own «Лучший сервер (авто)» only misleads — hidden from the list
+ * and from the urltest group (found by the name, case and emoji don't matter).
+ */
+export function isAutoSelectPseudo(o: Pick<OutboundConfig, 'name'>): boolean {
+  return o.name.toLowerCase().includes('автовыбор')
+}
+
 const LIMIT_RE = /лимит|limit|устройств|devices?/i
 const UNSUPPORTED_RE = /not supported|unsupported|не поддерж/i
 
@@ -56,7 +66,11 @@ export interface GuardResult {
 /** Drops placeholder entries; explains the problem if nothing real remains. */
 export function filterSubscription(outbounds: OutboundConfig[]): GuardResult {
   const real = outbounds.filter((o) => !isPlaceholderOutbound(o))
-  if (real.length > 0) return { outbounds: real }
+  if (real.length > 0) {
+    const visible = real.filter((o) => !isAutoSelectPseudo(o))
+    // a subscription of nothing else: better a working entry than none at all
+    return { outbounds: visible.length > 0 ? visible : real }
+  }
 
   const stubs = outbounds.filter(isPlaceholderOutbound)
   if (stubs.length === 0) {

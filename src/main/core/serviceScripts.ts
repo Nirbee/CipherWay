@@ -1,4 +1,5 @@
-import { psQuote } from './broker'
+import { CORE_PROCESS_PS, psQuote, STALE_ADAPTER_PS } from './broker'
+import { CORE_EXE, LEGACY_EXES, TUN_INTERFACE } from './coreNames'
 
 // ---------------------------------------------------------------------------
 // «Служба TUN» (0.4.2): instead of a UAC prompt on every TUN connect, the
@@ -8,7 +9,7 @@ import { psQuote } from './broker'
 // The app lives in %LOCALAPPDATA%\Programs — writable by any process of the
 // user. A task that ran anything from there with admin rights would be a
 // UAC bypass for every piece of malware, so:
-//  * the installer (under UAC) copies sing-box.exe + wintun.dll and writes the
+//  * the installer (under UAC) copies cipherway-core.exe + wintun.dll and writes the
 //    broker script into %ProgramData%\CipherWay, created with a protected ACL
 //    (SYSTEM / Administrators: full, users: read & execute). The task runs
 //    only powershell.exe (System32) with that broker. A pre-existing folder
@@ -28,7 +29,9 @@ import { psQuote } from './broker'
 //  * a run needs a fresh request (tun-ctl.json, < 2 min old, live app pid).
 // Talking to the broker (files, the broker polls every 250 ms):
 //   <userRun>\tun-ctl.json   app → broker {session,pid,cmd,restart,rules,ts}
-//   <home>\state.json        broker → app {session,status,restart,rules,exitCode,error,ts}
+//   <home>\state.json        broker → app {session,status,restart,rules,exitCode,uptimeMs,
+//                            stderr,stopReason,error,ts}
+//   <home>\broker.log        what the broker did and why a core ended (for diagnostics)
 // <home> = %ProgramData%\CipherWay\u\<user SID>. Pure — unit tested in
 // broker.test.ts, the broker itself runs (non-elevated) in the e2e test.
 // ---------------------------------------------------------------------------
@@ -36,7 +39,7 @@ import { psQuote } from './broker'
 export const SYSTEM_SID = 'S-1-5-18'
 
 export interface BrokerHashes {
-  'sing-box.exe': string
+  [CORE_EXE]: string
   'wintun.dll': string
 }
 
@@ -48,6 +51,8 @@ export interface ServiceBrokerParams {
   hashes: BrokerHashes
   /** tests only: a temp folder instead of %ProgramData%\CipherWay */
   rootOverride?: string
+  /** tests only: the adapter this broker may wait for / remove */
+  tunName?: string
 }
 
 const SID_RE = /^S-1-5-21(-\d{1,10}){3,6}$|^S-1-5-18$/
@@ -79,15 +84,20 @@ $UserRun = ${psQuote(p.userRunDir)}
 $Root = ${rootExpr(p.rootOverride)}
 $Dir = Join-Path $Root ('u\\' + $Sid)
 $Bin = Join-Path $Root 'bin'
-$Exe = Join-Path $Bin 'sing-box.exe'
+$Exe = Join-Path $Bin ${psQuote(CORE_EXE)}
+$CoreExe = $Exe
+$CoreDir = $Bin
+$TunName = ${psQuote(p.tunName ?? TUN_INTERFACE)}
 $RulesOut = Join-Path $Dir 'rules'
 $CfgOut = Join-Path $Dir 'config.json'
+$CoreArgs = 'run -c "' + $CfgOut + '"'
+$BrokerLog = Join-Path $Dir 'broker.log'
 $LogOut = Join-Path $Dir 'sing-box.log'
 $StateF = Join-Path $Dir 'state.json'
 $CtlF = Join-Path $UserRun 'tun-ctl.json'
 $CfgIn = Join-Path $UserRun 'config.json'
 $RulesIn = Join-Path $UserRun 'rules'
-$Hashes = @{ 'sing-box.exe' = ${psQuote(p.hashes['sing-box.exe'])}; 'wintun.dll' = ${psQuote(p.hashes['wintun.dll'])} }
+$Hashes = @{ ${psQuote(CORE_EXE)} = ${psQuote(p.hashes[CORE_EXE])}; 'wintun.dll' = ${psQuote(p.hashes['wintun.dll'])} }
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
 $NameRe = '^cw-[0-9a-z-]{1,40}\\.json$'
 $Forbidden = '(?i)(path|file|dir|_ui|download|certificate|key|script|command|exec|acme|cache|store|platform)'
@@ -117,7 +127,13 @@ function Write-Atomic([string]$p, [string]$text) {
   }
   throw ('не удалось записать ' + $p)
 }
-$State = @{ session = ''; status = 'starting'; restart = 0; rules = 0; corePid = 0; exitCode = $null; error = ''; brokerPid = $PID; ts = 0 }
+function Note([string]$m) {
+  try {
+    if ([IO.File]::Exists($BrokerLog) -and (New-Object IO.FileInfo($BrokerLog)).Length -gt 524288) { [IO.File]::WriteAllText($BrokerLog, '', $Utf8) }
+    [IO.File]::AppendAllText($BrokerLog, ([DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss') + ' ' + $m + [Environment]::NewLine), $Utf8)
+  } catch {}
+}
+$State = @{ session = ''; status = 'starting'; restart = 0; rules = 0; corePid = 0; exitCode = $null; uptimeMs = $null; stderr = ''; stopReason = ''; error = ''; brokerPid = $PID; ts = 0 }
 function Save-State { $State.ts = Now-Ms; Write-Atomic $StateF (ConvertTo-Json -Compress -InputObject $State) }
 function Alive($id) {
   try { $null = [Diagnostics.Process]::GetProcessById([int]$id); return $true } catch { return $false }
@@ -209,18 +225,40 @@ function Prepare {
   Write-Atomic $CfgOut $text
   Sync-Rules
 }
+${CORE_PROCESS_PS}
+${STALE_ADAPTER_PS}
 function Start-Core {
-  $psi = New-Object Diagnostics.ProcessStartInfo
-  $psi.FileName = $Exe
-  $psi.Arguments = 'run -c "' + $CfgOut + '"'
-  $psi.WorkingDirectory = $Bin
-  $psi.UseShellExecute = $false
-  $psi.CreateNoWindow = $true
-  return [Diagnostics.Process]::Start($psi)
+  $p = Start-CoreProcess
+  $State.corePid = $p.Id
+  $State.exitCode = $null
+  $State.uptimeMs = $null
+  $State.stderr = ''
+  Note ('ядро запущено, pid ' + $p.Id)
+  return $p
 }
 function Stop-Core($p) {
   if ($null -eq $p) { return }
   try { if (-not $p.HasExited) { $p.Kill(); $null = $p.WaitForExit(5000) } } catch {}
+}
+function Report-Exit($p) {
+  $State.exitCode = $p.ExitCode
+  $State.uptimeMs = (Now-Ms) - $script:CoreStarted
+  $State.stderr = Core-Output
+  Note ('ядро завершилось само: код ' + $State.exitCode + ', через ' + [math]::Round($State.uptimeMs / 1000, 1) + ' с; вывод: ' + $State.stderr)
+}
+# a core of an earlier session that outlived its broker holds the adapter and the ports
+function Stop-Orphan {
+  try {
+    if (-not [IO.File]::Exists($StateF)) { return }
+    $prev = [IO.File]::ReadAllText($StateF, $Utf8) | ConvertFrom-Json
+    if ([int]$prev.corePid -le 0) { return }
+    $o = [Diagnostics.Process]::GetProcessById([int]$prev.corePid)
+    if ($o.MainModule.FileName -ieq $Exe) {
+      $o.Kill()
+      $null = $o.WaitForExit(5000)
+      Note ('остановлено ядро прошлого запуска, pid ' + $prev.corePid)
+    }
+  } catch {}
 }
 
 $core = $null
@@ -235,25 +273,37 @@ try {
   $State.session = [string]$ctl.session
   $State.restart = [long]$ctl.restart
   $State.rules = [long]$ctl.rules
+  Stop-Orphan
+  # the app waits for this session id: it knows the task really started
+  Save-State
+  Clear-StaleAdapter
   Prepare
   $core = Start-Core
-  $State.corePid = $core.Id
   $State.status = 'running'
   Save-State
   $tick = 0
   $idle = 0
+  $miss = 0
   while ($true) {
     Start-Sleep -Milliseconds 250
     $tick++
     $c = Read-Ctl
-    if ($null -eq $c -or $c.session -ne $State.session -or $c.cmd -ne 'run') { break }
+    if ($null -eq $c) {
+      # one failed read (the app is replacing the file, an antivirus holds it) is no reason to
+      # kill a working core; the file gone for 3 s means the app removed it
+      $miss++
+      if ($miss -gt 12) { $State.stopReason = 'нет файла запроса'; break }
+      continue
+    }
+    $miss = 0
+    if ($c.session -ne $State.session) { $State.stopReason = 'новая сессия'; break }
+    if ($c.cmd -ne 'run') { $State.stopReason = 'команда остановки'; break }
     if ([long]$c.restart -gt $State.restart) {
       Stop-Core $core
       $core = $null
+      Clear-StaleAdapter
       Prepare
       $core = Start-Core
-      $State.corePid = $core.Id
-      $State.exitCode = $null
       $State.restart = [long]$c.restart
       $State.rules = [long]$c.rules
       $idle = 0
@@ -266,12 +316,12 @@ try {
       Save-State
     }
     if ($core.HasExited) {
-      if ($null -eq $State.exitCode) { $State.exitCode = $core.ExitCode; Save-State }
+      if ($null -eq $State.exitCode) { Report-Exit $core; Save-State }
       $idle++
-      if ($idle -gt 240) { break }
+      if ($idle -gt 240) { $State.stopReason = 'ядро завершилось, перезапуск не запрошен'; break }
     }
     if (($tick % 8) -eq 0) {
-      if (-not (Alive $c.pid)) { break }
+      if (-not (Alive $c.pid)) { $State.stopReason = 'приложение закрыто'; break }
       Save-State
     }
   }
@@ -279,8 +329,10 @@ try {
 } catch {
   $State.status = 'error'
   $State.error = [string]$_.Exception.Message
+  Note ('ошибка: ' + $State.error)
 } finally {
   Stop-Core $core
+  if ($State.stopReason) { Note ('ядро остановлено: ' + $State.stopReason) }
   if ($State.status -eq 'running' -or $State.status -eq 'starting') { $State.status = 'stopped' }
   try { Save-State } catch {}
 }
@@ -289,13 +341,41 @@ try {
 
 export interface InstallParams {
   sid: string
-  /** the app's resources\\bin (source of sing-box.exe / wintun.dll) */
+  /** the app's resources\\bin (source of the core / wintun.dll) */
   srcBinDir: string
   brokerText: string
   hashes: BrokerHashes
   /** sha256 of brokerText, stored in the manifest */
   brokerHash: string
   appVersion: string
+  /**
+   * tests only: run the file part (copy, hash check, removal of the old names,
+   * manifest) in this temp folder without elevation — no ACLs, no task.
+   */
+  testRoot?: string
+}
+
+/**
+ * PowerShell: removes what versions up to 0.4.2 left in $Bin: `sing-box.exe`.
+ * Anything with the same name elsewhere (another VPN client's core!) is not
+ * touched — a process is stopped only if it runs from exactly this file.
+ */
+export function legacyCleanupPs(): string {
+  const names = LEGACY_EXES.map(psQuote).join(', ')
+  return `
+function Remove-LegacyCores {
+  foreach ($name in @(${names})) {
+    $path = Join-Path $Bin $name
+    if (-not [IO.File]::Exists($path)) { continue }
+    foreach ($p in @(Get-Process -Name ([IO.Path]::GetFileNameWithoutExtension($name)) -ErrorAction SilentlyContinue)) {
+      try { if ($p.Path -ieq $path) { $p.Kill(); $null = $p.WaitForExit(3000) } } catch {}
+    }
+    for ($i = 0; $i -lt 15 -and [IO.File]::Exists($path); $i++) {
+      try { [IO.File]::Delete($path) } catch { Start-Sleep -Milliseconds 200 }
+    }
+  }
+}
+`.trim()
 }
 
 /**
@@ -339,16 +419,38 @@ export function installScript(p: InstallParams): string {
     broker: p.brokerHash,
     files: p.hashes
   })
+  const secureDirs = p.testRoot
+    ? `foreach ($d in @($Root, $Bin, (Join-Path $Root 'u'), $Dir, (Join-Path $Dir 'rules'))) { $null = [IO.Directory]::CreateDirectory($d) }`
+    : `Secure-Dir $Root $Shared
+  Secure-Dir $Bin $Shared
+  Secure-Dir (Join-Path $Root 'u') $Shared
+  Secure-Dir $Dir $Mine
+  Secure-Dir (Join-Path $Dir 'rules') $Mine`
+  const registerTask = p.testRoot
+    ? ''
+    : `$PsX = Join-Path ([Environment]::GetFolderPath('System')) 'WindowsPowerShell\\v1.0\\powershell.exe'
+  $DirX = [Security.SecurityElement]::Escape($Dir)
+  $BrokerX = [Security.SecurityElement]::Escape($BrokerX)
+  $PsX = [Security.SecurityElement]::Escape($PsX)
+  $Xml = @"
+${taskXml()}
+"@
+  $svc = New-Object -ComObject 'Schedule.Service'
+  $svc.Connect()
+  $folder = $svc.GetFolder('\\')
+  # the user may read and run the task (FRFX), never change it
+  $TaskSddl = 'D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;' + $Sid + ')'
+  $null = $folder.RegisterTask($TaskName, $Xml, 6, $null, $null, 5, $TaskSddl)`
   return `
 $ErrorActionPreference = 'Stop'
 $env:PSModulePath = Join-Path $PSHOME 'Modules'
 $Sid = ${psQuote(p.sid)}
 $SrcBin = ${psQuote(p.srcBinDir)}
 $TaskName = ${psQuote(taskName(p.sid))}
-$Want = @{ 'sing-box.exe' = ${psQuote(p.hashes['sing-box.exe'])}; 'wintun.dll' = ${psQuote(p.hashes['wintun.dll'])} }
+$Want = @{ ${psQuote(CORE_EXE)} = ${psQuote(p.hashes[CORE_EXE])}; 'wintun.dll' = ${psQuote(p.hashes['wintun.dll'])} }
 $Manifest = ${psQuote(manifest)}
 $BrokerText = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64}'))
-$Root = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'CipherWay'
+$Root = ${rootExpr(p.testRoot)}
 $Dir = Join-Path $Root ('u\\' + $Sid)
 $Bin = Join-Path $Root 'bin'
 $Trusted = @('S-1-5-32-544', 'S-1-5-18')
@@ -395,32 +497,19 @@ function Put-File([string]$src, [string]$name) {
   if ((Sha $tmp) -ne $Want[$name]) { [IO.File]::Delete($tmp); throw ('файл подменён при копировании: ' + $name) }
   if ([IO.File]::Exists($dest)) { [IO.File]::Replace($tmp, $dest, [NullString]::Value) } else { [IO.File]::Move($tmp, $dest) }
 }
+${legacyCleanupPs()}
 
 try {
-  Secure-Dir $Root $Shared
-  Secure-Dir $Bin $Shared
-  Secure-Dir (Join-Path $Root 'u') $Shared
-  Secure-Dir $Dir $Mine
-  Secure-Dir (Join-Path $Dir 'rules') $Mine
-  Put-File (Join-Path $SrcBin 'sing-box.exe') 'sing-box.exe'
+  ${secureDirs}
+  Put-File (Join-Path $SrcBin ${psQuote(CORE_EXE)}) ${psQuote(CORE_EXE)}
   Put-File (Join-Path $SrcBin 'wintun.dll') 'wintun.dll'
   $BrokerX = Join-Path $Dir 'broker.ps1'
   [IO.File]::WriteAllText($BrokerX, $BrokerText, (New-Object Text.UTF8Encoding($true)))
-  $PsX = Join-Path ([Environment]::GetFolderPath('System')) 'WindowsPowerShell\\v1.0\\powershell.exe'
-  $DirX = [Security.SecurityElement]::Escape($Dir)
-  $BrokerX = [Security.SecurityElement]::Escape($BrokerX)
-  $PsX = [Security.SecurityElement]::Escape($PsX)
-  $Xml = @"
-${taskXml()}
-"@
-  $svc = New-Object -ComObject 'Schedule.Service'
-  $svc.Connect()
-  $folder = $svc.GetFolder('\\')
-  # the user may read and run the task (FRFX), never change it
-  $TaskSddl = 'D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;' + $Sid + ')'
-  $null = $folder.RegisterTask($TaskName, $Xml, 6, $null, $null, 5, $TaskSddl)
+  ${registerTask}
   [IO.File]::WriteAllText((Join-Path $Dir 'manifest.json'), $Manifest, (New-Object Text.UTF8Encoding($false)))
   try { [IO.File]::Delete((Join-Path $Dir 'install-error.txt')) } catch {}
+  # last: until here the old setup still works if something above fails
+  try { Remove-LegacyCores } catch {}
   exit 0
 } catch {
   try { [IO.File]::WriteAllText((Join-Path $Dir 'install-error.txt'), [string]$_.Exception.Message, (New-Object Text.UTF8Encoding($false))) } catch {}

@@ -1,13 +1,15 @@
 // End-to-end check of SidecarManager against the real cores (opt-in):
 //   CW_E2E=1 npx vitest run src/main/core/sidecar.e2e.test.ts
-// Needs resources/bin (sing-box.exe + xray.exe) and internet access (the
+// Needs resources/bin (cipherway-core.exe + cipherway-xray.exe) and internet access (the
 // latency probe fetches gstatic.com/generate_204). The "live" node is a local
 // xray VLESS server on 127.0.0.1, the "dead" one points at a closed port, the
 // "blackhole" one at a non-routable address (times out like a node that is
 // blocked from Russia). The Windows system proxy is mocked — the registry is
 // never touched. TUN itself needs UAC and is not started here; the TUN broker
-// runs non-elevated with a TUN-less sing-box config.
-import { execFile, spawn, type ChildProcess } from 'node:child_process'
+// runs non-elevated (a real TUN config then fails to open the adapter — which is
+// what the «first start» tests want). Only processes these tests started are ever
+// stopped, always by pid. Nothing here may run elevated: see `elevated` below.
+import { execFile, execFileSync, spawn, type ChildProcess } from 'node:child_process'
 import { createHash, randomBytes } from 'node:crypto'
 import {
   copyFileSync,
@@ -19,6 +21,7 @@ import {
   rmSync,
   writeFileSync
 } from 'node:fs'
+import { createServer as createHttpServer, type Server as HttpServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
@@ -31,6 +34,7 @@ import type {
   StatusUpdate
 } from '@shared/types'
 import { TEST_RULES, TEST_SETTINGS } from './fixtures'
+import { CORE_EXE, XRAY_EXE } from './coreNames'
 
 const tmp = mkdtempSync(join(tmpdir(), 'cw-e2e-'))
 
@@ -41,13 +45,48 @@ vi.mock('../system/proxy', () => ({
   enableSystemProxy: vi.fn(async () => undefined),
   disableSystemProxy: vi.fn(async () => undefined)
 }))
+const memory = vi.hoisted(() => new Map<string, unknown>())
+vi.mock('../store', () => ({
+  store: {
+    get: (k: string) => memory.get(k) ?? null,
+    set: (k: string, v: unknown) => void memory.set(k, v)
+  },
+  getSettings: () => ({}),
+  DEFAULT_SETTINGS: {}
+}))
+vi.mock('../secrets', () => ({
+  getSubscriptionUrl: () => memory.get('url') ?? null,
+  setSubscriptionUrl: (u: string | null) => void memory.set('url', u)
+}))
+// the real adapter can't be created here, and the machine may have a real one up
+const fakeAdapter = vi.hoisted(() => ({ up: false }))
+vi.mock('./broker', async (orig) => ({
+  ...(await orig<typeof import('./broker')>()),
+  hasTunAdapter: () => fakeAdapter.up
+}))
 
 const BIN = resolve(__dirname, '../../../resources/bin')
-const XRAY = join(BIN, 'xray.exe')
-const SINGBOX = join(BIN, 'sing-box.exe')
-const enabled = !!process.env.CW_E2E && existsSync(SINGBOX) && existsSync(XRAY)
+const XRAY = join(BIN, XRAY_EXE)
+const SINGBOX = join(BIN, CORE_EXE)
+/** an elevated run could create a real adapter and real routes: never */
+const elevated = ((): boolean => {
+  try {
+    execFileSync('net', ['session'], { stdio: 'ignore', windowsHide: true })
+    return true
+  } catch {
+    return false
+  }
+})()
+const enabled = !!process.env.CW_E2E && !elevated && existsSync(SINGBOX) && existsSync(XRAY)
+/** the brokers here may look for / remove only this (non-existent) adapter */
+const E2E_TUN = 'CipherWayE2E'
 
 const UUID = '0b6f7c1e-3a7d-4c55-9a51-6f2f1b0d9e11' // random, local test server only
+/**
+ * Xray's freedom refuses private addresses by default; with another VPN client's
+ * TUN on the machine (fake-ip DNS, 198.18.x.x) that is everything.
+ */
+const FREEDOM = { protocol: 'freedom', settings: { finalRules: [{ action: 'allow' }] } }
 const SERVER_PORT = 27_431
 const HTTP_PORT = 27_432
 
@@ -67,7 +106,7 @@ const dead: OutboundConfig = { ...live, id: 'ob_dead', name: 'Dead', port: 1 }
 const blackhole: OutboundConfig = {
   ...live,
   id: 'ob_hole',
-  name: '⚡ Автовыбор',
+  name: 'Blackhole',
   server: '10.255.255.1',
   port: 443
 }
@@ -107,7 +146,7 @@ describe.skipIf(!enabled)('SidecarManager with real cores', () => {
             streamSettings: { network: 'raw', security: 'none' }
           }
         ],
-        outbounds: [{ protocol: 'freedom' }]
+        outbounds: [FREEDOM]
       })
     )
     server = spawn(XRAY, ['run', '-c', cfg], { windowsHide: true })
@@ -219,7 +258,7 @@ describe.skipIf(!enabled)('SidecarManager with real cores', () => {
       (p) => pings.push(p)
     )
     await m.start({
-      // subscription order: the dead «⚡ Автовыбор» first, as in the real subscription
+      // subscription order: a dead node first
       outbounds: [blackhole, live],
       activeOutboundId: 'auto',
       rules: TEST_RULES,
@@ -444,7 +483,8 @@ describe.skipIf(!enabled)('SidecarManager with real cores', () => {
           stopFile: f('stop.signal'),
           restartFile: f('restart.signal'),
           exitFile: f('core.exit'),
-          parentPid: process.pid
+          parentPid: process.pid,
+          tunName: E2E_TUN
         })
     )
     const broker = spawn(
@@ -462,7 +502,7 @@ describe.skipIf(!enabled)('SidecarManager with real cores', () => {
           [
             '-NoProfile',
             '-Command',
-            `(Get-CimInstance Win32_Process -Filter "Name='sing-box.exe'" | Where-Object { $_.CommandLine -like '*${cfg.replace(/'/g, "''")}*' }).ProcessId`
+            `(Get-CimInstance Win32_Process -Filter "Name='${CORE_EXE}'" | Where-Object { $_.CommandLine -like '*${cfg.replace(/'/g, "''")}*' }).ProcessId`
           ],
           { windowsHide: true },
           (_e, out) => res(String(out).trim())
@@ -715,10 +755,10 @@ describe.skipIf(!enabled)('SidecarManager with real cores', () => {
             (_e, out) => res(Number(String(out).trim()))
           )
         )
-      const n = await count('sing-box.exe')
-      if (n !== 1) console.log(await cmdLines('sing-box.exe'))
+      const n = await count(CORE_EXE)
+      if (n !== 1) console.log(await cmdLines(CORE_EXE))
       expect(n).toBe(1)
-      expect(await count('xray.exe')).toBe(1)
+      expect(await count(XRAY_EXE)).toBe(1)
       expect(states.filter((s) => s === 'connected')).toHaveLength(1)
       expect(logs.filter((l) => l.startsWith('Запуск xray'))).toHaveLength(1)
       expect(logs.some((l) => /Не удалось запустить ядро Xray/.test(l))).toBe(false)
@@ -753,14 +793,15 @@ describe.skipIf(!enabled)('SidecarManager with real cores', () => {
 
     async function broker(): Promise<ChildProcess> {
       const { serviceBrokerScript } = await import('./serviceScripts')
-      for (const n of ['sing-box.exe', 'wintun.dll']) {
+      for (const n of [CORE_EXE, 'wintun.dll']) {
         if (!existsSync(join(root, 'bin', n))) copyFileSync(join(BIN, n), join(root, 'bin', n))
       }
       const script = serviceBrokerScript({
         sid,
         userRunDir: userRun,
-        hashes: { 'sing-box.exe': sha(SINGBOX), 'wintun.dll': sha(join(BIN, 'wintun.dll')) },
-        rootOverride: root
+        hashes: { [CORE_EXE]: sha(SINGBOX), 'wintun.dll': sha(join(BIN, 'wintun.dll')) },
+        rootOverride: root,
+        tunName: E2E_TUN
       })
       writeFileSync(f('broker.ps1'), '\ufeff' + script)
       return spawn(
@@ -1101,5 +1142,907 @@ describe.skipIf(!enabled)('SidecarManager with real cores', () => {
       )
       expect(out).toBe('VALID')
     }, 30_000)
+
+    // --- 0.4.3: the first TUN start ------------------------------------------
+
+    it('a core that dies at the start: code, time and its FATAL reach the state file', async () => {
+      // a real TUN config, without admin rights: sing-box exits, its FATAL only on stderr
+      const { generateSingboxConfig } = await import('./configGen')
+      const { groupsFor, layoutRules, planRules } = await import('../rules/compile')
+      const plan = planRules(TEST_RULES, [])
+      const groups = groupsFor(plan)
+      const layout = layoutRules(plan, groups, new Map())!
+      for (const [name, text] of Object.entries(layout.files))
+        writeFileSync(join(userRun, 'rules', name), text)
+      const cfg = generateSingboxConfig({
+        outbounds: [],
+        activeOutboundId: 'auto',
+        slots: { groups, dir: join(home, 'rules'), selectors: layout.selectors },
+        settings: { ...TEST_SETTINGS, proxyMode: 'tun' },
+        socksPort: 1,
+        httpPort: 2,
+        clashApiPort: clashPort,
+        clashSecret: 'e2e',
+        logFile: f('sing-box.log'),
+        xrayPorts: {}
+      })
+      writeFileSync(join(userRun, 'config.json'), JSON.stringify(cfg, null, 2))
+      const session = randomBytes(16).toString('hex')
+      const c = { session, pid: process.pid, cmd: 'run', restart: 0, rules: 0, ts: Date.now() }
+      ctl(c)
+      const b = await broker()
+      try {
+        const st = await waitFor(
+          state,
+          (s) => s?.session === session && typeof s?.exitCode === 'number',
+          30_000
+        )
+        expect(st.status).toBe('running') // the broker stays for a restart request
+        expect(st.exitCode).not.toBe(0)
+        expect(typeof st.uptimeMs).toBe('number')
+        expect(st.stderr).toMatch(/FATAL/)
+        expect(readFileSync(f('broker.log'), 'utf8')).toMatch(/ядро завершилось само: код /)
+      } finally {
+        ctl({ ...c, cmd: 'stop' })
+        await waitFor(
+          () => b.exitCode,
+          (x) => x !== null,
+          10_000
+        )
+        if (b.exitCode === null) b.kill()
+      }
+      expect(state()?.stopReason).toBe('команда остановки')
+    }, 60_000)
+
+    it('one unreadable moment of the request file does not stop the core', async () => {
+      const { ClashApi } = await import('./clashApi')
+      writeFileSync(join(userRun, 'config.json'), JSON.stringify(goodConfig()))
+      const session = randomBytes(16).toString('hex')
+      const c = { session, pid: process.pid, cmd: 'run', restart: 0, rules: 0, ts: Date.now() }
+      ctl(c)
+      const b = await broker()
+      const api = new ClashApi(clashPort)
+      try {
+        await waitFor(state, (s) => s?.session === session && s?.status === 'running', 20_000)
+        expect(await waitFor(() => api.ping(), Boolean, 15_000)).toBe(true)
+        const pid = state()?.corePid
+        // the file disappears for a second (the 0.4.2 broker killed the core on the first miss)
+        rmSync(join(userRun, 'tun-ctl.json'))
+        await sleep(1000)
+        ctl(c)
+        await sleep(1000)
+        expect(b.exitCode).toBeNull()
+        expect(state()?.status).toBe('running')
+        expect(state()?.corePid).toBe(pid)
+        expect(await api.ping()).toBe(true)
+      } finally {
+        ctl({ ...c, cmd: 'stop' })
+        await waitFor(
+          () => b.exitCode,
+          (x) => x !== null,
+          10_000
+        )
+        if (b.exitCode === null) b.kill()
+      }
+    }, 60_000)
+
+    it('first TUN start through the service: the core dies → one automatic retry → connected', async () => {
+      const { SidecarManager } = await import('./SidecarManager')
+      const { ServiceLauncher } = await import('./tunService')
+      let brokerProc: ChildProcess | null = null
+      let brokersStarted = 0
+      const logs: string[] = []
+      const states: StatusUpdate['state'][] = []
+      /** a broker without elevation; a TUN-less config from the retry on (no admin rights here) */
+      class Fake extends ServiceLauncher {
+        override async restartCore(): Promise<void> {
+          const file = join(userRun, 'config.json')
+          const cfg = JSON.parse(readFileSync(file, 'utf8'))
+          writeFileSync(file, JSON.stringify({ ...cfg, inbounds: [] }, null, 2))
+          fakeAdapter.up = true
+          await super.restartCore()
+        }
+      }
+      const m = new SidecarManager(
+        (e) => logs.push(e.message),
+        (s) => states.push(s),
+        () => undefined,
+        undefined,
+        undefined,
+        undefined,
+        {
+          launcherFactory: async (_paths, cancelled) =>
+            new Fake(
+              {
+                binDir: BIN,
+                runDir: userRun,
+                configPath: join(userRun, 'config.json'),
+                rulesDir: join(userRun, 'rules'),
+                logPath: f('sing-box.log')
+              },
+              {
+                home,
+                task: 'e2e',
+                log: () => undefined,
+                isCancelled: cancelled,
+                runTask: async () => {
+                  // like the real task: only one instance at a time
+                  if (!brokerProc || brokerProc.exitCode !== null) {
+                    brokersStarted++
+                    brokerProc = await broker()
+                  }
+                  return { code: 0, out: '' }
+                }
+              }
+            )
+        }
+      )
+      // SidecarManager writes into <userData>\run: the broker of this test reads from there
+      Object.defineProperty(m, 'runDir', { get: () => userRun })
+      Object.defineProperty(m, 'rulesDir', { get: () => join(userRun, 'rules') })
+      try {
+        await m.start({
+          outbounds: [live],
+          activeOutboundId: 'ob_live',
+          rules: TEST_RULES,
+          settings: { ...TEST_SETTINGS, proxyMode: 'tun', routingMode: 'global' }
+        })
+        expect(states.at(-1)).toBe('connected')
+        expect(m.isRunning).toBe(true)
+        const retries = logs.filter((l) => /^Ядро завершилось при создании адаптера/.test(l))
+        expect(retries).toHaveLength(1)
+        expect(retries[0]).toMatch(
+          /^Ядро завершилось при создании адаптера \(код -?\d+, через [\d,]+ с\), повторяем$/
+        )
+        // what sing-box printed reached the journal
+        expect(logs.some((l) => /FATAL/.test(l))).toBe(true)
+        // the retry went to the same broker: the task was not started anew
+        expect(brokersStarted).toBe(1)
+        expect(states).not.toContain('error')
+      } finally {
+        fakeAdapter.up = false
+        await m.stop()
+        await waitFor(
+          () => brokerProc?.exitCode ?? null,
+          (x) => x !== null,
+          10_000
+        )
+        if (brokerProc && (brokerProc as ChildProcess).exitCode === null)
+          (brokerProc as ChildProcess).kill()
+      }
+    }, 120_000)
+  })
+
+  // --- 0.4.3 ---------------------------------------------------------------
+
+  async function code204(): Promise<string> {
+    return curl([
+      '-s',
+      '-o',
+      'NUL',
+      '-w',
+      '%{http_code}',
+      '-x',
+      `http://127.0.0.1:${HTTP_PORT}`,
+      '--max-time',
+      '6',
+      'https://www.gstatic.com/generate_204'
+    ])
+  }
+
+  describe('cores dying while connected', () => {
+    const params = {
+      outbounds: [live, dead],
+      activeOutboundId: 'ob_live',
+      rules: TEST_RULES,
+      settings: { ...TEST_SETTINGS, httpPort: HTTP_PORT, routingMode: 'global' as const }
+    }
+
+    async function connected() {
+      const { SidecarManager } = await import('./SidecarManager')
+      const logs: { level: string; message: string }[] = []
+      const states: [StatusUpdate['state'], string | undefined][] = []
+      const notices: string[] = []
+      const m = new SidecarManager(
+        (e) => logs.push(e),
+        (s, msg) => states.push([s, msg]),
+        () => undefined,
+        undefined,
+        undefined,
+        undefined,
+        { onNotice: (n) => notices.push(n.text) }
+      )
+      await m.start(params)
+      return { m, logs, states, notices }
+    }
+
+    it('the binaries have our own names; a kill of xray → restarted, traffic flows, sing-box untouched', async () => {
+      expect(existsSync(join(BIN, 'sing-box.exe'))).toBe(false)
+      expect(existsSync(join(BIN, 'xray.exe'))).toBe(false)
+      const { m, logs, states, notices } = await connected()
+      try {
+        expect(await code204()).toBe('204')
+        const core = m.corePid
+        const x1 = m.xrayPid!
+        // what `taskkill /f` of another VPN client does to it
+        process.kill(x1)
+        await waitFor(
+          () => notices,
+          (n) => n.includes('Ядро перезапущено'),
+          10_000
+        )
+        expect(notices).toEqual(['Ядро перезапущено'])
+        expect(m.xrayPid).toBeGreaterThan(0)
+        expect(m.xrayPid).not.toBe(x1)
+        expect(m.corePid).toBe(core) // no sing-box restart: the ports stayed
+        expect(await waitFor(code204, (c) => c === '204', 10_000)).toBe('204')
+        expect(m.isRunning).toBe(true)
+        expect(states.map((s) => s[0])).not.toContain('error')
+        expect(logs.some((l) => /Ядро Xray остановилось \(код \d+\) — перезапуск/.test(l.message))).toBe(true)
+      } finally {
+        await m.stop()
+      }
+    }, 60_000)
+
+    it('a kill of sing-box → restarted through the queue, xray untouched, selection kept', async () => {
+      const { m, states, notices } = await connected()
+      try {
+        const x = m.xrayPid
+        const c1 = m.corePid!
+        process.kill(c1)
+        await waitFor(
+          () => notices,
+          (n) => n.includes('Ядро перезапущено'),
+          15_000
+        )
+        expect(m.corePid).toBeGreaterThan(0)
+        expect(m.corePid).not.toBe(c1)
+        expect(m.xrayPid).toBe(x)
+        expect(await m.clash!.groupNow('proxy')).toBe('ob_live')
+        expect(await m.clash!.getMode()).toBe('Global')
+        expect(await waitFor(code204, (c) => c === '204', 10_000)).toBe('204')
+        expect(states.map((s) => s[0])).not.toContain('error')
+      } finally {
+        await m.stop()
+      }
+    }, 60_000)
+
+    it('xray can\'t come back: after 3 tries an honest error with its own start failure', async () => {
+      const { m, states, notices, logs } = await connected()
+      try {
+        // the next start fails by itself, with a message from xray
+        writeFileSync(join(tmp, 'run', 'xray.json'), '{ not json')
+        const t0 = Date.now()
+        process.kill(m.xrayPid!)
+        await waitFor(
+          () => states.at(-1)?.[0],
+          (s) => s === 'error',
+          30_000
+        )
+        // 1 + 3 + 5 s of pauses
+        expect(Date.now() - t0).toBeGreaterThan(8500)
+        const msg = states.at(-1)?.[1] ?? ''
+        expect(msg).toMatch(/^Ядро Xray остановилось \(код \d+\) и не перезапустилось/)
+        expect(msg).toContain('Failed to start')
+        expect(msg).not.toContain('REALITY')
+        expect(notices).toEqual([])
+        expect(m.isRunning).toBe(false)
+        expect(logs.filter((l) => /попытка \d из 3/.test(l.message))).toHaveLength(3)
+      } finally {
+        await m.stop()
+      }
+    }, 60_000)
+
+    it('a stop while a dead core waits for its restart cancels the restart', async () => {
+      const { m, states } = await connected()
+      process.kill(m.xrayPid!)
+      await sleep(200)
+      await m.stop()
+      await sleep(1500)
+      expect(states.at(-1)?.[0]).toBe('disconnected')
+      expect(m.xrayPid).toBeUndefined()
+      expect(m.corePid).toBeUndefined()
+    }, 30_000)
+  })
+
+  describe('first TUN start (fake broker)', () => {
+    const tunParams = {
+      outbounds: [live],
+      activeOutboundId: 'ob_live',
+      rules: TEST_RULES,
+      settings: { ...TEST_SETTINGS, proxyMode: 'tun' as const }
+    }
+
+    it('no WARN is ever shown as the reason; one retry; code and time in the error', async () => {
+      const { SidecarManager } = await import('./SidecarManager')
+      const logFile = join(tmp, 'fake-core.log')
+      let restarts = 0
+      const launcher = {
+        kind: 'service' as const,
+        coreRuleDir: join(tmp, 'run', 'rules'),
+        coreLogPath: logFile,
+        launch: async () =>
+          writeFileSync(
+            logFile,
+            '+0300 2026-11-05 16:58:40 WARN inbound/tun[tun-in]: open interface take too much time to finish!\n'
+          ),
+        restartCore: async () => {
+          restarts++
+        },
+        syncRules: async () => undefined,
+        exited: async () => true,
+        exitInfo: async () => ({ code: 1, uptimeMs: 12_500, stderr: '' }),
+        failure: () => null,
+        stop: async () => undefined
+      }
+      const logs: string[] = []
+      const states: [StatusUpdate['state'], string | undefined][] = []
+      const m = new SidecarManager(
+        (e) => logs.push(e.message),
+        (s, msg) => states.push([s, msg]),
+        () => undefined,
+        undefined,
+        undefined,
+        undefined,
+        { launcherFactory: async () => launcher }
+      )
+      await expect(m.start(tunParams)).rejects.toThrow(/не запустилось/)
+      const [state, msg] = states.at(-1)!
+      expect(state).toBe('error')
+      expect(msg).toBe('Ядро sing-box не запустилось (код 1, через 12,5 с)')
+      expect(msg).not.toMatch(/WARN|too much time/)
+      expect(restarts).toBe(1)
+      expect(logs).toContain(
+        'Ядро завершилось при создании адаптера (код 1, через 12,5 с), повторяем'
+      )
+    }, 60_000)
+
+    it('a stale core.exit is not an exit; the broker\'s report of this session is', async () => {
+      const { LegacyLauncher } = await import('./tunService')
+      const { generateProbeConfig } = await import('./configGen')
+      const { ClashApi } = await import('./clashApi')
+      const dir = join(tmp, 'legacy-stale')
+      mkdirSync(dir, { recursive: true })
+      const clashPort = 27_481
+      const cfgPath = join(dir, 'c.json')
+      writeFileSync(
+        cfgPath,
+        JSON.stringify(
+          generateProbeConfig({
+            outbounds: [],
+            clashApiPort: clashPort,
+            logFile: join(dir, 'sb.log'),
+            xrayPorts: {}
+          })
+        )
+      )
+      // left by 0.4.2 or by an earlier session
+      writeFileSync(join(dir, 'core.exit'), '1')
+      writeFileSync(join(dir, 'core-0123456789abcdef.exit'), '{"code":1}')
+      writeFileSync(join(dir, 'restart.signal'), '1')
+      let proc: ChildProcess | null = null
+      const l = new LegacyLauncher(
+        { binDir: BIN, runDir: dir, configPath: cfgPath, rulesDir: dir, logPath: join(dir, 'sb.log') },
+        () => undefined,
+        () => false,
+        {
+          tunName: E2E_TUN,
+          spawnBroker: (script) => {
+            proc = spawn(
+              'powershell.exe',
+              ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script],
+              { windowsHide: true }
+            )
+            return proc
+          }
+        }
+      )
+      await l.launch()
+      try {
+        expect(existsSync(join(dir, 'core.exit'))).toBe(false)
+        expect(existsSync(join(dir, 'core-0123456789abcdef.exit'))).toBe(false)
+        expect(existsSync(join(dir, 'restart.signal'))).toBe(false)
+        const api = new ClashApi(clashPort)
+        expect(await waitFor(() => api.ping(), Boolean, 15_000)).toBe(true)
+        // an old broker still finishing writes its report late: not ours
+        writeFileSync(join(dir, 'core.exit'), '1')
+        expect(await l.exited()).toBe(false)
+        expect(await l.exitInfo()).toBeNull()
+
+        const out = await new Promise<string>((res) =>
+          execFile(
+            'powershell.exe',
+            [
+              '-NoProfile',
+              '-Command',
+              `(Get-CimInstance Win32_Process -Filter "Name='${CORE_EXE}'" | Where-Object { $_.CommandLine -like '*${cfgPath.replace(/'/g, "''")}*' }).ProcessId`
+            ],
+            { windowsHide: true },
+            (_e, o) => res(String(o).trim())
+          )
+        )
+        expect(out).toMatch(/^\d+$/)
+        process.kill(Number(out))
+        expect(await waitFor(() => l.exited(), Boolean, 10_000)).toBe(true)
+        const info = await l.exitInfo()
+        expect(typeof info?.code).toBe('number')
+        expect(typeof info?.uptimeMs).toBe('number')
+
+        // restart signal → a new core, the report is gone
+        await l.restartCore()
+        expect(await waitFor(() => api.ping(), Boolean, 15_000)).toBe(true)
+        expect(await l.exited()).toBe(false)
+      } finally {
+        await l.stop()
+        await waitFor(
+          () => (proc as ChildProcess | null)?.exitCode ?? null,
+          (x) => x !== null,
+          10_000
+        )
+      }
+    }, 90_000)
+
+    it('the FATAL of a core started by the broker gets into the error (real stderr, no elevation)', async () => {
+      const { SidecarManager } = await import('./SidecarManager')
+      const { LegacyLauncher } = await import('./tunService')
+      const procs: ChildProcess[] = []
+      const dir = join(tmp, 'legacy-fatal')
+      mkdirSync(dir, { recursive: true })
+      const states: [StatusUpdate['state'], string | undefined][] = []
+      const logs: string[] = []
+      const m = new SidecarManager(
+        (e) => logs.push(e.message),
+        (s, msg) => states.push([s, msg]),
+        () => undefined,
+        undefined,
+        undefined,
+        undefined,
+        {
+          launcherFactory: async (paths, cancelled) =>
+            new LegacyLauncher(paths, () => undefined, cancelled, {
+              tunName: E2E_TUN,
+              spawnBroker: (script) => {
+                const p = spawn(
+                  'powershell.exe',
+                  ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script],
+                  { windowsHide: true }
+                )
+                procs.push(p)
+                return p
+              }
+            })
+        }
+      )
+      try {
+        // TUN without admin rights: sing-box exits at once, twice
+        await expect(m.start(tunParams)).rejects.toThrow()
+        const msg = states.at(-1)?.[1] ?? ''
+        expect(states.at(-1)?.[0]).toBe('error')
+        expect(msg).toMatch(/^Ядро sing-box не запустилось: /)
+        expect(msg).not.toMatch(/WARN/)
+        expect(logs.filter((l) => /повторяем$/.test(l))).toHaveLength(1)
+      } finally {
+        await m.stop()
+        for (const p of procs) {
+          await waitFor(
+            () => p.exitCode,
+            (x) => x !== null,
+            10_000
+          )
+          if (p.exitCode === null) p.kill()
+        }
+      }
+    }, 120_000)
+  })
+
+  describe('update from 0.4.2: the service', () => {
+    const sid = 'S-1-5-21-1000000001-1000000002-1000000003-2002'
+    const root = join(tmp, 'pd-update', 'CipherWay')
+    const home = join(root, 'u', sid)
+    const sha = (f: string) => createHash('sha256').update(readFileSync(f)).digest('hex')
+
+    function runScript(path: string): Promise<number | null> {
+      return new Promise((res) => {
+        const p = spawn(
+          'powershell.exe',
+          ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path],
+          { windowsHide: true }
+        )
+        p.on('exit', (c) => res(c))
+      })
+    }
+
+    it('«outdated» → one install: new files, old ones gone, a foreign sing-box.exe left alone', async () => {
+      const { TunService } = await import('./tunService')
+      const { installScript } = await import('./serviceScripts')
+      const { generateProbeConfig } = await import('./configGen')
+      for (const d of [join(root, 'bin'), join(home, 'rules')]) mkdirSync(d, { recursive: true })
+      // what 0.4.2 left: the old file (running!), its manifest
+      const oldExe = join(root, 'bin', 'sing-box.exe')
+      copyFileSync(SINGBOX, oldExe)
+      copyFileSync(join(BIN, 'wintun.dll'), join(root, 'bin', 'wintun.dll'))
+      writeFileSync(
+        join(home, 'manifest.json'),
+        JSON.stringify({
+          version: 1,
+          app: '0.4.2',
+          broker: 'c'.repeat(64),
+          files: { 'sing-box.exe': sha(SINGBOX), 'wintun.dll': sha(join(BIN, 'wintun.dll')) }
+        })
+      )
+      // a sing-box.exe of another VPN client, elsewhere
+      const otherDir = join(tmp, 'other-vpn')
+      mkdirSync(otherDir, { recursive: true })
+      const otherExe = join(otherDir, 'sing-box.exe')
+      copyFileSync(SINGBOX, otherExe)
+      const run = (exe: string, port: number): ChildProcess => {
+        const cfg = join(tmp, `update-${port}.json`)
+        writeFileSync(
+          cfg,
+          JSON.stringify(
+            generateProbeConfig({
+              outbounds: [],
+              clashApiPort: port,
+              logFile: join(tmp, `update-${port}.log`),
+              xrayPorts: {}
+            })
+          )
+        )
+        return spawn(exe, ['run', '-c', cfg], { windowsHide: true })
+      }
+      const oldCore = run(oldExe, 27_491)
+      const otherCore = run(otherExe, 27_492)
+      const logs: string[] = []
+      const svc = new TunService({
+        binDir: BIN,
+        runDir: join(tmp, 'run'),
+        appVersion: '0.4.3',
+        log: (_l, m) => logs.push(m),
+        rootOverride: root,
+        taskExists: async () => true,
+        sidOverride: sid
+      })
+      try {
+        await sleep(800)
+        expect(oldCore.exitCode).toBeNull()
+        expect((await svc.status()).state).toBe('outdated')
+
+        const brokerText = await svc.brokerText(sid)
+        const script = installScript({
+          sid,
+          srcBinDir: BIN,
+          brokerText,
+          hashes: { [CORE_EXE]: sha(SINGBOX), 'wintun.dll': sha(join(BIN, 'wintun.dll')) },
+          brokerHash: createHash('sha256').update(brokerText, 'utf8').digest('hex'),
+          appVersion: '0.4.3',
+          testRoot: root
+        })
+        const path = join(tmp, 'install-test.ps1')
+        writeFileSync(path, '\ufeff' + script)
+        expect(await runScript(path)).toBe(0)
+
+        expect(existsSync(join(root, 'bin', CORE_EXE))).toBe(true)
+        expect(existsSync(oldExe)).toBe(false)
+        await waitFor(
+          () => oldCore.exitCode,
+          (c) => c !== null,
+          5000
+        )
+        expect(oldCore.exitCode).not.toBeNull()
+        // not our file: never stopped, whatever its name
+        expect(otherCore.exitCode).toBeNull()
+        expect(existsSync(otherExe)).toBe(true)
+        expect((await svc.status()).state).toBe('ok')
+      } finally {
+        if (oldCore.exitCode === null) oldCore.kill()
+        if (otherCore.exitCode === null) otherCore.kill()
+      }
+    }, 90_000)
+
+    it('every generated PowerShell script parses', async () => {
+      const { brokerScript } = await import('./broker')
+      const { installScript, serviceBrokerScript, uninstallScript } =
+        await import('./serviceScripts')
+      const hashes = { [CORE_EXE]: 'a'.repeat(64), 'wintun.dll': 'b'.repeat(64) }
+      const service = serviceBrokerScript({ sid, userRunDir: 'C:\\r', hashes })
+      const scripts: Record<string, string> = {
+        service,
+        legacy: brokerScript({
+          exe: 'C:\\x.exe',
+          config: 'C:\\c.json',
+          workDir: 'C:\\',
+          stopFile: 'C:\\s',
+          restartFile: 'C:\\r',
+          exitFile: 'C:\\e',
+          parentPid: 1
+        }),
+        install: installScript({
+          sid,
+          srcBinDir: 'C:\\b',
+          brokerText: service,
+          hashes,
+          brokerHash: 'c'.repeat(64),
+          appVersion: '0.4.3'
+        }),
+        remove: uninstallScript(sid)
+      }
+      const dir = join(tmp, 'parse')
+      mkdirSync(dir, { recursive: true })
+      for (const [name, text] of Object.entries(scripts)) {
+        const file = join(dir, `${name}.ps1`)
+        writeFileSync(file, '\ufeff' + text)
+        const out = await new Promise<string>((res) =>
+          execFile(
+            'powershell.exe',
+            [
+              '-NoProfile',
+              '-Command',
+              `$e = $null; $null = [System.Management.Automation.Language.Parser]::ParseFile('${file.replace(/'/g, "''")}', [ref]$null, [ref]$e); $e.Count`
+            ],
+            { windowsHide: true },
+            (_e, o) => res(String(o).trim())
+          )
+        )
+        expect(out, name).toBe('0')
+      }
+    }, 30_000)
+  })
+
+  describe('the subscription follows the panel', () => {
+    const REAL_PORT = 27_501
+    const SUB_PORT = 27_502
+    let realityServer: ChildProcess | null = null
+    let httpServer: HttpServer | null = null
+    let goodKey = ''
+    let staleKey = ''
+    let body = ''
+
+    const link = (name: string, key: string): string =>
+      `vless://${UUID}@[::1]:${REAL_PORT}?security=reality&encryption=none&flow=xtls-rprx-vision&type=tcp&pbk=${key}&sid=ab12&sni=www.cloudflare.com&fp=chrome#${encodeURIComponent(name)}`
+    const AUTO_HOST = `vless://${UUID}@10.255.255.1:443?security=none&type=tcp#${encodeURIComponent('⚡ Автовыбор')}`
+    const serve = (...links: string[]): void => {
+      body = Buffer.from(links.join('\n')).toString('base64')
+    }
+
+    beforeAll(async () => {
+      const keys = () => {
+        const out = execFileSync(XRAY, ['x25519'], { encoding: 'utf8', windowsHide: true })
+        return {
+          priv: /PrivateKey:\s*(\S+)/.exec(out)![1],
+          pub: /Password[^:]*:\s*(\S+)/.exec(out)![1]
+        }
+      }
+      const a = keys()
+      goodKey = a.pub
+      staleKey = keys().pub
+      const cfg = join(tmp, 'reality-server.json')
+      writeFileSync(
+        cfg,
+        JSON.stringify({
+          log: { loglevel: 'warning' },
+          inbounds: [
+            {
+              listen: '::1',
+              port: REAL_PORT,
+              protocol: 'vless',
+              settings: { clients: [{ id: UUID, flow: 'xtls-rprx-vision' }], decryption: 'none' },
+              streamSettings: {
+                network: 'raw',
+                security: 'reality',
+                realitySettings: {
+                  dest: 'www.cloudflare.com:443',
+                  serverNames: ['www.cloudflare.com'],
+                  privateKey: a.priv,
+                  shortIds: ['ab12']
+                }
+              }
+            }
+          ],
+          outbounds: [FREEDOM]
+        })
+      )
+      realityServer = spawn(XRAY, ['run', '-c', cfg], { windowsHide: true })
+      httpServer = createHttpServer((_req, res) => {
+        res.writeHead(200, {
+          'content-type': 'text/plain',
+          'profile-update-interval': '6',
+          'profile-title': 'e2e'
+        })
+        res.end(body)
+      })
+      await new Promise<void>((r) => httpServer!.listen(SUB_PORT, '127.0.0.1', () => r()))
+      await sleep(800)
+    })
+
+    afterAll(() => {
+      realityServer?.kill()
+      httpServer?.close()
+    })
+
+    /** Everything handlers.ts wires together, around the real client and the real cores. */
+    async function app() {
+      const { SidecarManager } = await import('./SidecarManager')
+      const { RemnawaveClient } = await import('../remnawave/RemnawaveClient')
+      const { SubscriptionSync } = await import('../remnawave/SubscriptionSync')
+      const rw = new RemnawaveClient()
+      const logs: string[] = []
+      const states: StatusUpdate['state'][] = []
+      const hints: Record<string, string>[] = []
+      const params = () => ({
+        outbounds: rw.getCached()?.outbounds ?? [],
+        activeOutboundId: (memory.get('activeOutboundId') as string | null) ?? undefined,
+        rules: TEST_RULES,
+        settings: { ...TEST_SETTINGS, httpPort: HTTP_PORT, routingMode: 'global' as const },
+        latencies: {}
+      })
+      const m = new SidecarManager(
+        (e) => logs.push(e.message),
+        (s) => states.push(s),
+        () => undefined,
+        undefined,
+        undefined,
+        undefined,
+        {
+          onRealityHeal: () => void sync.heal().finally(() => m.realityHealDone()),
+          onServerHints: (h) => hints.push(h)
+        }
+      )
+      const sync = new SubscriptionSync({
+        url: () => (memory.get('url') as string | null) ?? null,
+        fetch: (url, t) => rw.fetchSubscription(url, t),
+        cached: () => rw.getCached(),
+        getActive: () => (memory.get('activeOutboundId') as string | null) ?? null,
+        setActive: (id) => void memory.set('activeOutboundId', id),
+        getLatencies: () => ({}),
+        setLatencies: () => undefined,
+        settingHours: () => 12,
+        applyToCore: () => m.reload(params()),
+        activeChanged: () => undefined,
+        log: (_l, msg) => logs.push(msg),
+        notify: () => undefined
+      })
+      return { m, rw, sync, logs, states, hints, params }
+    }
+
+    function reset(cached: string[]): void {
+      memory.clear()
+      memory.set('url', `http://127.0.0.1:${SUB_PORT}/sub`)
+      memory.set('subscriptionCache', {
+        url: '',
+        fetchedAt: 1,
+        outbounds: parseOutboundsSync(cached)
+      })
+    }
+    let parseOutboundsSync: (l: string[]) => OutboundConfig[] = () => []
+    beforeAll(async () => {
+      const { parseOutbounds } = await import('../remnawave/parsers')
+      parseOutboundsSync = (l) => parseOutbounds(l.join('\n'))
+    })
+
+    it('before a connect: new key picked up, «⚡ Автовыбор» hidden, selection by name, interval from the panel', async () => {
+      // the cache of ≤0.4.2: ids from the whole link, an old key
+      reset([link('Германия', staleKey)])
+      const cache = memory.get('subscriptionCache') as { outbounds: OutboundConfig[] }
+      cache.outbounds[0].id = 'ob_old_hash'
+      memory.set('activeOutboundId', 'ob_old_hash')
+      serve(AUTO_HOST, link('Германия', goodKey))
+
+      const { m, rw, sync, states, params } = await app()
+      await sync.beforeConnect()
+      const data = rw.getCached()!
+      expect(data.outbounds.map((o) => o.name)).toEqual(['Германия'])
+      expect(data.updateIntervalHours).toBe(6)
+      expect(memory.get('activeOutboundId')).toBe(data.outbounds[0].id)
+
+      await m.start(params())
+      try {
+        expect(states.at(-1)).toBe('connected')
+        const xcfg = readFileSync(join(tmp, 'run', 'xray.json'), 'utf8')
+        expect(xcfg).toContain(goodKey)
+        expect(xcfg).not.toContain(staleKey)
+        const cfg = JSON.parse(readFileSync(join(tmp, 'run', 'config.json'), 'utf8'))
+        const auto = cfg.outbounds.find((o: { tag: string }) => o.tag === 'auto')
+        expect(auto.outbounds).toEqual([data.outbounds[0].id])
+        expect(await waitFor(code204, (c) => c === '204', 15_000)).toBe('204')
+      } finally {
+        await m.stop()
+      }
+    }, 90_000)
+
+    it('the subscription can\'t be fetched: the connect goes on with the saved copy', async () => {
+      reset([link('Германия', goodKey)])
+      memory.set('url', 'http://127.0.0.1:1/nothing-listens-here')
+      const { m, sync, logs, states, params } = await app()
+      await sync.beforeConnect()
+      expect(logs.at(-1)).toMatch(/сохранённой копии/)
+      await m.start(params())
+      try {
+        expect(states.at(-1)).toBe('connected')
+        expect(await waitFor(code204, (c) => c === '204', 15_000)).toBe('204')
+      } finally {
+        await m.stop()
+      }
+    }, 60_000)
+
+    it('REALITY error with a stale key: the subscription is fetched, the core restarted, traffic flows', async () => {
+      reset([link('Германия', staleKey)])
+      serve(AUTO_HOST, link('Германия', goodKey))
+      const { m, rw, logs, states, params } = await app()
+      memory.set('activeOutboundId', rw.getCached()!.outbounds[0].id)
+      await m.start(params()) // on purpose without beforeConnect: the stale key is in use
+      try {
+        expect(states.at(-1)).toBe('connected')
+        const code = await waitFor(code204, (c) => c === '204', 30_000)
+        expect(code).toBe('204')
+        expect(logs.some((l) => /Сервер ответил чужим сертификатом/.test(l))).toBe(true)
+        expect(logs.some((l) => /Перезапуск ядра с новой конфигурацией/.test(l))).toBe(true)
+        expect(readFileSync(join(tmp, 'run', 'xray.json'), 'utf8')).toContain(goodKey)
+        // the lines were collapsed, not repeated
+        expect(logs.filter((l) => /REALITY: received real certificate/.test(l)).length).toBeLessThan(4)
+      } finally {
+        await m.stop()
+      }
+    }, 90_000)
+
+    it('the error stays after the refresh → a hint on exactly that server', async () => {
+      reset([link('Германия', staleKey), link('Голландия', staleKey)])
+      // the panel doesn't know better
+      serve(link('Германия', staleKey), link('Голландия', staleKey))
+      const { m, rw, hints, logs, params } = await app()
+      const [de, nl] = rw.getCached()!.outbounds
+      memory.set('activeOutboundId', de.id)
+      await m.start(params())
+      try {
+        const res = await waitFor(
+          async () => {
+            await code204()
+            return hints.at(-1) ?? {}
+          },
+          (h) => !!h[de.id],
+          60_000
+        )
+        expect(res[de.id]).toContain('другой сервер')
+        expect(res[nl.id]).toBeUndefined()
+        expect(logs.filter((l) => /проверяем подписку/.test(l))).toHaveLength(1)
+        // no restart: nothing changed
+        expect(logs.some((l) => /Перезапуск ядра/.test(l))).toBe(false)
+      } finally {
+        await m.stop()
+      }
+    }, 120_000)
+
+    it('a change while connected: restart without a word from the user, selection survives or falls to auto', async () => {
+      reset([link('Германия', goodKey), link('Голландия', goodKey)])
+      serve(link('Германия', goodKey), link('Голландия', goodKey))
+      const { m, rw, sync, logs, states, params } = await app()
+      const [de, nl] = rw.getCached()!.outbounds
+      memory.set('activeOutboundId', nl.id)
+      await m.start(params())
+      try {
+        const pid = m.corePid
+        // nothing new: the core is left alone
+        expect((await sync.refresh()).changed).toBe(false)
+        await sleep(300)
+        expect(m.corePid).toBe(pid)
+
+        // «Голландия» is gone → «Лучший сервер»
+        serve(link('Германия', goodKey))
+        expect((await sync.refresh()).changed).toBe(true)
+        expect(memory.get('activeOutboundId')).toBe('auto')
+        await waitFor(
+          () => m.corePid !== pid && m.isRunning,
+          Boolean,
+          30_000
+        )
+        expect(m.isRunning).toBe(true)
+        expect(await m.clash!.groupNow('proxy')).toBe('auto')
+        expect(de.id).toBe(rw.getCached()!.outbounds[0].id)
+        expect(logs.some((l) => /больше нет в подписке/.test(l))).toBe(true)
+        expect(states.at(-1)).toBe('connected')
+        expect(states).not.toContain('error')
+      } finally {
+        await m.stop()
+      }
+    }, 90_000)
   })
 })

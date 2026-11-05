@@ -81,6 +81,13 @@ export interface ServerInfo {
   protocol: Protocol
 }
 
+/** Result of «Обновить подписку». */
+export interface SubscriptionRefreshResult {
+  view: SubscriptionView | null
+  /** the list or a server's connection parameters really changed */
+  changed: boolean
+}
+
 /** What the renderer gets instead of SubscriptionData (see remnawave/view.ts). */
 export interface SubscriptionView {
   fetchedAt: number
@@ -188,6 +195,16 @@ export interface StatusUpdate {
   /** the check finished and no server answered */
   autoDead?: boolean
   message?: string
+  /** node id → a hint for its row in the server list (REALITY keeps failing) */
+  serverHints?: Record<string, string>
+}
+
+export type NoticeTone = 'info' | 'success' | 'error'
+
+/** A message the main process wants shown as a toast. */
+export interface AppNotice {
+  text: string
+  tone: NoticeTone
 }
 
 /** What the urltest group is doing right now (main-process internal → StatusUpdate). */

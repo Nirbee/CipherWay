@@ -17,6 +17,8 @@ export interface ServerEntry {
   checking?: boolean
   /** «auto»: no server answered */
   dead?: boolean
+  /** why this server does not work (REALITY keeps failing) */
+  hint?: string
 }
 
 /**
@@ -36,11 +38,19 @@ export function useServerList(): {
   const autoDelayMs = useConnection((s) => s.autoDelayMs)
   const autoChecking = useConnection((s) => s.autoChecking)
   const autoDead = useConnection((s) => s.autoDead)
+  const serverHints = useConnection((s) => s.serverHints)
 
   return useMemo(() => {
     const list: ServerEntry[] = (servers ?? []).map((s) => {
       const { code, label } = parseServerName(s.name)
-      return { id: s.id, label, code, protocol: s.protocol, latency: pings[s.id] }
+      return {
+        id: s.id,
+        label,
+        code,
+        protocol: s.protocol,
+        latency: pings[s.id],
+        hint: serverHints[s.id]
+      }
     })
     // connected: the node the core uses right now, with *its* latency
     let autoPick = list.find((e) => e.id === autoSelectedId)
@@ -70,5 +80,5 @@ export function useServerList(): {
     const entries = list.length ? [auto, ...list] : []
     const active = entries.find((e) => e.id === activeId) ?? (list.length ? auto : undefined)
     return { entries, active, autoPick: autoChecking || autoDead ? undefined : autoPick }
-  }, [servers, pings, activeId, autoSelectedId, autoDelayMs, autoChecking, autoDead])
+  }, [servers, pings, activeId, autoSelectedId, autoDelayMs, autoChecking, autoDead, serverHints])
 }

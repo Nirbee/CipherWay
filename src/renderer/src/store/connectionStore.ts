@@ -13,6 +13,8 @@ interface ConnectionStore {
   /** no server answered the check */
   autoDead?: boolean
   message?: string
+  /** node id → hint for its row in the server list */
+  serverHints: Record<string, string>
   traffic: TrafficStats
   connectedAt: number | null // ms timestamp when the tunnel came up
   setStatus: (s: StatusUpdate) => void
@@ -30,6 +32,7 @@ const ZERO_TRAFFIC: TrafficStats = {
 
 export const useConnection = create<ConnectionStore>((set, get) => ({
   state: 'disconnected',
+  serverHints: {},
   traffic: ZERO_TRAFFIC,
   connectedAt: null,
   setStatus: (s) =>
@@ -41,6 +44,7 @@ export const useConnection = create<ConnectionStore>((set, get) => ({
       autoChecking: s.autoChecking,
       autoDead: s.autoDead,
       message: s.message,
+      serverHints: s.serverHints ?? {},
       traffic: s.state === 'connected' ? prev.traffic : ZERO_TRAFFIC,
       connectedAt:
         s.state === 'connected'

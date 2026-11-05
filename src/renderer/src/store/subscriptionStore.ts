@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import type { SubscriptionView } from '@shared/types'
 import { errorText } from '../lib/format'
+import { toast } from './toastStore'
 
 interface SubscriptionStore {
   data: SubscriptionView | null
@@ -37,10 +38,13 @@ export const useSubscription = create<SubscriptionStore>((set) => ({
   refresh: async () => {
     set({ loading: true, error: null })
     try {
-      const data = await window.api.subscription.refresh()
-      set({ data, loading: false })
+      const { view, changed } = await window.api.subscription.refresh()
+      set({ data: view, loading: false })
+      toast(changed ? 'Обновлено' : 'Новых изменений нет', changed ? 'success' : 'info')
     } catch (e) {
-      set({ loading: false, error: errorText(e) })
+      const text = errorText(e)
+      set({ loading: false, error: text })
+      toast(`Подписка не обновилась: ${text}`, 'error')
     }
   }
 }))

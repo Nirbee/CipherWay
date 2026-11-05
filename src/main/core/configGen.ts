@@ -11,10 +11,11 @@ import {
   type SbOutbound,
   type SbRouteRule
 } from './sbTypes'
-import { isXrayHandled, XRAY_EXE } from './xrayGen'
+import { isXrayHandled } from './xrayGen'
+import { TUN_INTERFACE, XRAY_EXE } from './coreNames'
 import { toExcludeCidrs, type ServerIps } from '../system/resolve'
 
-export const TUN_INTERFACE = 'CipherWay'
+export { TUN_INTERFACE }
 export const TUN_ADDRESS4 = '172.19.0.1'
 
 export interface SlotParams {
@@ -176,7 +177,7 @@ export function groupOutbounds(
 
 function inbounds(p: GenParams): SbInbound[] {
   if (p.settings.proxyMode === 'tun') {
-    // the node IPs get no TUN route: xray.exe's connections to them leave via
+    // the node IPs get no TUN route: cipherway-xray.exe's connections to them leave via
     // the physical NIC directly instead of looping through sing-box
     const exclude = toExcludeCidrs(p.serverIps ?? {})
     return [
@@ -215,7 +216,7 @@ export function generateSingboxConfig(p: GenParams): SbConfig {
   const tun = p.settings.proxyMode === 'tun'
   const nodeDomains = serverDomains(p.outbounds)
 
-  // Loop protection in TUN mode: xray.exe dials the nodes itself. Normally its
+  // Loop protection in TUN mode: cipherway-xray.exe dials the nodes itself. Normally its
   // sockets never reach the TUN (node IPs are in route_exclude_address); if a
   // node's IP changed after the pre-start lookup they would — send them
   // straight out (sing-box binds `direct` to the physical NIC via

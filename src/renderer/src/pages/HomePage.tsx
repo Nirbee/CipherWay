@@ -16,6 +16,7 @@ import {
   ExternalIcon,
   MegaphoneIcon,
   PowerIcon,
+  RefreshIcon,
   SupportIcon
 } from '../components/icons'
 import {
@@ -93,6 +94,8 @@ function Announcement({ text }: { text: string }) {
 
 function ProfileCard() {
   const data = useSubscription((s) => s.data)
+  const refresh = useSubscription((s) => s.refresh)
+  const refreshing = useSubscription((s) => s.loading)
   const setPage = useNav((s) => s.setPage)
   const { renewUrl } = useLinks()
 
@@ -136,6 +139,16 @@ function ProfileCard() {
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-2">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => void refresh()}
+            disabled={refreshing}
+            title="Обновить подписку"
+            aria-label="Обновить подписку"
+          >
+            <RefreshIcon width={15} height={15} className={cn(refreshing && 'animate-spin')} />
+          </Button>
           <Button variant="ghost" size="sm" onClick={() => setPage('support')}>
             <SupportIcon width={15} height={15} />
             Поддержка

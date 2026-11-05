@@ -21,7 +21,8 @@ import {
   onSettingsChange,
   onVpnStatus,
   registerIpcHandlers,
-  setRoutingMode
+  setRoutingMode,
+  startSubscriptionSync
 } from './ipc/handlers'
 import { remnawave } from './remnawave/RemnawaveClient'
 import { getSettings, store } from './store'
@@ -85,7 +86,7 @@ function createWindow(): void {
   // Windows log-off / shutdown: let the window close and clean up the cores
   mainWindow.on('session-end', () => {
     isQuitting = true
-    void activeManager?.stop()
+    void disconnectVpn()
   })
   mainWindow.on('closed', () => {
     mainWindow = null
@@ -286,9 +287,9 @@ if (!app.requestSingleInstanceLock()) {
       void clearStaleProxy(getSettings().httpPort).catch(() => undefined)
     }
 
-    // resume periodic subscription refresh if one was configured previously
+    // fetch the subscription now and keep it fresh from here on
     remnawave.prefetchDevice()
-    remnawave.startAutoRefresh(getSettings().subscriptionRefreshHours)
+    startSubscriptionSync()
 
     // quiet update check in the background (no-op in dev / unpackaged)
     void appUpdater?.checkSilently()
@@ -303,7 +304,7 @@ if (!app.requestSingleInstanceLock()) {
     // ensure cores are killed and the system proxy is reverted before exit
     e.preventDefault()
     cleanupDone = true
-    void activeManager.stop().finally(() => app.quit())
+    void disconnectVpn().finally(() => app.quit())
   })
 
   // closing the window only hides it; the app lives in the tray until «Выход»

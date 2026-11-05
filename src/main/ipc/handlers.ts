@@ -4,6 +4,7 @@ import { app, BrowserWindow, ipcMain, dialog, shell, Notification } from 'electr
 import { z } from 'zod'
 import { IPC } from '@shared/ipc'
 import type {
+  AppNotice,
   AppSettings,
   AutoInfo,
   ConnSnapshot,
@@ -13,14 +14,16 @@ import type {
   ServerPing,
   StatusUpdate,
   SubscriptionData,
+  SubscriptionRefreshResult,
   SubscriptionView,
   SupportView,
   TunServiceInfo
 } from '@shared/types'
 import { LogBatcher } from '@shared/logBuffer'
 import { DEFAULT_SETTINGS, getSettings, store } from '../store'
-import { listProcesses } from '../system/processes'
+import { findOtherVpnClients, listProcesses, runningProcessNames } from '../system/processes'
 import { remnawave } from '../remnawave/RemnawaveClient'
+import { SubscriptionSync } from '../remnawave/SubscriptionSync'
 import { toSubscriptionView } from '../remnawave/view'
 import { getSubscriptionUrl } from '../secrets'
 import { createMasker, type Masker } from '../mask'
@@ -186,6 +189,12 @@ function saveLatencies(pings: ServerPing[], known: Set<string>): void {
 let connectImpl: ((outboundId?: string) => Promise<StatusUpdate>) | null = null
 let disconnectImpl: (() => Promise<StatusUpdate>) | null = null
 let routingModeImpl: ((mode: RoutingMode) => Promise<AppSettings>) | null = null
+let subscriptionSync: SubscriptionSync | null = null
+
+/** At app start: fetch the subscription + keep it fresh from now on. */
+export function startSubscriptionSync(): void {
+  subscriptionSync?.start()
+}
 
 /** Connect / disconnect from outside the renderer (tray menu). */
 export function connectVpn(outboundId?: string): Promise<StatusUpdate> {
@@ -205,8 +214,9 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
     if (win && !win.isDestroyed()) win.webContents.send(channel, payload)
   }
   status = { state: 'disconnected', activeOutboundId: store.get('activeOutboundId') ?? undefined }
+  let serverHints: Record<string, string> = {}
   const publish = (next: StatusUpdate): void => {
-    status = next
+    status = { ...next, serverHints }
     send(IPC.evtStatus, status)
     for (const cb of statusListeners) cb(status)
   }
@@ -242,6 +252,9 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
 
   // the cores can print thousands of lines a minute: one IPC message per batch
   const logBatcher = new LogBatcher((batch: LogEntry[]) => send(IPC.evtLog, batch))
+  const notify = (notice: AppNotice): void => send(IPC.evtNotice, notice)
+  const appLog = (level: LogEntry['level'], message: string): void =>
+    logBatcher.push({ ts: Date.now(), level, source: 'app', message: mask(message) })
 
   ipcMain.handle(IPC.appGetVersion, () => app.getVersion())
   ipcMain.handle(IPC.openExternal, async (_e, url: unknown) => {
@@ -282,13 +295,60 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
     (ips) => {
       serverIps = ips
       rebuildMask(remnawave.getCached())
+    },
+    {
+      onNotice: notify,
+      onRealityHeal: () => void sync.heal().finally(() => manager.realityHealDone()),
+      onServerHints: (hints) => {
+        serverHints = hints
+        publish(status)
+      }
     }
   )
+
+  const sync = new SubscriptionSync({
+    url: getSubscriptionUrl,
+    fetch: (url, timeoutMs) => remnawave.fetchSubscription(url, timeoutMs),
+    cached: () => remnawave.getCached(),
+    getActive: () => store.get('activeOutboundId'),
+    setActive: (id) => store.set('activeOutboundId', id),
+    getLatencies: () => store.get('latencyCache') ?? {},
+    setLatencies: (v) => store.set('latencyCache', v),
+    settingHours: () => getSettings().subscriptionRefreshHours,
+    applyToCore: async () => {
+      if (manager.reloadNeedsPrompt) {
+        // TUN without the service: a restart would ask for admin rights out of the blue
+        notify({ text: 'Подписка обновилась — переподключитесь, чтобы применить', tone: 'info' })
+        return
+      }
+      if (manager.isRunning) notify({ text: 'Серверы обновились — применяем', tone: 'info' })
+      // queued: also covers a start that is running right now; no-op while disconnected
+      await manager.reload(buildStartParams())
+    },
+    activeChanged: (id) => publish({ ...status, activeOutboundId: id }),
+    log: appLog,
+    notify: (text, tone) => notify({ text, tone })
+  })
+  subscriptionSync = sync
+  // an old cache may hold a selection that is hidden now («⚡ Автовыбор»)
+  sync.migrateActive()
+  status = { state: 'disconnected', activeOutboundId: store.get('activeOutboundId') ?? undefined }
 
   // expose so app shutdown can stop cores gracefully
   activeManager = manager
 
   // ---- connection --------------------------------------------------------
+  /** Two VPNs at once: a word of warning, nothing is blocked. */
+  const warnOtherVpn = async (): Promise<void> => {
+    const others = findOtherVpnClients(await runningProcessNames())
+    if (others.length === 0) return
+    const text = `Запущен ${others.join(', ')}. Два VPN одновременно могут мешать друг другу.`
+    appLog('warn', text)
+    notify({ text, tone: 'info' })
+  }
+
+  /** bumped by every connect / disconnect: a connect still fetching the subscription gives up */
+  let connectGen = 0
   connectImpl = async (outboundId?: string): Promise<StatusUpdate> => {
     if (outboundId) store.set('activeOutboundId', z.string().max(100).parse(outboundId))
     // already connected: just switch the server (start() would be a no-op)
@@ -298,6 +358,16 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
       }
       return status
     }
+    const gen = ++connectGen
+    publish({
+      state: 'connecting',
+      activeOutboundId: store.get('activeOutboundId') ?? undefined,
+      message: 'Обновляем подписку…'
+    })
+    if (getSettings().proxyMode === 'tun') void warnOtherVpn().catch(() => undefined)
+    await sync.beforeConnect()
+    // «Отмена» while the subscription was loading: stop() has already reported it
+    if (gen !== connectGen) return status
     try {
       await manager.start(buildStartParams())
     } catch (err) {
@@ -312,6 +382,7 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
     return status
   }
   disconnectImpl = async (): Promise<StatusUpdate> => {
+    connectGen++
     await manager.stop()
     return status
   }
@@ -348,12 +419,14 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
   // ---- subscription ------------------------------------------------------
   ipcMain.handle(IPC.subscriptionFetch, async (_e, url: unknown) => {
     const parsed = z.string().url().max(2000).parse(url)
-    const data = await remnawave.fetchSubscription(parsed)
-    remnawave.startAutoRefresh(getSettings().subscriptionRefreshHours)
-    return view(data)
+    const res = await sync.fetchUrl(parsed)
+    return view(res.data)
   })
 
-  ipcMain.handle(IPC.subscriptionRefresh, async () => view(await remnawave.refreshSubscription()))
+  ipcMain.handle(IPC.subscriptionRefresh, async (): Promise<SubscriptionRefreshResult> => {
+    const res = await sync.refresh()
+    return { view: view(res.data), changed: res.changed }
+  })
 
   ipcMain.handle(IPC.subscriptionGet, async () => view(remnawave.getCached()))
 

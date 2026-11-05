@@ -8,6 +8,7 @@ import { join } from 'node:path'
 import { app } from 'electron'
 import {
   AUTO_OUTBOUND_ID,
+  type AppNotice,
   type AppSettings,
   type AutoInfo,
   type ConnectionState,
@@ -20,13 +21,16 @@ import {
   type TunServiceInfo
 } from '@shared/types'
 import { generateProbeConfig, generateSingboxConfig, TUN_ADDRESS4 } from './configGen'
-import { generateXrayConfig, isXrayHandled, XRAY_EXE, type XrayBridge } from './xrayGen'
+import { generateXrayConfig, isXrayHandled, type XrayBridge } from './xrayGen'
+import { CORE_EXE, XRAY_EXE } from './coreNames'
 import { ClashApi } from './clashApi'
 import { CLASH_MODE, LATENCY_TIMEOUT_MS, TAG_AUTO, TAG_PROXY_GROUP } from './sbTypes'
-import { hasTunAdapter } from './broker'
+import { hasTunAdapter, type CoreExit } from './broker'
 import { LegacyLauncher, TunService, type LauncherPaths, type TunLauncher } from './tunService'
 import { writeAtomic } from './atomicFile'
 import { DirectFailures } from './connections'
+import { LogFilter } from './logFilter'
+import { REALITY_ERROR_RE, RealityWatch } from './realityWatch'
 import { groupsFor, layoutRules, planRules, type RuleLayout } from '../rules/compile'
 import { GeoCache } from '../rules/geo'
 import { findFreePort } from '../system/ports'
@@ -49,12 +53,35 @@ export interface StartParams {
   latencies?: Record<string, number | null>
 }
 
-const MAX_RESTARTS = 5
+/** Optional reactions of the app + what tests replace. */
+export interface ManagerHooks {
+  /** a toast for the user */
+  onNotice?: (n: AppNotice) => void
+  /** REALITY errors: the subscription should be fetched (call realityHealDone() after) */
+  onRealityHeal?: () => void
+  /** node id → hint for the server list */
+  onServerHints?: (hints: Record<string, string>) => void
+  /** tests: a broker that needs no elevation */
+  launcherFactory?: (paths: LauncherPaths, cancelled: () => boolean) => Promise<TunLauncher>
+}
+
+/** a core that died is restarted up to this many times, after these pauses */
+const RESTART_DELAYS_MS = [1000, 3000, 5000]
+/** a run this long after the last restart: the count starts over */
+const RESTART_FORGET_MS = 60_000
 const XRAY_READY_TIMEOUT_MS = 8000
 /** system proxy: sing-box is up in well under a second */
 const CORE_READY_TIMEOUT_MS = 25_000
-/** TUN: includes the time the user needs to answer a UAC prompt */
+/**
+ * TUN: sing-box opens its Clash API only after the TUN inbound is up
+ * (StartStateStarted, 1.13.x), so this also covers creating the wintun adapter
+ * and the time the user needs to answer a UAC prompt.
+ */
 const CORE_READY_TIMEOUT_TUN_MS = 90_000
+/** TUN: one automatic retry when the core dies or the adapter doesn't appear (no UAC) */
+const TUN_RETRIES = 1
+/** how long the previous adapter may take to disappear */
+const ADAPTER_GONE_TIMEOUT_MS = 8000
 /** TUN: creating the wintun adapter the very first time can take half a minute */
 const TUN_ADAPTER_TIMEOUT_MS = 45_000
 const PROBE_READY_TIMEOUT_MS = 8000
@@ -134,11 +161,28 @@ class ServiceUnavailable extends Error {}
 const sameIds = (a: string[], b: string[]): boolean =>
   a.length === b.length && a.every((x, i) => x === b[i])
 
+/** 12500 → «12,5 с» */
+const seconds = (ms: number | null | undefined): string =>
+  ms === null || ms === undefined ? '?' : `${(ms / 1000).toFixed(1).replace('.', ',').replace(',0', '')} с`
+
+/** `ERROR [123 5ms] connection: …` is about one connection, never about the core itself. */
+const CONNECTION_LINE_RE = /ERROR\s+\[\d+ [^\]]*\]|\bconnection: /
+
+/** How an xray line tells about itself: `<date> <time> [Level] [session] …`. */
+const XRAY_SESSION_RE = /^\S+ \S+ \[\w+\] \[(\d+)\] /
+const XRAY_DETOUR_RE = /taking detour \[out-([^\]]+)\]/
+const XRAY_TAGGED_QUIET_RE = /^\S+ \S+ \[(Info|Debug)\]/
+/** what xray prints when it can't start: no timestamp («Failed to start: …», a panic) */
+const XRAY_START_ERROR_RE = /^(?!\d{4}\/\d{2}\/\d{2} ).*(failed|error|panic|fatal)/i
+/** sessions remembered for matching a REALITY line with its node */
+const XRAY_SESSIONS_MAX = 4000
+
 /**
  * Drives the cores: xray (VLESS connections, one loopback SOCKS inbound per
  * node) and sing-box (TUN / system proxy, routing, DNS, Hysteria2).
- * Order: xray starts before sing-box and stops after it. If xray dies while
- * connected, everything is stopped with an error (no silent fallback).
+ * Order: xray starts before sing-box and stops after it. A core that dies while
+ * connected is restarted alone, up to 3 times (xray keeps its ports, so sing-box
+ * doesn't even notice) — only then everything stops with an error.
  *  - System Proxy mode: sing-box spawned as a normal child (full stdio), the
  *    WinInet registry proxy points at its mixed inbound.
  *  - TUN mode: sing-box needs admin — through the «Служба TUN» task (no UAC
@@ -156,7 +200,17 @@ export class SidecarManager {
   private xray: ChildProcess | null = null // xray-core child (always non-elevated)
   private xrayTail: string[] = [] // last output lines, for error messages
   private coreTail: string[] = [] // last sing-box lines, for error messages
-  private restarts = 0
+  private xrayPorts: number[] = [] // SOCKS ports of the running xray (a restart reuses them)
+  /** a dead core is being restarted (keeps the state «connected») */
+  private recovering = false
+  private restartsUsed = 0
+  private lastRestartAt = 0
+  /** TUN: automatic retries used by this start */
+  private tunRetries = 0
+  /** xray session number → node id */
+  private xraySessions = new Map<string, string>()
+  private reality = new RealityWatch()
+  private logFilter: LogFilter
   private intentionalStop = false
   private starting = false
   private running = false
@@ -214,8 +268,11 @@ export class SidecarManager {
     /** latencies measured by the running core (startup check of the group) */
     private onPings: PingsFn = () => undefined,
     /** resolved node IPs — so they are masked in the log like the host names */
-    private onServerIps: IpsFn = () => undefined
-  ) {}
+    private onServerIps: IpsFn = () => undefined,
+    private hooks: ManagerHooks = {}
+  ) {
+    this.logFilter = new LogFilter((e) => this.onLog(e))
+  }
 
   private get binDir(): string {
     return app.isPackaged
@@ -229,7 +286,7 @@ export class SidecarManager {
     return join(this.runDir, 'rules')
   }
   private exePath(): string {
-    return join(this.binDir, 'sing-box.exe')
+    return join(this.binDir, CORE_EXE)
   }
   private xrayExePath(): string {
     return join(this.binDir, XRAY_EXE)
@@ -298,10 +355,28 @@ export class SidecarManager {
   get corePid(): number | undefined {
     return this.child?.pid
   }
+  /** tests: pid of xray */
+  get xrayPid(): number | undefined {
+    return this.xray?.pid
+  }
+  /** Restarting a legacy (non-service) TUN core would mean a UAC prompt. */
+  get reloadNeedsPrompt(): boolean {
+    return this.launcher?.kind === 'legacy'
+  }
 
   private log(level: LogEntry['level'], source: LogEntry['source'], message: string): void {
     if (!message) return
-    this.onLog({ ts: Date.now(), level, source, message })
+    const verbose = this.lastParams?.settings.verboseLog ?? false
+    this.logFilter.push({ ts: Date.now(), level, source, message }, verbose)
+  }
+
+  private publishHints(): void {
+    this.hooks.onServerHints?.(this.reality.hints())
+  }
+
+  /** The subscription was fetched after a REALITY error (whatever the result). */
+  realityHealDone(): void {
+    this.reality.healDone()
   }
 
   private coreLine(raw: string): void {
@@ -383,13 +458,16 @@ export class SidecarManager {
 
   // --- start -----------------------------------------------------------------
 
-  private async doStart(p: StartParams, gen: number, keepRestarts = false): Promise<void> {
+  private async doStart(p: StartParams, gen: number): Promise<void> {
     // a latency probe holds its own cores — let it finish first
     if (this.probing) await this.probing.catch(() => undefined)
     // a previous xray (e.g. auto-restart path) must be gone before ports are re-bound
     await this.stopXray()
     this.intentionalStop = false
-    if (!keepRestarts) this.restarts = 0
+    this.restartsUsed = 0
+    this.tunRetries = 0
+    this.xraySessions.clear()
+    if (this.reality.resetServers()) this.publishHints()
     this.lastParams = p
     this.mode = p.settings.proxyMode
     this.running = false
@@ -403,9 +481,9 @@ export class SidecarManager {
     const cancelled = (): boolean => gen !== this.opGen || this.intentionalStop
 
     if (!existsSync(this.exePath())) {
-      this.onState('error', 'sing-box.exe не найден — переустановите приложение')
-      this.log('error', 'app', `sing-box.exe отсутствует в ${this.binDir}`)
-      throw new Error('sing-box.exe missing')
+      this.onState('error', `${CORE_EXE} не найден — переустановите приложение`)
+      this.log('error', 'app', `${CORE_EXE} отсутствует в ${this.binDir}`)
+      throw new Error(`${CORE_EXE} missing`)
     }
     if (p.outbounds.length === 0) {
       this.onState('error', 'Нет серверов. Добавьте подписку на странице «Подписка».')
@@ -413,9 +491,9 @@ export class SidecarManager {
     }
     const xrayNodes = p.outbounds.filter(isXrayHandled)
     if (xrayNodes.length > 0 && !existsSync(this.xrayExePath())) {
-      this.onState('error', 'xray.exe не найден — переустановите приложение')
+      this.onState('error', `${XRAY_EXE} не найден — переустановите приложение`)
       this.log('error', 'app', `${XRAY_EXE} отсутствует в ${this.binDir}`)
-      throw new Error('xray.exe missing')
+      throw new Error(`${XRAY_EXE} missing`)
     }
 
     const tun = this.mode === 'tun'
@@ -485,12 +563,10 @@ export class SidecarManager {
       await writeFile(this.configPath, JSON.stringify(cfg, null, 2), 'utf8')
 
       if (bridges.length > 0) {
-        const xcfg = generateXrayConfig(bridges, {
-          serverIps,
-          verbose: p.settings.verboseLog
-        })
+        const xcfg = generateXrayConfig(bridges, { serverIps })
         await writeFile(this.xrayConfigPath, JSON.stringify(xcfg, null, 2), 'utf8')
-        await this.startXray(bridges.map((b) => b.port))
+        this.xrayPorts = bridges.map((b) => b.port)
+        await this.startXray(this.xrayPorts)
       }
 
       this.api = new ClashApi(this.ports.clashApi, clashSecret)
@@ -505,11 +581,11 @@ export class SidecarManager {
       this.startLogTail(logFile, skip)
       if (this.launcher) {
         // after a reload the old adapter may take a moment to disappear
-        for (let i = 0; i < 15 && hasTunAdapter(networkInterfaces(), TUN_ADDRESS4); i++)
-          await sleep(200)
-        this.staleAdapter = hasTunAdapter(networkInterfaces(), TUN_ADDRESS4)
+        // (one that stays is removed by the broker, it has the rights)
+        this.staleAdapter = !(await this.adapterGone())
         if (this.staleAdapter)
           this.log('warn', 'app', 'Сетевой адаптер CipherWay остался от прошлого запуска')
+        this.onState('connecting', 'Создаём сетевой адаптер…')
         await this.launcher.launch()
         const why = this.launcher.failure()
         if (why)
@@ -542,11 +618,7 @@ export class SidecarManager {
         // «Если службы нет — как раньше»: one UAC prompt for this connection
         this.log('warn', 'app', `${msg} — подключаемся с запросом прав администратора`)
         this.starting = false
-        return this.doStart(
-          { ...p, settings: { ...p.settings, tunService: false } },
-          gen,
-          keepRestarts
-        )
+        return this.doStart({ ...p, settings: { ...p.settings, tunService: false } }, gen)
       }
       this.onState('error', msg)
       throw err
@@ -557,6 +629,7 @@ export class SidecarManager {
 
   /** TUN: the «Служба TUN» task if allowed (set up / updated with one UAC prompt), else per-connect UAC. */
   private async pickLauncher(p: StartParams, cancelled: () => boolean): Promise<TunLauncher> {
+    if (this.hooks.launcherFactory) return this.hooks.launcherFactory(this.paths, cancelled)
     const legacy = (): TunLauncher =>
       new LegacyLauncher(this.paths, (l, m) => this.log(l, 'app', m), cancelled)
     if (!p.settings.tunService) return legacy()
@@ -603,46 +676,113 @@ export class SidecarManager {
     await api.select(TAG_PROXY_GROUP, target).catch(() => false)
   }
 
-  /** Waits until the new sing-box answers on its Clash API, or explains why not. */
+  /**
+   * Waits until the new sing-box answers on its Clash API, or explains why not.
+   * TUN: the answer means the adapter exists too; a core that dies on the way gets
+   * one automatic retry — the same thing a second click would do.
+   */
   private async waitCoreReady(cancelled: () => boolean, timeoutMs?: number): Promise<void> {
     const api = this.api
     if (!api) throw new Error('Ядро не запущено')
     const l = this.launcher
-    const deadline =
+    let deadline =
       Date.now() + (timeoutMs ?? (l ? CORE_READY_TIMEOUT_TUN_MS : CORE_READY_TIMEOUT_MS))
+    let exit: CoreExit | null = null
     while (Date.now() < deadline) {
       if (cancelled()) throw new Error('Подключение отменено')
       if (await api.ping()) return
       const why = l?.failure()
       if (why) throw new Error(why)
       if (!l && !this.child) break // sing-box exited during startup
-      if (l && (await l.exited())) break // ... or under the broker
-      if (this.coreTail.some((x) => /\bFATAL\b/.test(x))) break
+      if (!l && this.coreTail.some((x) => /\bFATAL\b/.test(x))) break
+      if (l && (await l.exited())) {
+        exit = await this.noteCoreExit(l)
+        if (this.tunRetries >= TUN_RETRIES) break
+        this.tunRetries++
+        this.log(
+          'warn',
+          'app',
+          `Ядро завершилось при создании адаптера (${this.exitWords(exit)}), повторяем`
+        )
+        this.onState('connecting', 'Повторная попытка: создаём сетевой адаптер…')
+        this.coreTail = []
+        exit = null
+        await l.restartCore()
+        const failed = l.failure()
+        if (failed) throw new Error(failed)
+        deadline = Date.now() + CORE_READY_TIMEOUT_TUN_MS
+        continue
+      }
       await sleep(250)
     }
-    throw new Error(`Ядро sing-box не запустилось${await this.coreReason()}`)
+    const reason = await this.coreReason()
+    const details = !reason && exit ? ` (${this.exitWords(exit)})` : ''
+    throw new Error(`Ядро sing-box не запустилось${reason || details}`)
   }
 
-  /** «: <last error line of sing-box>» or '' */
-  private async coreReason(): Promise<string> {
-    await this.tailOnce()
-    const reason =
-      this.coreTail.filter((l) => /error|fatal/i.test(l)).at(-1) ?? this.coreTail.at(-1)
-    return reason ? `: ${reason.replace(/^.*?(FATAL|ERROR)(\[\d+\])?\s*/i, '')}` : ''
+  /** «код 1, через 12,5 с» */
+  private exitWords(exit: CoreExit | null): string {
+    return `код ${exit?.code ?? '?'}, через ${seconds(exit?.uptimeMs)}`
   }
 
   /**
-   * TUN: the Clash API answers before the TUN inbound is up — wait for the
-   * wintun adapter itself. The first one on a machine can take 20–40 s
-   * («open interface take too much time»); on failure the core is restarted
-   * once (no second UAC prompt).
+   * What the broker knows about a core that ended: the journal gets the exit
+   * code, the time and what the core printed (its FATAL goes to stderr, never to
+   * log.output). The lines also feed coreTail, so coreReason() finds them.
+   */
+  private async noteCoreExit(l: TunLauncher): Promise<CoreExit | null> {
+    await this.tailOnce()
+    const exit = await l.exitInfo()
+    this.log(
+      'warn',
+      'singbox',
+      `Ядро завершилось: ${this.exitWords(exit)}${exit?.note ? ` (служба: ${exit.note})` : ''}`
+    )
+    for (const line of exit?.stderr.split('\n') ?? []) {
+      if (line.trim()) this.coreLine(line.trim())
+    }
+    return exit
+  }
+
+  /**
+   * «: <reason>» — only what sing-box itself called FATAL / ERROR (not a line about
+   * one connection), or '' with no details. A WARN like «open interface take too
+   * much time» says nothing about why the core ended.
+   */
+  private async coreReason(): Promise<string> {
+    await this.tailOnce()
+    const fatal = this.coreTail.filter((l) => /\b(FATAL|PANIC)\b|^panic:/.test(l)).at(-1)
+    const error = this.coreTail
+      .filter((l) => /\bERROR\b/.test(l) && !CONNECTION_LINE_RE.test(l))
+      .at(-1)
+    const reason = fatal ?? error
+    return reason ? `: ${reason.replace(/^.*?(FATAL|ERROR)(\[\d+\])?\s*/, '')}` : ''
+  }
+
+  /** Waits for the adapter of the previous run to disappear; false = it stayed. */
+  private async adapterGone(): Promise<boolean> {
+    const end = Date.now() + ADAPTER_GONE_TIMEOUT_MS
+    while (hasTunAdapter(networkInterfaces(), TUN_ADDRESS4)) {
+      if (Date.now() >= end) return false
+      await sleep(200)
+    }
+    return true
+  }
+
+  /**
+   * TUN: makes sure the wintun adapter really is there («connected» is only
+   * reported with it). The first one on a machine can take 20–40 s («open
+   * interface take too much time» — just a warning). A core that ended here or an
+   * adapter that never appeared uses up the one automatic retry (no UAC prompt).
    */
   private async waitTunReady(cancelled: () => boolean): Promise<void> {
     let why = ''
-    for (let attempt = 1; attempt <= 2; attempt++) {
+    for (;;) {
       this.onState(
         'connecting',
-        attempt === 1 ? 'Создаём сетевой адаптер…' : 'Повторная попытка: создаём сетевой адаптер…'
+        this.tunRetries === 0
+          ? 'Создаём сетевой адаптер…'
+          : 'Повторная попытка: создаём сетевой адаптер…'
       )
       const res = await this.pollAdapter(TUN_ADAPTER_TIMEOUT_MS, cancelled)
       if (res === 'ok') {
@@ -650,20 +790,21 @@ export class SidecarManager {
         return
       }
       if (res === 'cancel') throw new Error('Подключение отменено')
+      const exit = res === 'exited' && this.launcher ? await this.noteCoreExit(this.launcher) : null
       why = res === 'exited' ? await this.coreReason() : ''
-      this.log(
-        'warn',
-        'app',
+      const what =
         res === 'exited'
-          ? `Ядро завершилось при создании адаптера TUN${why}`
+          ? `Ядро завершилось при создании адаптера (${this.exitWords(exit)})`
           : `Адаптер TUN не создан за ${TUN_ADAPTER_TIMEOUT_MS / 1000} с`
-      )
-      if (attempt === 1) {
-        this.log('info', 'app', 'Повторная попытка запуска TUN')
-        this.coreTail = []
-        await this.launcher?.restartCore()
-        await this.waitCoreReady(cancelled, CORE_READY_TIMEOUT_MS)
+      if (this.tunRetries >= TUN_RETRIES) {
+        this.log('warn', 'app', what)
+        break
       }
+      this.tunRetries++
+      this.log('warn', 'app', `${what}, повторяем`)
+      this.coreTail = []
+      await this.launcher?.restartCore()
+      await this.waitCoreReady(cancelled, CORE_READY_TIMEOUT_TUN_MS)
     }
     throw new Error(
       `Не удалось создать сетевой адаптер TUN${why}. Перезагрузите компьютер и попробуйте снова или выберите «Системный прокси» в Настройках.`
@@ -702,12 +843,13 @@ export class SidecarManager {
     })
     this.xray = proc
     let exited = false
+    let rest = ''
     const onData = (d: Buffer): void => {
-      for (const raw of d.toString().split(/\r?\n/)) {
+      const lines = (rest + d.toString()).split(/\r?\n/)
+      rest = lines.pop() ?? ''
+      for (const raw of lines) {
         const line = raw.trim()
-        if (!line) continue
-        this.xrayTail = [...this.xrayTail.slice(-4), line]
-        this.log(xrayLevel(line), 'xray', line)
+        if (line) this.xrayLine(line)
       }
     }
     proc.stdout?.on('data', onData)
@@ -717,18 +859,13 @@ export class SidecarManager {
     )
     proc.on('exit', (code) => {
       exited = true
+      if (rest.trim()) this.xrayLine(rest.trim())
+      rest = ''
       if (this.xray !== proc) return // stopped on purpose / replaced
       this.xray = null
-      this.log('error', 'xray', `xray завершился (code=${code})`)
+      this.log('warn', 'xray', `xray завершился (code=${code})`)
       if (this.intentionalStop || this.starting) return
-      // xray died while connected: tear everything down and show why
-      const reason = this.xrayTail.at(-1)
-      const msg = `Ядро Xray остановилось (код ${code ?? '?'}), соединение разорвано.${reason ? ` ${reason}` : ''}`
-      void this.serial(async () => {
-        if (!this.running) return
-        await this.doStop(true)
-        this.onState('error', msg)
-      })
+      this.recover('Xray', code)
     })
     this.log('info', 'app', `Запуск xray: узлов VLESS — ${ports.length}, вход 127.0.0.1`)
 
@@ -744,13 +881,49 @@ export class SidecarManager {
       if (pending.size === 0) return
       await sleep(150)
     }
-    // «Xray … started» is its normal banner, not a reason
-    const last = this.xrayTail.filter((l) => !/\bstarted\b/i.test(l)).at(-1)
+    // only what xray itself reported as a start failure — not its banner, not traffic
+    const reported = this.xrayTail.filter((l) => XRAY_START_ERROR_RE.test(l)).at(-1)
     const reason = exited
-      ? (last ?? `xray завершился`)
+      ? (reported ?? `xray завершился`)
       : `входы xray не отвечают (${pending.size} из ${ports.length})`
     await this.stopXray()
     throw new Error(`Не удалось запустить ядро Xray: ${reason}`)
+  }
+
+  /**
+   * One line of xray output. The log level is always `info` (see xrayGen.ts):
+   * it pairs session numbers with nodes, so a REALITY error can name its server;
+   * the info lines reach «Журнал» only with «Подробный журнал».
+   */
+  private xrayLine(line: string): void {
+    const session = XRAY_SESSION_RE.exec(line)?.[1]
+    const detour = XRAY_DETOUR_RE.exec(line)?.[1]
+    if (session && detour) {
+      if (this.xraySessions.size >= XRAY_SESSIONS_MAX) {
+        const oldest = this.xraySessions.keys().next().value
+        if (oldest !== undefined) this.xraySessions.delete(oldest)
+      }
+      this.xraySessions.set(session, detour)
+    }
+    const quiet = XRAY_TAGGED_QUIET_RE.test(line)
+    if (REALITY_ERROR_RE.test(line)) {
+      this.noteReality(session ? this.xraySessions.get(session) : undefined)
+    } else if (!quiet) {
+      this.xrayTail = [...this.xrayTail.slice(-4), line]
+    }
+    const level = xrayLevel(line)
+    const verbose = this.lastParams?.settings.verboseLog ?? false
+    if ((level === 'info' || level === 'debug') && !verbose) return
+    this.log(level, 'xray', line)
+  }
+
+  private noteReality(nodeId: string | undefined): void {
+    const res = this.reality.note(nodeId)
+    if (res.hintsChanged) this.publishHints()
+    if (res.heal) {
+      if (this.hooks.onRealityHeal) this.hooks.onRealityHeal()
+      else this.reality.healDone()
+    }
   }
 
   private async stopXray(): Promise<void> {
@@ -767,6 +940,9 @@ export class SidecarManager {
       windowsHide: true
     })
     this.child = proc
+    proc.on('error', (err) =>
+      this.log('error', 'singbox', `Не удалось запустить ядро: ${err.message}`)
+    )
     const onData = (d: Buffer): void => {
       for (const raw of d.toString().split(/\r?\n/)) {
         const line = raw.trim()
@@ -779,43 +955,97 @@ export class SidecarManager {
       if (this.child !== proc) return
       this.log('warn', 'singbox', `sing-box завершился (code=${code})`)
       this.child = null
-      if (!this.starting) this.maybeRestart()
+      if (this.starting || this.intentionalStop) return
+      this.recover('sing-box', code)
     })
   }
 
-  /** TUN: sing-box died under the broker while connected. */
-  private coreDied(): Promise<void> {
-    return this.serial(async () => {
-      if (!this.running || this.intentionalStop) return
-      this.running = false
-      const reason = await this.coreReason()
-      this.log('error', 'singbox', `sing-box завершился${reason}`)
-      await this.doStop(true)
-      this.onState('error', `Ядро sing-box остановилось, соединение разорвано${reason}`)
-    })
-  }
+  // --- a core died while connected -------------------------------------------
 
-  private maybeRestart(): void {
-    if (this.intentionalStop || !this.lastParams) return
-    if (this.launcher) return // TUN: the broker owns the elevated lifecycle
-    if (this.restarts >= MAX_RESTARTS) {
-      void this.serial(async () => {
-        await this.doStop(true)
-        this.onState('error', 'Превышено число перезапусков ядра')
-      })
-      return
-    }
-    this.restarts++
-    this.log('warn', 'app', `Авто-перезапуск ядра (${this.restarts}/${MAX_RESTARTS})`)
-    const params = this.lastParams
+  /**
+   * Queues the restart of whatever died. Xray keeps its ports and config, so
+   * sing-box and the TUN adapter stay up; sing-box keeps its config and Clash API
+   * port, so the system proxy stays valid and TUN needs no UAC prompt.
+   * `taskkill /f` of another program gives code 1 — that is no reason to drop the
+   * connection, and the old log tail is no reason to blame the server.
+   */
+  private recover(what: 'Xray' | 'sing-box', code: number | null): void {
+    if (this.recovering) return
+    this.recovering = true
     const gen = this.opGen
-    setTimeout(() => {
-      void this.serial(async () => {
-        if (this.intentionalStop || gen !== this.opGen) return
-        await this.doStop(true)
-        await this.doStart(params, gen, true)
-      }).catch(() => undefined)
-    }, 1500)
+    void this.serial(() => this.recoverCores(what, code, gen))
+      .catch(() => undefined)
+      .finally(() => {
+        this.recovering = false
+      })
+  }
+
+  private async recoverCores(
+    what: 'Xray' | 'sing-box',
+    code: number | null,
+    gen: number
+  ): Promise<void> {
+    const cancelled = (): boolean => gen !== this.opGen || this.intentionalStop || !this.running
+    if (cancelled()) return
+    if (Date.now() - this.lastRestartAt > RESTART_FORGET_MS) this.restartsUsed = 0
+    let startError = ''
+    while (this.restartsUsed < RESTART_DELAYS_MS.length) {
+      const delay = RESTART_DELAYS_MS[this.restartsUsed]
+      this.restartsUsed++
+      this.lastRestartAt = Date.now()
+      this.log(
+        'warn',
+        'app',
+        `Ядро ${what} остановилось (код ${code ?? '?'}) — перезапуск через ${delay / 1000} с, попытка ${this.restartsUsed} из ${RESTART_DELAYS_MS.length}`
+      )
+      for (const end = Date.now() + delay; Date.now() < end; await sleep(100)) {
+        if (cancelled()) return
+      }
+      if (cancelled()) return
+      try {
+        await this.restartDeadCores(cancelled)
+        if (cancelled()) return
+        this.lastRestartAt = Date.now()
+        this.log('info', 'app', 'Ядро перезапущено')
+        this.hooks.onNotice?.({ text: 'Ядро перезапущено', tone: 'info' })
+        return
+      } catch (err) {
+        if (cancelled()) return
+        startError = err instanceof Error ? err.message : String(err)
+        this.log('warn', 'app', `Перезапуск не удался: ${startError}`)
+      }
+    }
+    // the reason only if the process itself said why it couldn't start
+    const told = /: /.test(startError) && !/входы xray не отвечают|xray завершился$/.test(startError)
+    await this.doStop(true)
+    this.onState(
+      'error',
+      `Ядро ${what} остановилось (код ${code ?? '?'}) и не перезапустилось, соединение разорвано.${told ? ` ${startError}` : ''} Нажмите «Подключить», чтобы попробовать снова.`
+    )
+  }
+
+  /** Starts what is not running (xray first, as at a normal start). */
+  private async restartDeadCores(cancelled: () => boolean): Promise<void> {
+    if (this.xrayPorts.length > 0 && !this.xray) await this.startXray(this.xrayPorts)
+    const l = this.launcher
+    const coreDead = l ? await l.exited() : !this.child
+    if (coreDead) {
+      this.coreTail = []
+      this.tunRetries = 0
+      if (l) {
+        await this.noteCoreExit(l)
+        this.onState('connecting', 'Перезапуск ядра…')
+        await l.restartCore()
+      } else {
+        this.startChild()
+      }
+      await this.waitCoreReady(cancelled, l ? CORE_READY_TIMEOUT_TUN_MS : CORE_READY_TIMEOUT_MS)
+      if (l) await this.waitTunReady(cancelled)
+      if (this.lastParams) await this.applyRuntimeChoices(this.lastParams)
+      if (l) this.onState('connected')
+    }
+    // it may have gone down too in the meantime
+    if (this.xrayPorts.length > 0 && !this.xray) await this.startXray(this.xrayPorts)
   }
 
   // --- rules on the fly ------------------------------------------------------
@@ -1029,6 +1259,9 @@ export class SidecarManager {
     this.launcher = null
     if (launcher) {
       await launcher.stop()
+      // the next start must not meet the old adapter (the broker checks again)
+      if (!(await this.adapterGone()))
+        this.log('warn', 'app', 'Сетевой адаптер CipherWay ещё не удалён системой')
     } else {
       const child = this.child
       this.child = null
@@ -1041,8 +1274,10 @@ export class SidecarManager {
     }
     // xray goes down after sing-box, so traffic never falls through to direct
     await this.stopXray()
+    this.xrayPorts = []
     await this.tailOnce()
     this.stopLogTail()
+    this.logFilter.flush()
     this.api = null
     this.setAuto(NO_AUTO)
 
@@ -1194,10 +1429,23 @@ export class SidecarManager {
     const api = this.clash
     if (!api) return
     ++this.tick
+    this.logFilter.tick()
+    if (this.tick % 60 === 0 && this.reality.prune()) this.publishHints()
     if (this.tick % 5 === 0) void this.refreshAuto()
+    // nothing may stay dead unnoticed (an exit that fell between two restarts)
+    if (!this.recovering && !this.intentionalStop) {
+      if (this.xrayPorts.length > 0 && !this.xray) return this.recover('Xray', null)
+      if (!this.launcher && !this.child) return this.recover('sing-box', null)
+    }
     // TUN: the broker reports a sing-box that died on its own
-    if (this.launcher && this.tick % 2 === 0 && (await this.launcher.exited())) {
-      void this.coreDied()
+    if (
+      this.launcher &&
+      !this.recovering &&
+      this.tick % 2 === 0 &&
+      (await this.launcher.exited())
+    ) {
+      const exit = await this.launcher.exitInfo()
+      if (this.running && !this.intentionalStop) this.recover('sing-box', exit?.code ?? null)
       return
     }
     const json = await api.connections()
