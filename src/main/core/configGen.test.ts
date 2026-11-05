@@ -1,9 +1,9 @@
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
-import type { AppSettings } from '@shared/types'
+import type { AppSettings, RulesConfig } from '@shared/types'
 import { parseOutbounds } from '../remnawave/parsers'
 import { filterSubscription } from '../remnawave/subscriptionGuard'
 import {
@@ -24,6 +24,7 @@ import {
 } from './xrayGen'
 import type { ServerIps } from '../system/resolve'
 import { MIXED_SUB_BODY, TEST_RULES, TEST_SETTINGS } from './fixtures'
+import { groupsFor, layoutRules, planRules, type HeadlessRule } from '../rules/compile'
 
 const outbounds = filterSubscription(parseOutbounds(MIXED_SUB_BODY)).outbounds
 const [vlessA, vlessB, hy2] = outbounds
@@ -40,17 +41,31 @@ const SERVER_IPS: ServerIps = {
   'hy.example.com': ['198.51.100.8']
 }
 
+const GEO = new Map<string, HeadlessRule[]>([
+  ['geosite-category-ads-all', [{ domain_suffix: ['ads.example.com'] }]],
+  ['geoip-ru', [{ ip_cidr: ['5.0.0.0/8'] }]],
+  ['geosite-category-ru', [{ domain_suffix: ['ru'] }]]
+])
+const SLOT_DIR = 'C:\\cw\\rules'
+
+/** the slot layout of `rules` (+ its files, for `sing-box check`) */
+function slotsFor(rules: RulesConfig, dir = SLOT_DIR) {
+  const plan = planRules(rules, outbounds)
+  const groups = groupsFor(plan)
+  const layout = layoutRules(plan, groups, GEO)!
+  return { slots: { groups, dir, selectors: layout.selectors }, files: layout.files }
+}
+
 function singbox(settings: Partial<AppSettings> = {}, extra: Partial<GenParams> = {}) {
   return generateSingboxConfig({
     outbounds,
     activeOutboundId: vlessA.id,
-    rules: TEST_RULES,
+    slots: slotsFor(TEST_RULES).slots,
     settings: { ...TEST_SETTINGS, ...settings },
     socksPort: 10808,
     httpPort: 10809,
     clashApiPort: 19090,
     logFile: 'sing-box.log',
-    cacheFile: 'cache.db',
     xrayPorts,
     ...extra
   })
@@ -146,8 +161,9 @@ describe('generateSingboxConfig with xray bridges', () => {
       obfs: { type: 'salamander', password: 'obfs-pass' }
     })
     expect(byTag.direct).toEqual({ type: 'direct', tag: 'direct' })
-    // unmatched traffic goes to the selector, which defaults to the active node
-    expect(cfg.route.final).toBe('proxy')
+    // unmatched traffic: «Всё остальное» selector → the proxy selector → the active node
+    expect(cfg.route.final).toBe('cw-final')
+    expect(byTag['cw-final']).toMatchObject({ type: 'selector', default: 'proxy' })
     expect(byTag.proxy).toMatchObject({ type: 'selector', default: vlessA.id })
   })
 
@@ -161,21 +177,38 @@ describe('generateSingboxConfig with xray bridges', () => {
     expect(rules[0]).toEqual({ domain: ['nl.example.com', 'hy.example.com'], server: 'local' })
   })
 
-  it('never sets a DNS detour to the empty direct outbound (sing-box refuses to start)', () => {
+  it('remote DNS goes through the cw-dns selector (tunnel, or direct for «всё напрямую»)', () => {
     const servers = (singbox().dns as { servers: { tag: string; detour?: string }[] }).servers
+    // sing-box refuses to start with a detour to the empty direct outbound
     expect(servers.find((s) => s.tag === 'local')?.detour).toBeUndefined()
-    expect(servers.find((s) => s.tag === 'remote')?.detour).toBe('proxy')
+    expect(servers.find((s) => s.tag === 'remote')?.detour).toBe('cw-dns')
     const direct = generateSingboxConfig({
       ...{ outbounds, activeOutboundId: vlessA.id, settings: TEST_SETTINGS, xrayPorts },
-      rules: { defaultBehavior: 'direct', rules: [] },
+      slots: slotsFor({ defaultBehavior: 'direct', rules: [] }).slots,
       socksPort: 0,
       httpPort: 1,
       clashApiPort: 2,
-      logFile: 'l',
-      cacheFile: 'c'
+      logFile: 'l'
     })
-    const ds = (direct.dns as { servers: { detour?: string }[] }).servers
-    expect(ds.every((s) => s.detour === undefined)).toBe(true)
+    expect(direct.outbounds.find((o) => o.tag === 'cw-dns')).toMatchObject({
+      type: 'selector',
+      default: 'direct'
+    })
+    expect(direct.outbounds.find((o) => o.tag === 'cw-final')).toMatchObject({ default: 'direct' })
+  })
+
+  it('no cache_file: the previous run’s mode / selector choice never comes back at start', () => {
+    expect(singbox().experimental).not.toHaveProperty('cache_file')
+    expect(JSON.stringify(singbox({ proxyMode: 'tun' }))).not.toMatch(/cache/)
+  })
+
+  it('user rules are local rule-sets in the slot folder (no downloads by the core)', () => {
+    const sets = singbox().route.rule_set ?? []
+    expect(sets.length).toBeGreaterThan(0)
+    for (const r of sets) {
+      expect(r.type).toBe('local')
+      expect(r.path.startsWith(`${SLOT_DIR}\\`)).toBe(true)
+    }
   })
 
   it('TUN mode: xray.exe goes direct before anything else (no loop)', () => {
@@ -223,9 +256,11 @@ describe('server groups: «Лучший сервер (авто)» + selector', (
     expect(sel(undefined)).toBe('auto')
   })
 
-  it('PROXY rules route to the selector, not to a fixed node', () => {
-    const rule = singbox().route.rules.find((r) => r.process_name?.includes('telegram.exe'))
-    expect(rule).toMatchObject({ action: 'route', outbound: 'proxy' })
+  it('PROXY rules route to a slot selector that points at the proxy selector', () => {
+    const cfg = singbox()
+    const rule = cfg.route.rules.find((r) => r.rule_set?.[0] === 'cw-0-p')
+    expect(rule).toMatchObject({ action: 'route', outbound: 'cw-0' })
+    expect(cfg.outbounds.find((o) => o.tag === 'cw-0')).toMatchObject({ default: 'proxy' })
   })
 })
 
@@ -235,12 +270,17 @@ describe('routing modes (Правила / Весь трафик / Напряму
     const idx = (pred: (r: (typeof rules)[number]) => boolean) => rules.findIndex(pred)
     const direct = idx((r) => r.clash_mode === 'Direct')
     const global = idx((r) => r.clash_mode === 'Global')
-    const firstUser = idx((r) => r.rule_set?.includes('geosite-category-ads-all') ?? false)
+    const firstUser = idx((r) => r.rule_set?.[0]?.startsWith('cw-') ?? false)
     expect(rules[direct]).toEqual({ clash_mode: 'Direct', action: 'route', outbound: 'direct' })
     expect(rules[global]).toEqual({ clash_mode: 'Global', action: 'route', outbound: 'proxy' })
     expect(direct).toBeLessThan(firstUser)
     expect(global).toBeLessThan(firstUser)
     expect(idx((r) => r.ip_is_private === true)).toBeLessThan(global)
+  })
+
+  it('Clash API: loopback only, with the per-start secret', () => {
+    const api = singbox({}, { clashSecret: 'f00d' }).experimental?.clash_api
+    expect(api).toMatchObject({ external_controller: '127.0.0.1:19090', secret: 'f00d' })
   })
 
   it('default_mode follows the saved routing mode', () => {
@@ -405,13 +445,26 @@ describe('real core validation', () => {
     check(XRAY, ['run', '-test', '-c', file])
   })
 
+  /** slot files of `rules` written into the temp folder (check reads local rule-sets) */
+  function writeSlots(rules: RulesConfig, name: string) {
+    const dir = join(tmp, name)
+    mkdirSync(dir, { recursive: true })
+    const { slots, files } = slotsFor(rules, dir)
+    for (const [f, text] of Object.entries(files)) writeFileSync(join(dir, f), text)
+    return slots
+  }
+
   for (const mode of ['system', 'tun'] as const) {
     for (const routingMode of ['rule', 'global', 'direct'] as const) {
       it.skipIf(!existsSync(SINGBOX))(`sing-box check accepts ${mode}/${routingMode}`, () => {
         const file = join(tmp, `sing-box-${mode}-${routingMode}.json`)
         const cfg = singbox(
           { proxyMode: mode, routingMode, verboseLog: routingMode === 'global' },
-          { serverIps: SERVER_IPS, latencies: { [outbounds[0].id]: null } }
+          {
+            serverIps: SERVER_IPS,
+            latencies: { [outbounds[0].id]: null },
+            slots: writeSlots(TEST_RULES, `slots-${mode}-${routingMode}`)
+          }
         )
         writeFileSync(file, JSON.stringify(cfg, null, 2))
         check(SINGBOX, ['check', '-c', file])
@@ -436,40 +489,70 @@ describe('real core validation', () => {
     const cfg = generateSingboxConfig({
       outbounds,
       activeOutboundId: 'auto',
-      rules: {
-        defaultBehavior: 'proxy',
-        rules: [
-          {
-            id: '1',
-            enabled: true,
-            conditionType: 'DomainRegex',
-            value: '^(.+\\.)?ads\\.',
-            action: 'REJECT'
-          },
-          {
-            id: '2',
-            enabled: true,
-            conditionType: 'DstPort',
-            value: '6881-6889',
-            action: 'DIRECT'
-          },
-          { id: '3', enabled: true, conditionType: 'DstPort', value: '22', action: 'DIRECT' },
-          {
-            id: '4',
-            enabled: true,
-            conditionType: 'IPCIDR',
-            value: '2001:db8::/32',
-            action: 'DIRECT'
-          },
-          { id: '5', enabled: true, conditionType: 'GeoIP', value: 'lan', action: 'DIRECT' }
-        ]
-      },
+      slots: writeSlots(
+        {
+          defaultBehavior: 'auto',
+          rules: [
+            {
+              id: '1',
+              enabled: true,
+              conditionType: 'DomainRegex',
+              value: '^(.+\\.)?ads\\.',
+              action: 'REJECT'
+            },
+            {
+              id: '2',
+              enabled: true,
+              conditionType: 'DstPort',
+              value: '6881-6889',
+              action: 'DIRECT'
+            },
+            { id: '3', enabled: true, conditionType: 'DstPort', value: '22', action: 'DIRECT' },
+            {
+              id: '4',
+              enabled: true,
+              conditionType: 'IPCIDR',
+              value: '2001:db8::/32',
+              action: 'DIRECT'
+            },
+            { id: '5', enabled: true, conditionType: 'GeoIP', value: 'lan', action: 'DIRECT' },
+            {
+              id: '6',
+              enabled: true,
+              conditionType: 'ProcessName',
+              value: 'discord.exe',
+              action: 'PROXY'
+            },
+            {
+              id: '7',
+              enabled: true,
+              conditionType: 'ProcessPath',
+              value: 'C:\\Games (x86)\\g+1.exe',
+              action: 'DIRECT'
+            },
+            {
+              id: '8',
+              enabled: true,
+              conditionType: 'GeoIP',
+              value: 'telegram',
+              action: 'Germany'
+            },
+            {
+              id: '9',
+              enabled: true,
+              conditionType: 'GeoSite',
+              value: 'category-ads-all',
+              action: 'REJECT'
+            }
+          ]
+        },
+        'slots-imported'
+      ),
       settings: TEST_SETTINGS,
       socksPort: 10808,
       httpPort: 10809,
       clashApiPort: 19090,
       logFile: 'l',
-      cacheFile: 'c',
       xrayPorts
     })
     writeFileSync(file, JSON.stringify(cfg, null, 2))

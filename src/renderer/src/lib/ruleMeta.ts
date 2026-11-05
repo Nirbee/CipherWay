@@ -16,7 +16,8 @@ export const CONDITION_META: Record<RuleConditionType, CondMeta> = {
     clash: 'PROCESS-NAME',
     placeholder: 'Telegram.exe',
     tone: 'blue',
-    mono: true
+    mono: true,
+    hint: 'Регистр букв не важен: discord.exe = Discord.exe'
   },
   ProcessPath: {
     label: 'Путь к программе',
@@ -47,7 +48,14 @@ export const CONDITION_META: Record<RuleConditionType, CondMeta> = {
     hint: 'Регулярное выражение'
   },
   GeoSite: { label: 'Набор сайтов', clash: 'GEOSITE', placeholder: 'youtube', tone: 'amber', mono: true },
-  GeoIP: { label: 'Страна по IP', clash: 'GEOIP', placeholder: 'ru', tone: 'amber', mono: true },
+  GeoIP: {
+    label: 'Страна по IP',
+    clash: 'GEOIP',
+    placeholder: 'ru',
+    tone: 'amber',
+    mono: true,
+    hint: 'Код страны или telegram — все адреса Telegram (встроенный список)'
+  },
   IPCIDR: {
     label: 'IP-подсеть',
     clash: 'IP-CIDR',
@@ -93,7 +101,19 @@ export const GEOSITE_CATEGORIES = [
 ]
 
 // ISO country codes commonly used with geoip:<cc>.
-export const GEOIP_CATEGORIES = ['ru', 'private', 'by', 'kz', 'ua', 'cn', 'us', 'de', 'nl', 'fi']
+export const GEOIP_CATEGORIES = [
+  'ru',
+  'telegram',
+  'private',
+  'by',
+  'kz',
+  'ua',
+  'cn',
+  'us',
+  'de',
+  'nl',
+  'fi'
+]
 
 export type ActionTone = 'blue' | 'green' | 'red' | 'neutral'
 

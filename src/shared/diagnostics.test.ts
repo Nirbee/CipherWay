@@ -13,7 +13,8 @@ const settings: AppSettings = {
   httpPort: 10809,
   subscriptionRefreshHours: 12,
   verboseLog: false,
-  apiBase: 'https://cabinet.example.com'
+  apiBase: 'https://cabinet.example.com',
+  tunService: true
 }
 const logs: LogEntry[] = Array.from({ length: 500 }, (_, i) => ({
   ts: Date.UTC(2026, 10, 4, 12, 0, i % 60),

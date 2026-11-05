@@ -15,7 +15,8 @@ import type {
   SupportPhoto,
   SupportSendResult,
   SupportView,
-  TrafficStats
+  TrafficStats,
+  TunServiceInfo
 } from './types'
 
 export const IPC = {
@@ -65,6 +66,13 @@ export const IPC = {
   // settings
   settingsGet: 'settings:get',
   settingsSet: 'settings:set',
+
+  // «Служба TUN»: Task Scheduler task for TUN without a UAC prompt per connect
+  tunServiceStatus: 'tun:serviceStatus',
+  /** one UAC prompt; also turns the service mode back on */
+  tunServiceInstall: 'tun:serviceInstall',
+  /** one UAC prompt; TUN asks for admin rights on every connect afterwards */
+  tunServiceRemove: 'tun:serviceRemove',
 
   // cipherway:// deep links (import a subscription)
   deeplinkTakePending: 'deeplink:takePending',
@@ -163,6 +171,11 @@ export interface ExposedApi {
   settings: {
     get: () => Promise<AppSettings>
     set: (patch: Partial<AppSettings>) => Promise<AppSettings>
+  }
+  tunService: {
+    status: () => Promise<TunServiceInfo>
+    install: () => Promise<TunServiceInfo>
+    remove: () => Promise<TunServiceInfo>
   }
   deeplink: {
     /** returns (and clears) the pending cipherway:// import, if any */

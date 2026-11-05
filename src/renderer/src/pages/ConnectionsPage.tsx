@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import type { ConnItem, ConnSnapshot } from '@shared/types'
+import type { ConnItem, ConnSnapshot, FailedDirect, RoutingRule } from '@shared/types'
 import { PageHeader } from '../components/PageHeader'
 import { EmptyState } from '../components/EmptyState'
 import { Button, Input } from '../components/ui'
@@ -15,6 +15,7 @@ import {
   SearchIcon
 } from '../components/icons'
 import { useConnection } from '../store/connectionStore'
+import { useRules } from '../store/rulesStore'
 import { useProcessIcon } from '../hooks/useProcessIcon'
 import { toast } from '../store/toastStore'
 import { errorText, formatBytes, formatDuration, formatSpeed } from '../lib/format'
@@ -214,6 +215,8 @@ export function ConnectionsPage() {
         </div>
       )}
 
+      {snap?.failed && snap.failed.length > 0 && <FailedDirectPanel failed={snap.failed} />}
+
       <div className="mx-7 mb-6 flex min-h-0 flex-1 overflow-hidden rounded-card border border-border-default bg-bg-panel">
         {groups.length === 0 ? (
           <EmptyState
@@ -250,6 +253,98 @@ export function ConnectionsPage() {
             {current && <GroupDetail g={current} by={effectiveBy} />}
           </>
         )}
+      </div>
+    </div>
+  )
+}
+
+const IPV4_RE = /^\d{1,3}(\.\d{1,3}){3}$/
+
+/** The rule that would send this address through the VPN. */
+function vpnRuleFor(f: FailedDirect): Omit<RoutingRule, 'id'> {
+  if (f.telegram) return { enabled: true, conditionType: 'GeoIP', value: 'telegram', action: 'PROXY' }
+  if (IPV4_RE.test(f.host) || f.host.includes(':'))
+    return { enabled: true, conditionType: 'IPCIDR', value: f.host, action: 'PROXY' }
+  return { enabled: true, conditionType: 'DomainSuffix', value: f.host, action: 'PROXY' }
+}
+
+function ruleText(r: Omit<RoutingRule, 'id'>): string {
+  if (r.conditionType === 'GeoIP') return 'адреса Telegram'
+  return r.conditionType === 'IPCIDR' ? `IP ${r.value}` : `сайт ${r.value}`
+}
+
+/**
+ * Connections that went «напрямую» and timed out: in Russia that is almost
+ * always a blocked address. One click adds a «через VPN» rule at the top.
+ */
+function FailedDirectPanel({ failed }: { failed: FailedDirect[] }) {
+  const [open, setOpen] = useState(false)
+  const [added, setAdded] = useState<Set<string>>(new Set())
+  const { prependRule, rules, loaded, load } = useRules()
+  useEffect(() => {
+    if (!loaded) void load()
+  }, [loaded, load])
+  const hasTelegramRule = rules.some(
+    (r) => r.enabled && r.conditionType === 'GeoIP' && r.value.toLowerCase() === 'telegram'
+  )
+  const shown = open ? failed : failed.slice(0, 3)
+
+  const add = async (f: FailedDirect) => {
+    const rule = vpnRuleFor(f)
+    try {
+      await prependRule(rule)
+      setAdded((s) => new Set(s).add(`${rule.conditionType}:${rule.value}`))
+      toast(`Правило добавлено: ${ruleText(rule)} → через VPN. Применится через секунду.`, 'success')
+    } catch (e) {
+      toast(errorText(e), 'error')
+    }
+  }
+
+  return (
+    <div className="mx-7 mb-3 rounded-xl border border-accent-amber/30 bg-accent-amber/[0.07] px-3.5 py-2.5">
+      <div className="flex items-start gap-2 text-[11px] leading-relaxed text-accent-amber">
+        <InfoIcon width={14} height={14} className="mt-px shrink-0" />
+        <span className="flex-1">
+          Не удалось подключиться напрямую (нет ответа): {failed.length}{' '}
+          {failed.length === 1 ? 'адрес' : 'адресов'}. Возможно, они заблокированы — добавьте правило
+          «через VPN».
+        </span>
+        {failed.length > 3 && (
+          <button
+            onClick={() => setOpen((v) => !v)}
+            className="shrink-0 rounded-lg px-2 font-medium hover:bg-accent-amber/15"
+          >
+            {open ? 'Свернуть' : 'Показать все'}
+          </button>
+        )}
+      </div>
+      <div className="mt-1.5 space-y-1">
+        {shown.map((f) => {
+          const rule = vpnRuleFor(f)
+          const key = `${rule.conditionType}:${rule.value}`
+          const done = added.has(key) || (f.telegram && hasTelegramRule)
+          return (
+            <div key={`${f.host}:${f.port}`} className="flex items-center gap-3 text-[11px]">
+              <span className="min-w-0 flex-1 truncate font-mono text-text-secondary select-text">
+                {f.host}
+                <span className="text-text-faint">:{f.port}</span>
+                <span className="ml-2 font-sans text-text-faint">
+                  {f.process ?? 'программа неизвестна'}
+                  {f.telegram ? ' · Telegram' : ''} · {f.count} раз
+                </span>
+              </span>
+              <Button
+                size="sm"
+                variant="secondary"
+                className="h-6 shrink-0 px-2 text-[11px]"
+                disabled={done}
+                onClick={() => void add(f)}
+              >
+                {done ? 'Добавлено' : f.telegram ? 'Telegram через VPN' : 'Через VPN'}
+              </Button>
+            </div>
+          )
+        })}
       </div>
     </div>
   )
@@ -367,6 +462,11 @@ function GroupDetail({ g, by }: { g: Group; by: GroupBy }) {
                 <RouteBadge c={c} />
                 <span className="truncate">{c.rule}</span>
               </div>
+              {c.stalled && (
+                <div className="mt-0.5 text-[10px] text-accent-amber">
+                  Нет ответа — возможно, этот адрес заблокирован. Добавьте правило «через VPN».
+                </div>
+              )}
             </div>
             <div className="text-right font-mono text-[10px] leading-relaxed tabular-nums text-text-faint">
               <div>

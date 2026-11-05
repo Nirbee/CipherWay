@@ -150,6 +150,17 @@ export interface AppSettings {
   verboseLog: boolean
   /** in-app support API (cabinet), https only */
   apiBase: string
+  /**
+   * TUN through the «Служба TUN» task (one UAC prompt to set up, then none).
+   * false = the user removed it: a UAC prompt on every TUN connect.
+   */
+  tunService: boolean
+}
+
+/** «Служба TUN» (Task Scheduler) as seen by the app. */
+export interface TunServiceInfo {
+  state: 'ok' | 'missing' | 'outdated'
+  detail?: string
 }
 
 export const DEFAULT_API_BASE = 'https://cabinet.cipherway.net.ru'
@@ -225,6 +236,8 @@ export interface ConnItem {
   route: ConnRouteKind
   /** server name when route === 'proxy' */
   serverName?: string
+  /** direct, nothing received yet and several seconds old — likely blocked */
+  stalled?: boolean
   upload: number
   download: number
   /** bytes/s since the previous snapshot */
@@ -234,11 +247,30 @@ export interface ConnItem {
   start: number
 }
 
+/**
+ * A destination the core could not reach DIRECTLY (dial timeout) — in Russia
+ * that usually means it is blocked and needs a «через VPN» rule.
+ */
+export interface FailedDirect {
+  /** IP or host name */
+  host: string
+  port: string
+  /** exe name, if a live connection to it was seen with a known process */
+  process?: string
+  count: number
+  /** ms timestamp of the last failure */
+  last: number
+  /** the address belongs to Telegram (suggest GEOIP,telegram) */
+  telegram?: boolean
+}
+
 export interface ConnSnapshot {
   /** false = VPN not connected, list is empty */
   running: boolean
   proxyMode: ProxyMode
   items: ConnItem[]
+  /** direct connections that timed out recently (newest first) */
+  failed?: FailedDirect[]
 }
 
 // ---------------------------------------------------------------------------

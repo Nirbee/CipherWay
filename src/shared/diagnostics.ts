@@ -34,6 +34,7 @@ export function buildDiagnostics(d: DiagnosticsInput, maxChars = Infinity, maxLi
         autoLaunch: s.autoLaunch,
         autoConnect: s.autoConnect,
         verboseLog: s.verboseLog,
+        tunService: s.tunService,
         supportUrl: s.supportUrl ? 'задана' : ''
       }
     : null

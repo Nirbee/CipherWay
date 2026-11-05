@@ -16,6 +16,8 @@ interface RulesStore {
   persist: () => Promise<void>
 
   addRule: (rule: Omit<RoutingRule, 'id'>) => Promise<void>
+  /** add at the top (checked before everything else) */
+  prependRule: (rule: Omit<RoutingRule, 'id'>) => Promise<void>
   updateRule: (id: string, patch: Partial<RoutingRule>) => Promise<void>
   removeRule: (id: string) => Promise<void>
   toggleRule: (id: string) => Promise<void>
@@ -60,6 +62,12 @@ export const useRules = create<RulesStore>((set, get) => ({
 
   addRule: async (rule) => {
     set((s) => ({ rules: [...s.rules, { ...rule, id: newId() }] }))
+    await get().persist()
+  },
+
+  prependRule: async (rule) => {
+    if (!get().loaded) await get().load()
+    set((s) => ({ rules: [{ ...rule, id: newId() }, ...s.rules] }))
     await get().persist()
   },
 

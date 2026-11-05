@@ -14,7 +14,8 @@ import type {
   StatusUpdate,
   SubscriptionData,
   SubscriptionView,
-  SupportView
+  SupportView,
+  TunServiceInfo
 } from '@shared/types'
 import { LogBatcher } from '@shared/logBuffer'
 import { DEFAULT_SETTINGS, getSettings, store } from '../store'
@@ -24,7 +25,7 @@ import { toSubscriptionView } from '../remnawave/view'
 import { getSubscriptionUrl } from '../secrets'
 import { createMasker, type Masker } from '../mask'
 import { SidecarManager } from '../core/SidecarManager'
-import { toConnItems } from '../core/connections'
+import { nodeAddressSet, toConnItems } from '../core/connections'
 import { AppUpdater } from '../updater/AppUpdater'
 import {
   SUPPORT_CAPTION_MAX,
@@ -49,6 +50,9 @@ export interface HandlerHooks {
   /** icon for Windows notifications */
   notificationIcon?: string
 }
+
+/** rules are applied to the running core this long after the last edit */
+const RULES_DEBOUNCE_MS = 700
 
 // --- zod validation schemas for inbound IPC payloads ----------------------
 
@@ -287,6 +291,13 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
   // ---- connection --------------------------------------------------------
   connectImpl = async (outboundId?: string): Promise<StatusUpdate> => {
     if (outboundId) store.set('activeOutboundId', z.string().max(100).parse(outboundId))
+    // already connected: just switch the server (start() would be a no-op)
+    if (manager.isRunning) {
+      if (outboundId && !(await manager.selectServer(outboundId))) {
+        await manager.reload(buildStartParams()).catch(() => undefined)
+      }
+      return status
+    }
     try {
       await manager.start(buildStartParams())
     } catch (err) {
@@ -379,11 +390,18 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
     const raw = await api.connections()
     if (!raw) return snapshot
     const now = Date.now()
+    const outbounds = remnawave.getCached()?.outbounds ?? []
     snapshot.items = toConnItems(raw, {
-      outbounds: remnawave.getCached()?.outbounds ?? [],
+      outbounds,
       prev: prevConn,
-      now
+      now,
+      labels: manager.labels
     })
+    manager.failures.noteConnections(snapshot.items, now)
+    snapshot.failed = manager.failures.list(
+      new Set([...nodeAddressSet(outbounds), ...serverIps]),
+      now
+    )
     prevConn.clear()
     for (const c of snapshot.items) {
       prevConn.set(c.id, { upload: c.upload, download: c.download, ts: now })
@@ -416,13 +434,23 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
   })
 
   // ---- rules -------------------------------------------------------------
+  // Saved at once; applied to the running core ~0.7 s after the last change
+  // (one application for a burst of edits / drag & drop), without a restart.
+  let rulesTimer: NodeJS.Timeout | null = null
+  const scheduleRulesApply = (): void => {
+    if (rulesTimer) clearTimeout(rulesTimer)
+    rulesTimer = setTimeout(() => {
+      rulesTimer = null
+      if (manager.isRunning) void manager.applyRules(buildStartParams()).catch(() => undefined)
+    }, RULES_DEBOUNCE_MS)
+  }
+
   ipcMain.handle(IPC.rulesGet, async (): Promise<RulesConfig> => store.get('rules'))
 
   ipcMain.handle(IPC.rulesSet, async (_e, config: unknown) => {
     const parsed = rulesConfigSchema.parse(config)
     store.set('rules', parsed)
-    // hot-reload the running cores so routing changes apply immediately
-    if (manager.isRunning) await manager.reload(buildStartParams()).catch(() => undefined)
+    scheduleRulesApply()
   })
 
   ipcMain.handle(IPC.rulesExport, async (): Promise<string | null> => {
@@ -448,7 +476,7 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
     const raw = await readFile(filePaths[0], 'utf8')
     const parsed = rulesConfigSchema.parse(JSON.parse(raw))
     store.set('rules', parsed)
-    if (manager.isRunning) await manager.reload(buildStartParams()).catch(() => undefined)
+    scheduleRulesApply()
     return parsed
   })
 
@@ -525,6 +553,31 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
     }
     if (parsed.apiBase && parsed.apiBase !== prev.apiBase) support.reset()
     return next
+  })
+
+  // ---- «Служба TUN» (Task Scheduler) --------------------------------------
+  const setTunService = (on: boolean): void => {
+    const next = { ...getSettings(), tunService: on }
+    store.set('settings', next)
+    publishSettings(next)
+  }
+  ipcMain.handle(IPC.tunServiceStatus, async (): Promise<TunServiceInfo> =>
+    manager.tunServiceStatus()
+  )
+  ipcMain.handle(IPC.tunServiceInstall, async (): Promise<TunServiceInfo> => {
+    const res = await manager.installTunService()
+    if (res === 'cancelled') throw new Error('Запрос прав администратора отклонён')
+    if (res === 'failed') throw new Error('Не удалось установить службу — подробности в «Журнале»')
+    setTunService(true)
+    return manager.tunServiceStatus()
+  })
+  ipcMain.handle(IPC.tunServiceRemove, async (): Promise<TunServiceInfo> => {
+    const res = await manager.removeTunService()
+    if (res === 'cancelled') throw new Error('Запрос прав администратора отклонён')
+    if (res === 'failed') throw new Error('Не удалось удалить службу')
+    // from now on TUN asks for admin rights on every connect, until reinstalled
+    setTunService(false)
+    return manager.tunServiceStatus()
   })
 
   // ---- support chat ------------------------------------------------------

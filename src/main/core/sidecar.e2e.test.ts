@@ -8,16 +8,35 @@
 // never touched. TUN itself needs UAC and is not started here; the TUN broker
 // runs non-elevated with a TUN-less sing-box config.
 import { execFile, spawn, type ChildProcess } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { createHash, randomBytes } from 'node:crypto'
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
-import type { AutoInfo, OutboundConfig, ServerPing, StatusUpdate } from '@shared/types'
+import type {
+  AutoInfo,
+  OutboundConfig,
+  RoutingRule,
+  RulesConfig,
+  ServerPing,
+  StatusUpdate
+} from '@shared/types'
 import { TEST_RULES, TEST_SETTINGS } from './fixtures'
 
 const tmp = mkdtempSync(join(tmpdir(), 'cw-e2e-'))
 
-vi.mock('electron', () => ({ app: { isPackaged: false, getPath: () => tmp } }))
+vi.mock('electron', () => ({
+  app: { isPackaged: false, getPath: () => tmp, getVersion: () => '0.0.0-e2e' }
+}))
 vi.mock('../system/proxy', () => ({
   enableSystemProxy: vi.fn(async () => undefined),
   disableSystemProxy: vi.fn(async () => undefined)
@@ -275,6 +294,51 @@ describe.skipIf(!enabled)('SidecarManager with real cores', () => {
     }
   }, 60_000)
 
+  it('«Лучший сервер»: a silent node (accepts, never answers) is no reason for «no server answers»', async () => {
+    // 0.4.1 decided after 8 s; sing-box publishes `now` only when its slowest
+    // member is done (a silent node: ~15 s) — and /group/delay is a no-op until then
+    const { createServer } = await import('node:net')
+    const sockets: import('node:net').Socket[] = []
+    const silentSrv = createServer((s) => {
+      sockets.push(s)
+      s.on('error', () => undefined)
+    })
+    await new Promise<void>((r) => silentSrv.listen(27_471, '127.0.0.1', () => r()))
+    const silent: OutboundConfig = { ...live, id: 'ob_silent', name: 'Silent', port: 27_471 }
+    const { SidecarManager } = await import('./SidecarManager')
+    const autos: { a: AutoInfo; t: number }[] = []
+    const logs: string[] = []
+    const t0 = Date.now()
+    const m = new SidecarManager(
+      (e) => logs.push(e.message),
+      () => undefined,
+      () => undefined,
+      (a) => autos.push({ a, t: Date.now() - t0 })
+    )
+    try {
+      await m.start({
+        outbounds: [silent, live],
+        activeOutboundId: 'auto',
+        rules: TEST_RULES,
+        settings: { ...TEST_SETTINGS, httpPort: HTTP_PORT },
+        // the silent node first, as if it had been the fastest last time
+        latencies: { ob_silent: 10, ob_live: 50 }
+      })
+      const done = await waitFor(
+        () => autos.at(-1)!.a,
+        (a) => !a.checking,
+        45_000
+      )
+      console.log('auto check done after', autos.at(-1)!.t, 'ms')
+      expect(done).toMatchObject({ checking: false, dead: false, nodeId: 'ob_live' })
+      expect(logs.some((l) => l.startsWith('Ни один сервер не ответил'))).toBe(false)
+    } finally {
+      await m.stop()
+      for (const s of sockets) s.destroy()
+      silentSrv.close()
+    }
+  }, 90_000)
+
   it('xray dials the pre-resolved node IP from dns.hosts (no system DNS for the node)', async () => {
     const { generateXrayConfig } = await import('./xrayGen')
     // a name no DNS server knows: the request only works through the pin
@@ -313,19 +377,24 @@ describe.skipIf(!enabled)('SidecarManager with real cores', () => {
   it('TUN config with real DNS answers passes sing-box check (route_exclude_address)', async () => {
     const { generateSingboxConfig } = await import('./configGen')
     const { resolveServers } = await import('../system/resolve')
+    const { groupsFor, layoutRules, planRules } = await import('../rules/compile')
     const node: OutboundConfig = { ...live, server: 'www.gstatic.com', port: 443 }
     const ips = await resolveServers([node])
     expect(ips['www.gstatic.com']?.length).toBeGreaterThan(0)
+    const dir = join(tmp, 'tun-check-rules')
+    mkdirSync(dir, { recursive: true })
+    const plan = planRules(TEST_RULES, [node])
+    const layout = layoutRules(plan, groupsFor(plan), new Map())!
+    for (const [f, t] of Object.entries(layout.files)) writeFileSync(join(dir, f), t)
     const cfg = generateSingboxConfig({
       outbounds: [node],
       activeOutboundId: 'auto',
-      rules: TEST_RULES,
+      slots: { groups: groupsFor(plan), dir, selectors: layout.selectors },
       settings: { ...TEST_SETTINGS, proxyMode: 'tun' },
       socksPort: 1,
       httpPort: 2,
       clashApiPort: 3,
       logFile: 'l',
-      cacheFile: 'c',
       xrayPorts: { [node.id]: 4 },
       serverIps: ips
     })
@@ -439,4 +508,598 @@ describe.skipIf(!enabled)('SidecarManager with real cores', () => {
       if (/^\d+$/.test(pid)) process.kill(Number(pid))
     }
   }, 90_000)
+
+  // --- 0.4.2 ---------------------------------------------------------------
+
+  const rule = (
+    conditionType: RoutingRule['conditionType'],
+    value: string,
+    action: string
+  ): RoutingRule => ({
+    id: `${conditionType}-${value}-${action}`,
+    enabled: true,
+    conditionType,
+    value,
+    action
+  })
+
+  /** a slow download through the mixed inbound → the live connection of curl.exe */
+  async function curlConn(
+    m: { clash: { connections: () => Promise<unknown> } | null },
+    labels: () => Record<string, string>
+  ) {
+    const { toConnItems } = await import('./connections')
+    const slow = curl([
+      '-s',
+      '-o',
+      'NUL',
+      '-x',
+      `http://127.0.0.1:${HTTP_PORT}`,
+      '--limit-rate',
+      '20k',
+      '--max-time',
+      '4',
+      'https://speed.cloudflare.com/__down?bytes=400000'
+    ])
+    const found = await waitFor(
+      async () => {
+        const raw = (await m.clash?.connections()) ?? {}
+        return toConnItems(raw as never, {
+          outbounds: [live, dead],
+          prev: new Map(),
+          now: Date.now(),
+          labels: labels()
+        }).find((i) => i.host === 'speed.cloudflare.com')
+      },
+      (c) => !!c && (c.route !== 'direct' || c.download > 0 || c.rule !== ''),
+      8000
+    )
+    await slow
+    return found
+  }
+
+  it('rules change on the fly: same sing-box process, new route; process names ignore case', async () => {
+    const { SidecarManager } = await import('./SidecarManager')
+    const states: StatusUpdate['state'][] = []
+    const logs: string[] = []
+    const m = new SidecarManager(
+      (e) => logs.push(e.message),
+      (s) => states.push(s),
+      () => undefined
+    )
+    const params = (rules: RulesConfig) => ({
+      outbounds: [live, dead],
+      activeOutboundId: 'ob_live',
+      rules,
+      settings: { ...TEST_SETTINGS, httpPort: HTTP_PORT, routingMode: 'rule' as const }
+    })
+    // Koala-style lower/upper case: the process is curl.exe
+    await m.start(
+      params({ defaultBehavior: 'proxy', rules: [rule('ProcessName', 'CURL.EXE', 'DIRECT')] })
+    )
+    try {
+      expect(states.at(-1)).toBe('connected')
+      const pid = m.corePid
+      expect(pid).toBeGreaterThan(0)
+
+      const c1 = await curlConn(m, () => m.labels)
+      expect(c1).toMatchObject({ route: 'direct', rule: 'программа CURL.EXE' })
+
+      // the same program → through the VPN (a named server), applied without a restart
+      await m.applyRules(
+        params({ defaultBehavior: 'proxy', rules: [rule('ProcessName', 'Curl.Exe', 'Live')] })
+      )
+      expect(m.corePid).toBe(pid)
+      const c2 = await curlConn(m, () => m.labels)
+      expect(c2).toMatchObject({ route: 'proxy', serverName: 'Live', rule: 'программа Curl.Exe' })
+
+      // first match wins: a DIRECT domain rule above the process rule
+      await m.applyRules(
+        params({
+          defaultBehavior: 'proxy',
+          rules: [
+            rule('DomainSuffix', 'cloudflare.com', 'DIRECT'),
+            rule('ProcessName', 'curl.exe', 'PROXY')
+          ]
+        })
+      )
+      expect(m.corePid).toBe(pid)
+      const c3 = await curlConn(m, () => m.labels)
+      expect(c3).toMatchObject({ route: 'direct', rule: 'домен cloudflare.com' })
+
+      // only «Всё остальное» changes: a selector switch, still the same process
+      await m.applyRules(params({ defaultBehavior: 'direct', rules: [] }))
+      expect(m.corePid).toBe(pid)
+      const c4 = await curlConn(m, () => m.labels)
+      expect(c4).toMatchObject({ route: 'direct', rule: 'Всё остальное' })
+      await m.applyRules(params({ defaultBehavior: 'proxy', rules: [] }))
+      const c5 = await curlConn(m, () => m.labels)
+      expect(c5).toMatchObject({ route: 'proxy', serverName: 'Live' })
+
+      // REJECT: the request fails at once
+      await m.applyRules(
+        params({ defaultBehavior: 'proxy', rules: [rule('Domain', 'www.gstatic.com', 'REJECT')] })
+      )
+      const code = await curl([
+        '-s',
+        '-o',
+        'NUL',
+        '-w',
+        '%{http_code}',
+        '-x',
+        `http://127.0.0.1:${HTTP_PORT}`,
+        '--max-time',
+        '4',
+        'https://www.gstatic.com/generate_204'
+      ])
+      expect(code).not.toBe('204')
+      expect(m.corePid).toBe(pid)
+      expect(logs).toContain('Правила применены без переподключения')
+      expect(states).not.toContain('error')
+    } finally {
+      await m.stop()
+    }
+  }, 90_000)
+
+  it('a core that fails to start ends in «error» with its reason (not stuck «connecting»)', async () => {
+    const { SidecarManager } = await import('./SidecarManager')
+    const states: [StatusUpdate['state'], string | undefined][] = []
+    const m = new SidecarManager(
+      () => undefined,
+      (s, msg) => states.push([s, msg]),
+      () => undefined
+    )
+    const broken: OutboundConfig = {
+      id: 'ob_bad',
+      name: 'Bad',
+      protocol: 'hysteria2',
+      server: '127.0.0.1',
+      port: 1,
+      password: 'x',
+      obfs: 'bogus'
+    }
+    await expect(
+      m.start({
+        outbounds: [broken],
+        activeOutboundId: 'auto',
+        rules: TEST_RULES,
+        settings: { ...TEST_SETTINGS, httpPort: HTTP_PORT }
+      })
+    ).rejects.toThrow(/obfs/)
+    expect(states.at(-1)?.[0]).toBe('error')
+    expect(states.at(-1)?.[1]).toMatch(/^Ядро sing-box не запустилось: create service: .*obfs/)
+    expect(m.isRunning).toBe(false)
+  }, 60_000)
+
+  it('one queue: parallel connects / rule changes never start two cores', async () => {
+    const { SidecarManager } = await import('./SidecarManager')
+    const states: StatusUpdate['state'][] = []
+    const logs: string[] = []
+    const m = new SidecarManager(
+      (e) => logs.push(e.message),
+      (s) => states.push(s),
+      () => undefined
+    )
+    const p = {
+      outbounds: [live, dead],
+      activeOutboundId: 'auto',
+      rules: TEST_RULES,
+      settings: { ...TEST_SETTINGS, httpPort: HTTP_PORT }
+    }
+    try {
+      await Promise.all([m.start(p), m.start(p), m.applyRules(p), m.start(p), m.applyRules(p)])
+      expect(m.isRunning).toBe(true)
+      const cmdLines = (exe: string): Promise<string> =>
+        new Promise((res) =>
+          execFile(
+            'powershell.exe',
+            [
+              '-NoProfile',
+              '-Command',
+              `Get-CimInstance Win32_Process -Filter "Name='${exe}'" | ForEach-Object { $_.ProcessId.ToString() + ' ' + $_.CommandLine }`
+            ],
+            { windowsHide: true },
+            (_e, out) => res(String(out))
+          )
+        )
+      const count = (exe: string): Promise<number> =>
+        new Promise((res) =>
+          execFile(
+            'powershell.exe',
+            [
+              '-NoProfile',
+              '-Command',
+              `@(Get-CimInstance Win32_Process -Filter "Name='${exe}'" | Where-Object { $_.CommandLine -like '*${join(tmp, 'run').replace(/'/g, "''")}*' }).Count`
+            ],
+            { windowsHide: true },
+            (_e, out) => res(Number(String(out).trim()))
+          )
+        )
+      const n = await count('sing-box.exe')
+      if (n !== 1) console.log(await cmdLines('sing-box.exe'))
+      expect(n).toBe(1)
+      expect(await count('xray.exe')).toBe(1)
+      expect(states.filter((s) => s === 'connected')).toHaveLength(1)
+      expect(logs.filter((l) => l.startsWith('Запуск xray'))).toHaveLength(1)
+      expect(logs.some((l) => /Не удалось запустить ядро Xray/.test(l))).toBe(false)
+      // a stop issued while a start waits in the queue cancels it
+      await m.stop()
+      const queued = m.start(p)
+      const stopping = m.stop()
+      await Promise.all([queued, stopping])
+      expect(m.isRunning).toBe(false)
+      expect(states.at(-1)).toBe('disconnected')
+      expect(states).not.toContain('error')
+    } finally {
+      await m.stop()
+    }
+  }, 90_000)
+
+  describe('«Служба TUN» broker (run without elevation, temp folders)', () => {
+    const sha = (f: string) => createHash('sha256').update(readFileSync(f)).digest('hex')
+    const sid = 'S-1-5-21-1000000001-1000000002-1000000003-1001'
+    const root = join(tmp, 'ProgramData', 'CipherWay')
+    const home = join(root, 'u', sid)
+    const userRun = join(tmp, 'пользователь', 'run')
+    const clashPort = 27_461
+    const f = (n: string) => join(home, n)
+
+    // (not at collection time: the suite is skipped without CW_E2E)
+    beforeAll(() => {
+      for (const d of [join(root, 'bin'), join(home, 'rules'), join(userRun, 'rules')]) {
+        mkdirSync(d, { recursive: true })
+      }
+    })
+
+    async function broker(): Promise<ChildProcess> {
+      const { serviceBrokerScript } = await import('./serviceScripts')
+      for (const n of ['sing-box.exe', 'wintun.dll']) {
+        if (!existsSync(join(root, 'bin', n))) copyFileSync(join(BIN, n), join(root, 'bin', n))
+      }
+      const script = serviceBrokerScript({
+        sid,
+        userRunDir: userRun,
+        hashes: { 'sing-box.exe': sha(SINGBOX), 'wintun.dll': sha(join(BIN, 'wintun.dll')) },
+        rootOverride: root
+      })
+      writeFileSync(f('broker.ps1'), '\ufeff' + script)
+      return spawn(
+        'powershell.exe',
+        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', f('broker.ps1')],
+        {
+          windowsHide: true
+        }
+      )
+    }
+    const state = () => {
+      try {
+        return JSON.parse(readFileSync(f('state.json'), 'utf8').replace(/^\ufeff/, ''))
+      } catch {
+        return null
+      }
+    }
+    const ctl = (c: object) => writeFileSync(join(userRun, 'tun-ctl.json'), JSON.stringify(c))
+    const goodConfig = () => ({
+      log: { level: 'warn', output: f('sing-box.log'), timestamp: true },
+      dns: { servers: [{ type: 'https', tag: 'local', server: '77.88.8.8' }], final: 'local' },
+      experimental: {
+        clash_api: { external_controller: `127.0.0.1:${clashPort}`, default_mode: 'Rule' }
+      },
+      inbounds: [],
+      outbounds: [{ type: 'direct', tag: 'direct' }],
+      route: {
+        rule_set: [
+          {
+            type: 'local',
+            tag: 'cw-0-d',
+            format: 'source',
+            path: join(home, 'rules', 'cw-0-d.json')
+          }
+        ],
+        rules: [{ rule_set: ['cw-0-d'], action: 'route', outbound: 'direct' }],
+        final: 'direct'
+      }
+    })
+
+    async function runOnce(
+      config: object,
+      ctlOver: object = {}
+    ): Promise<{ status: string; error: string; corePid: number }> {
+      writeFileSync(join(userRun, 'config.json'), JSON.stringify(config))
+      writeFileSync(
+        join(userRun, 'rules', 'cw-0-d.json'),
+        JSON.stringify({ version: 3, rules: [] })
+      )
+      const session = randomBytes(16).toString('hex')
+      ctl({
+        session,
+        pid: process.pid,
+        cmd: 'run',
+        restart: 0,
+        rules: 0,
+        ts: Date.now(),
+        ...ctlOver
+      })
+      const b = await broker()
+      await waitFor(
+        () => b.exitCode,
+        (c) => c !== null,
+        20_000
+      )
+      if (b.exitCode === null) b.kill()
+      const st = state()
+      return { status: st?.status, error: st?.error ?? '', corePid: st?.corePid ?? 0 }
+    }
+
+    it('full cycle: validated copy, rules synced on request, restart, stop', async () => {
+      const { ClashApi } = await import('./clashApi')
+      writeFileSync(join(userRun, 'config.json'), JSON.stringify(goodConfig()))
+      writeFileSync(
+        join(userRun, 'rules', 'cw-0-d.json'),
+        JSON.stringify({ version: 3, rules: [] })
+      )
+      const session = randomBytes(16).toString('hex')
+      const c = { session, pid: process.pid, cmd: 'run', restart: 0, rules: 0, ts: Date.now() }
+      ctl(c)
+      const b = await broker()
+      const api = new ClashApi(clashPort)
+      try {
+        const st = await waitFor(
+          state,
+          (s) => s?.session === session && s?.status === 'running',
+          20_000
+        )
+        expect(st?.status).toBe('running')
+        expect(await waitFor(() => api.ping(), Boolean, 15_000)).toBe(true)
+        // the core runs the protected copy, not the user's file
+        expect(readFileSync(f('config.json'), 'utf8')).toBe(
+          readFileSync(join(userRun, 'config.json'), 'utf8')
+        )
+        expect(existsSync(f(join('rules', 'cw-0-d.json')))).toBe(true)
+
+        // new rules: copied once asked (the core re-reads them itself)
+        const next = JSON.stringify({ version: 3, rules: [{ domain: ['example.com'] }] })
+        writeFileSync(join(userRun, 'rules', 'cw-0-d.json'), next)
+        writeFileSync(join(userRun, 'rules', 'evil.json'), next) // wrong name: ignored
+        writeFileSync(join(userRun, 'rules', 'cw-1-d.json'), 'not a rule-set') // wrong content: ignored
+        ctl({ ...c, rules: 1 })
+        expect((await waitFor(state, (s) => s?.rules === 1, 10_000))?.rules).toBe(1)
+        expect(readFileSync(f(join('rules', 'cw-0-d.json')), 'utf8')).toBe(next)
+        expect(existsSync(f(join('rules', 'evil.json')))).toBe(false)
+        expect(existsSync(f(join('rules', 'cw-1-d.json')))).toBe(false)
+
+        // restart on request: a new core process
+        const pid1 = state()?.corePid
+        ctl({ ...c, rules: 1, restart: 1 })
+        const st2 = await waitFor(state, (s) => s?.restart === 1 && s?.status === 'running', 15_000)
+        expect(st2?.corePid).not.toBe(pid1)
+        expect(await waitFor(() => api.ping(), Boolean, 15_000)).toBe(true)
+
+        // stop
+        ctl({ ...c, rules: 1, restart: 1, cmd: 'stop' })
+        await waitFor(
+          () => b.exitCode,
+          (x) => x !== null,
+          10_000
+        )
+        expect(state()?.status).toBe('stopped')
+        expect(await api.ping()).toBe(false)
+      } finally {
+        if (b.exitCode === null) b.kill()
+      }
+    }, 90_000)
+
+    it('accepts the real TUN config the app generates for the service', async () => {
+      const { generateSingboxConfig } = await import('./configGen')
+      const { groupsFor, layoutRules, planRules } = await import('../rules/compile')
+      const hy2: OutboundConfig = {
+        id: 'ob_hy',
+        name: 'HY2',
+        protocol: 'hysteria2',
+        server: 'hy.example.com',
+        port: 8443,
+        password: 'p',
+        sni: 'hy.example.com',
+        obfs: 'salamander',
+        obfsPassword: 'o'
+      }
+      const vm: OutboundConfig = {
+        id: 'ob_vm',
+        name: 'VM',
+        protocol: 'vmess',
+        server: '198.51.100.9',
+        port: 443,
+        uuid: UUID,
+        security: 'tls'
+      }
+      const nodes = [live, hy2, vm]
+      const plan = planRules(TEST_RULES, nodes)
+      const groups = groupsFor(plan)
+      const layout = layoutRules(plan, groups, new Map())!
+      for (const [name, text] of Object.entries(layout.files))
+        writeFileSync(join(userRun, 'rules', name), text)
+      const cfg = generateSingboxConfig({
+        outbounds: nodes,
+        activeOutboundId: 'auto',
+        slots: { groups, dir: join(home, 'rules'), selectors: layout.selectors },
+        settings: { ...TEST_SETTINGS, proxyMode: 'tun', verboseLog: true },
+        socksPort: 1,
+        httpPort: 2,
+        clashApiPort: clashPort,
+        clashSecret: randomBytes(16).toString('hex'),
+        logFile: f('sing-box.log'),
+        xrayPorts: { ob_live: 27_499 },
+        serverIps: { 'hy.example.com': ['198.51.100.8'] }
+      })
+      writeFileSync(join(userRun, 'config.json'), JSON.stringify(cfg, null, 2))
+      const session = randomBytes(16).toString('hex')
+      const c = { session, pid: process.pid, cmd: 'run', restart: 0, rules: 0, ts: Date.now() }
+      ctl(c)
+      const b = await broker()
+      try {
+        // «running» = the config passed validation and the core was started (without
+        // admin rights it then fails to open the TUN — that is expected here)
+        const st = await waitFor(
+          state,
+          (s) => s?.session === session && s?.status !== 'starting',
+          20_000
+        )
+        expect(st?.error ?? '').toBe('')
+        expect(st?.status).toBe('running')
+        expect(readdirSync(join(home, 'rules')).filter((n) => n.startsWith('cw-'))).toHaveLength(
+          groups * 5
+        )
+      } finally {
+        ctl({ ...c, cmd: 'stop' })
+        await waitFor(
+          () => b.exitCode,
+          (x) => x !== null,
+          10_000
+        )
+        if (b.exitCode === null) b.kill()
+      }
+    }, 60_000)
+
+    it('refuses configs that would let the elevated core touch other files', async () => {
+      const g = goodConfig()
+      const bad: [string, object][] = [
+        [
+          'cache_file',
+          {
+            ...g,
+            experimental: {
+              ...g.experimental,
+              cache_file: { enabled: true, path: 'C:\\Windows\\x.db' }
+            }
+          }
+        ],
+        [
+          'external_ui',
+          {
+            ...g,
+            experimental: {
+              clash_api: { external_controller: `127.0.0.1:${clashPort}`, external_ui: 'C:\\' }
+            }
+          }
+        ],
+        [
+          'clash on LAN',
+          { ...g, experimental: { clash_api: { external_controller: `0.0.0.0:${clashPort}` } } }
+        ],
+        [
+          'log elsewhere',
+          { ...g, log: { level: 'warn', output: 'C:\\Windows\\System32\\evil.dll' } }
+        ],
+        [
+          'rule-set outside',
+          {
+            ...g,
+            route: {
+              ...g.route,
+              rule_set: [
+                {
+                  type: 'local',
+                  tag: 'cw-0-d',
+                  format: 'source',
+                  path: join(userRun, 'rules', 'cw-0-d.json')
+                }
+              ]
+            }
+          }
+        ],
+        [
+          'remote rule-set',
+          {
+            ...g,
+            route: {
+              ...g.route,
+              rule_set: [
+                { type: 'remote', tag: 'cw-0-d', format: 'binary', url: 'https://x/y.srs' }
+              ]
+            }
+          }
+        ],
+        [
+          'mixed inbound',
+          { ...g, inbounds: [{ type: 'mixed', tag: 'm', listen: '0.0.0.0', listen_port: 1080 }] }
+        ],
+        [
+          'tls certificate',
+          {
+            ...g,
+            outbounds: [
+              { type: 'direct', tag: 'direct' },
+              {
+                type: 'hysteria2',
+                tag: 'h',
+                server: 'x',
+                server_port: 1,
+                tls: { enabled: true, certificate_path: 'C:\\secret.pem' }
+              }
+            ]
+          }
+        ],
+        [
+          'endpoints',
+          { ...g, endpoints: [{ type: 'tailscale', tag: 't', state_directory: 'C:\\' }] }
+        ],
+        [
+          'hosts dns',
+          {
+            ...g,
+            dns: {
+              servers: [
+                { type: 'hosts', tag: 'h', path: ['C:\\Windows\\System32\\drivers\\etc\\hosts'] }
+              ]
+            }
+          }
+        ]
+      ]
+      for (const [name, cfg] of bad) {
+        const res = await runOnce(cfg)
+        expect(res.status, name).toBe('error')
+        // no core was started for it
+        expect(res.corePid, name).toBe(0)
+        expect(res.error, name).not.toBe('')
+      }
+    }, 180_000)
+
+    it('a stale or foreign request is refused', async () => {
+      expect((await runOnce(goodConfig(), { ts: Date.now() - 10 * 60_000 })).status).toBe('refused')
+      expect((await runOnce(goodConfig(), { pid: 999_999_999 })).status).toBe('refused')
+      expect((await runOnce(goodConfig(), { cmd: 'stop' })).status).toBe('refused')
+    }, 60_000)
+
+    it('the task XML is accepted by Task Scheduler (validate only — nothing is registered)', async () => {
+      const { taskXml } = await import('./serviceScripts')
+      const esc = (v: string) =>
+        v.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+      const xml = taskXml()
+        .replace('$PsX', esc('C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'))
+        .replace('$BrokerX', esc(f('broker.ps1')))
+        .replace('$DirX', esc(home))
+      const xmlFile = join(tmp, 'task.xml')
+      writeFileSync(xmlFile, xml, 'utf8')
+      const ps = join(tmp, 'validate-task.ps1')
+      writeFileSync(
+        ps,
+        '\ufeff' +
+          [
+            `$xml = [IO.File]::ReadAllText('${xmlFile.replace(/'/g, "''")}')`,
+            "$svc = New-Object -ComObject 'Schedule.Service'; $svc.Connect()",
+            // 1 = TASK_VALIDATE_ONLY
+            `try { $null = $svc.GetFolder('\\').RegisterTask('CipherWay e2e validate', $xml, 1, $null, $null, 5, 'D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;${sid})'); 'VALID' } catch { 'ERR ' + $_.Exception.Message }`
+          ].join('\r\n')
+      )
+      const out = await new Promise<string>((res) =>
+        execFile(
+          'powershell.exe',
+          ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps],
+          { windowsHide: true },
+          (_e, o) => res(String(o).trim())
+        )
+      )
+      expect(out).toBe('VALID')
+    }, 30_000)
+  })
 })

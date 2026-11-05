@@ -32,7 +32,8 @@ export const TEST_SETTINGS: AppSettings = {
   httpPort: 10809,
   subscriptionRefreshHours: 12,
   verboseLog: false,
-  apiBase: 'https://cabinet.example.com'
+  apiBase: 'https://cabinet.example.com',
+  tunService: true
 }
 
 export const TEST_RULES: RulesConfig = {

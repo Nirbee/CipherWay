@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { DEFAULT_API_BASE, type AppSettings } from '@shared/types'
+import { DEFAULT_API_BASE, type AppSettings, type TunServiceInfo } from '@shared/types'
 import { buildDiagnostics } from '@shared/diagnostics'
 import { PageHeader } from '../components/PageHeader'
 import { Button, Card, Input, Toggle } from '../components/ui'
@@ -75,9 +75,10 @@ export function SettingsPage() {
               active={settings.proxyMode === 'tun'}
               onClick={() => void save({ proxyMode: 'tun' })}
               title="TUN — весь компьютер"
-              desc="Перехватывает трафик всех программ, включая игры. При подключении Windows спросит права администратора."
+              desc="Перехватывает трафик всех программ, включая игры. Права администратора Windows спросит один раз — при установке службы TUN."
             />
           </div>
+          {settings.proxyMode === 'tun' && <TunServiceControls enabled={settings.tunService} />}
         </Section>
 
         <Section title="Запуск">
@@ -264,6 +265,78 @@ function UpdaterControls() {
         </span>
       )}
       {phase === 'error' && <span className="text-xs text-accent-red">{error}</span>}
+    </div>
+  )
+}
+
+const TUN_STATE_LABEL: Record<TunServiceInfo['state'], string> = {
+  ok: 'установлена',
+  missing: 'не установлена',
+  outdated: 'нужно обновить (после обновления приложения)'
+}
+
+/** «Служба TUN»: one UAC prompt to install, then TUN connects without one. */
+function TunServiceControls({ enabled }: { enabled: boolean }) {
+  const state = useConnection((s) => s.state)
+  const [info, setInfo] = useState<TunServiceInfo | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    void window.api.tunService.status().then(setInfo)
+  }, [])
+
+  const run = async (op: 'install' | 'remove') => {
+    setBusy(true)
+    try {
+      setInfo(await window.api.tunService[op]())
+      toast(
+        op === 'install'
+          ? 'Служба TUN установлена — подключение без запроса прав'
+          : 'Служба TUN удалена — права будут запрашиваться при каждом подключении',
+        'success'
+      )
+    } catch (e) {
+      toast(errorText(e), 'error')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const connected = state === 'connected' || state === 'connecting'
+  const hint = !enabled
+    ? 'Выключена: Windows спрашивает права администратора при каждом подключении TUN.'
+    : 'Задача Планировщика Windows запускает ядро с правами администратора без запроса. Файлы ядра хранятся в защищённой папке ProgramData\\CipherWay.'
+
+  return (
+    <div className="flex items-center justify-between gap-4 rounded-xl border border-border-subtle bg-bg-panel-alt px-3.5 py-3">
+      <div className="min-w-0">
+        <div className="text-sm text-text-primary">
+          Служба TUN: {info ? TUN_STATE_LABEL[info.state] : '…'}
+        </div>
+        <div className="text-[11px] text-text-faint">{hint}</div>
+      </div>
+      {info?.state === 'ok' ? (
+        <Button
+          variant="secondary"
+          size="sm"
+          className="shrink-0"
+          disabled={busy || connected}
+          title={connected ? 'Сначала отключите VPN' : undefined}
+          onClick={() => void run('remove')}
+        >
+          Удалить службу TUN
+        </Button>
+      ) : (
+        <Button
+          size="sm"
+          className="shrink-0"
+          disabled={busy || connected}
+          title={connected ? 'Сначала отключите VPN' : undefined}
+          onClick={() => void run('install')}
+        >
+          {info?.state === 'outdated' ? 'Обновить службу' : 'Установить службу'}
+        </Button>
+      )}
     </div>
   )
 }

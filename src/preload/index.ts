@@ -54,6 +54,11 @@ const api: ExposedApi = {
     get: () => ipcRenderer.invoke(IPC.settingsGet),
     set: (patch) => ipcRenderer.invoke(IPC.settingsSet, patch)
   },
+  tunService: {
+    status: () => ipcRenderer.invoke(IPC.tunServiceStatus),
+    install: () => ipcRenderer.invoke(IPC.tunServiceInstall),
+    remove: () => ipcRenderer.invoke(IPC.tunServiceRemove)
+  },
   deeplink: {
     takePending: () => ipcRenderer.invoke(IPC.deeplinkTakePending)
   },

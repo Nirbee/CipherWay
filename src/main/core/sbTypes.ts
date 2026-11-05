@@ -1,6 +1,6 @@
 // Structural types for the subset of the sing-box config we generate.
-// Targeting sing-box 1.11.x schema (modern rule "action" form, rule-sets for
-// geosite/geoip). The pinned version lives in scripts/download-cores.ts.
+// Targeting sing-box 1.13.x (modern rule "action" form, local source
+// rule-sets for the user's rules). Checked with `sing-box check` 1.13.14.
 
 export type SbAction = 'route' | 'reject' | 'sniff' | 'hijack-dns'
 
@@ -16,6 +16,7 @@ export interface SbRouteRule {
   ip_is_private?: boolean
   process_name?: string[]
   process_path?: string[]
+  process_path_regex?: string[]
   rule_set?: string[]
   inbound?: string[]
   protocol?: string[]
@@ -26,12 +27,12 @@ export interface SbRouteRule {
   outbound?: string // when action === 'route'
 }
 
+/** Local rule-set in our own directory; sing-box re-reads it when the file changes. */
 export interface SbRuleSet {
-  type: 'remote'
+  type: 'local'
   tag: string
-  format: 'binary'
-  url: string
-  download_detour: string
+  format: 'source'
+  path: string
 }
 
 export interface SbOutbound {
@@ -50,8 +51,7 @@ export interface SbConfig {
   log: { level: string; output?: string; timestamp: boolean }
   dns?: Record<string, unknown>
   experimental?: {
-    clash_api?: { external_controller: string; default_mode?: string }
-    cache_file?: { enabled: boolean; path?: string }
+    clash_api?: { external_controller: string; default_mode?: string; secret?: string }
   }
   inbounds: SbInbound[]
   outbounds: SbOutbound[]
@@ -79,28 +79,12 @@ export const LATENCY_TIMEOUT_MS = 5000
 /** Clash API mode names (sing-box compares them case-insensitively) */
 export const CLASH_MODE = { rule: 'Rule', global: 'Global', direct: 'Direct' } as const
 
-// rule-set source repos (SagerNet official, .srs binary format)
+// geo rule-set source repos (SagerNet official, .srs binary format) — the app
+// downloads and decompiles them itself (rules/geo.ts)
 const GEOSITE_BASE = 'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set'
 const GEOIP_BASE = 'https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set'
 
-export function geositeRuleSet(category: string): SbRuleSet {
-  const slug = category.toLowerCase()
-  return {
-    type: 'remote',
-    tag: `geosite-${slug}`,
-    format: 'binary',
-    url: `${GEOSITE_BASE}/geosite-${slug}.srs`,
-    download_detour: TAG_DIRECT
-  }
-}
-
-export function geoipRuleSet(code: string): SbRuleSet {
-  const slug = code.toLowerCase()
-  return {
-    type: 'remote',
-    tag: `geoip-${slug}`,
-    format: 'binary',
-    url: `${GEOIP_BASE}/geoip-${slug}.srs`,
-    download_detour: TAG_DIRECT
-  }
+/** Download URL of a `geosite-x` / `geoip-x` tag. */
+export function geoUrl(tag: string): string {
+  return `${tag.startsWith('geoip-') ? GEOIP_BASE : GEOSITE_BASE}/${tag}.srs`
 }

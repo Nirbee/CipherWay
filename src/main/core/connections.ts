@@ -1,6 +1,7 @@
-import type { ConnItem, OutboundConfig } from '@shared/types'
+import type { ConnItem, FailedDirect, OutboundConfig } from '@shared/types'
 import { TAG_AUTO, TAG_DIRECT, TAG_PROXY_GROUP } from './sbTypes'
 import { XRAY_EXE } from './xrayGen'
+import { SLOT_FINAL, TELEGRAM_CIDRS } from '../rules/compile'
 
 // ---------------------------------------------------------------------------
 // Clash API `/connections` (sing-box) → what the «Подключения» screen shows.
@@ -41,7 +42,12 @@ export interface ConnContext {
   /** id -> { upload, download, ts } from the previous snapshot */
   prev: Map<string, { upload: number; download: number; ts: number }>
   now: number
+  /** rule-set tag of a rule slot → what the user wrote (rules/compile.ts) */
+  labels?: Record<string, string>
 }
+
+/** a direct connection that got nothing back for this long is probably blocked */
+export const STALL_MS = 4000
 
 const OWN_CORES = new Set([XRAY_EXE, 'sing-box.exe'])
 
@@ -52,16 +58,23 @@ export function exeOf(path: string | undefined): string | undefined {
 }
 
 /** `domain_suffix=[x.com] => route(ob_1)` → «домен x.com»; no node ids survive. */
-export function describeRule(rule: string | undefined): string {
+export function describeRule(
+  rule: string | undefined,
+  labels: Record<string, string> = {}
+): string {
   const r = (rule ?? '').trim()
-  if (!r || r === 'final') return 'По умолчанию'
+  if (!r || r === 'final') return 'Всё остальное'
   const cond = r.split('=>')[0].trim()
+  // the user's rules live in slots (rule_set=cw-3-p) — show what they wrote
+  const slot = /rule_set=\[?(cw-\d+-[dpx])\]?/.exec(cond)?.[1]
+  if (slot) return labels[slot] ?? 'Правило'
   const mode = /clash_mode=(\w+)/i.exec(cond)?.[1]?.toLowerCase()
   if (mode === 'global') return 'Режим «Весь трафик через VPN»'
   if (mode === 'direct') return 'Режим «Напрямую»'
   if (/ip_is_private/.test(cond)) return 'Локальная сеть'
   const list = (key: string): string | undefined => {
-    const m = new RegExp(`${key}=\\[([^\\]]*)\\]`).exec(cond) ?? new RegExp(`${key}=(\\S+)`).exec(cond)
+    const m =
+      new RegExp(`${key}=\\[([^\\]]*)\\]`).exec(cond) ?? new RegExp(`${key}=(\\S+)`).exec(cond)
     return m?.[1]?.trim()
   }
   const pairs: [string, string][] = [
@@ -102,7 +115,7 @@ export function toConnItems(raw: RawConnections, ctx: ConnContext): ConnItem[] {
     if (nodeAddrs.has(host.toLowerCase()) || nodeAddrs.has((md.destinationIP ?? '').toLowerCase()))
       continue
 
-    const chain = c.chains ?? []
+    const chain = (c.chains ?? []).filter((t) => t !== SLOT_FINAL)
     const tail = chain[0]
     let route: ConnItem['route'] = 'proxy'
     let serverName: string | undefined
@@ -126,9 +139,14 @@ export function toConnItems(raw: RawConnections, ctx: ConnContext): ConnItem[] {
       host: host || '—',
       port: md.destinationPort ?? '',
       network: md.network ?? 'tcp',
-      rule: describeRule(c.rule),
+      rule: describeRule(c.rule, ctx.labels),
       route,
       serverName,
+      ...(route === 'direct' &&
+      download === 0 &&
+      ctx.now - (Number.isFinite(start) ? start : ctx.now) > STALL_MS
+        ? { stalled: true }
+        : {}),
       upload,
       download,
       uploadSpeed: prev ? Math.max(0, (upload - prev.upload) / dt) : 0,
@@ -137,4 +155,95 @@ export function toConnItems(raw: RawConnections, ctx: ConnContext): ConnItem[] {
     })
   }
   return out
+}
+
+// ---------------------------------------------------------------------------
+// «Не удалось подключиться напрямую»: sing-box logs (at warn level too)
+//   ERROR [id 5.0s] connection: open connection to 149.154.167.41:443 using
+//   outbound/direct[direct]: dial tcp 149.154.167.41:443: i/o timeout
+// Collected per address; the process comes from live connections seen while
+// they were still dialing (the Clash API lists them during the dial).
+// ---------------------------------------------------------------------------
+
+const FAIL_RE =
+  /open connection to (\S+?):(\d+) using outbound\/direct\[direct\]:.*(i\/o timeout|timed out|did not properly respond)/i
+const KEEP_MS = 15 * 60_000
+const MAX_FAILED = 40
+
+function ipv4ToInt(ip: string): number | null {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(ip)
+  if (!m) return null
+  const parts = m.slice(1).map(Number)
+  if (parts.some((p) => p > 255)) return null
+  return ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0
+}
+
+export function inCidr4(ip: string, cidr: string): boolean {
+  const [net, bitsStr] = cidr.split('/')
+  const a = ipv4ToInt(ip)
+  const b = ipv4ToInt(net)
+  const bits = Number(bitsStr)
+  if (a === null || b === null || !(bits >= 0 && bits <= 32)) return false
+  const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0
+  return (a & mask) === (b & mask)
+}
+
+export function isTelegramIp(ip: string): boolean {
+  return TELEGRAM_CIDRS.some((c) => !c.includes(':') && inCidr4(ip, c))
+}
+
+export class DirectFailures {
+  private failed = new Map<string, FailedDirect>()
+  /** host:port → exe, from direct connections seen in snapshots */
+  private seen = new Map<string, { process: string; at: number }>()
+
+  /** Feed every sing-box log line. */
+  noteLog(line: string, now = Date.now()): void {
+    const m = FAIL_RE.exec(line)
+    if (!m) return
+    const host = m[1].replace(/^\[|\]$/g, '')
+    const key = `${host}:${m[2]}`
+    const prev = this.failed.get(key)
+    this.failed.set(key, {
+      host,
+      port: m[2],
+      count: (prev?.count ?? 0) + 1,
+      last: now,
+      ...(prev?.process ? { process: prev.process } : {}),
+      ...(isTelegramIp(host) ? { telegram: true } : {})
+    })
+    if (this.failed.size > MAX_FAILED * 2) this.prune(now)
+  }
+
+  /** Remember which program dialed what (direct connections only). */
+  noteConnections(items: ConnItem[], now = Date.now()): void {
+    for (const c of items) {
+      if (c.route !== 'direct' || !c.process) continue
+      this.seen.set(`${c.host}:${c.port}`, { process: c.process, at: now })
+    }
+    if (this.seen.size > 2000) {
+      for (const [k, v] of this.seen) if (now - v.at > KEEP_MS) this.seen.delete(k)
+    }
+  }
+
+  private prune(now: number): void {
+    for (const [k, v] of this.failed) if (now - v.last > KEEP_MS) this.failed.delete(k)
+  }
+
+  /** Newest first; node addresses are never listed. */
+  list(hidden: Set<string>, now = Date.now()): FailedDirect[] {
+    this.prune(now)
+    return [...this.failed.entries()]
+      .filter(([, f]) => !hidden.has(f.host.toLowerCase()))
+      .map(([key, f]) => {
+        const p = f.process ?? this.seen.get(key)?.process
+        return p ? { ...f, process: p } : f
+      })
+      .sort((a, b) => b.last - a.last)
+      .slice(0, MAX_FAILED)
+  }
+
+  clear(): void {
+    this.failed.clear()
+  }
 }

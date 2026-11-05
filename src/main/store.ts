@@ -36,7 +36,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   httpPort: 10809,
   subscriptionRefreshHours: 12,
   verboseLog: false,
-  apiBase: DEFAULT_API_BASE
+  apiBase: DEFAULT_API_BASE,
+  tunService: true
 }
 
 export const DEFAULT_RULES: RulesConfig = {
@@ -51,6 +52,9 @@ export const DEFAULT_RULES: RulesConfig = {
     },
     { id: 'r2', enabled: true, conditionType: 'GeoIP', value: 'ru', action: 'DIRECT' },
     { id: 'r3', enabled: true, conditionType: 'GeoSite', value: 'yandex', action: 'DIRECT' },
+    // Telegram connects to its IPs without DNS, so a domain rule misses them;
+    // directly they time out in Russia (0.4.2)
+    { id: 'r5', enabled: true, conditionType: 'GeoIP', value: 'telegram', action: 'PROXY' },
     { id: 'r4', enabled: true, conditionType: 'ProcessName', value: 'firefox.exe', action: 'PROXY' }
   ]
 }

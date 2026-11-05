@@ -1,10 +1,5 @@
-import {
-  AUTO_OUTBOUND_ID,
-  type AppSettings,
-  type OutboundConfig,
-  type RulesConfig
-} from '@shared/types'
-import { compileRules } from '../rules/compile'
+import { AUTO_OUTBOUND_ID, type AppSettings, type OutboundConfig } from '@shared/types'
+import { ruleSkeleton, SLOT_DNS, SLOT_FINAL } from '../rules/compile'
 import {
   CLASH_MODE,
   LATENCY_URL,
@@ -22,18 +17,29 @@ import { toExcludeCidrs, type ServerIps } from '../system/resolve'
 export const TUN_INTERFACE = 'CipherWay'
 export const TUN_ADDRESS4 = '172.19.0.1'
 
+export interface SlotParams {
+  /** number of slot groups (rules/compile.ts groupsFor) */
+  groups: number
+  /** absolute directory the core reads the slot rule-sets from */
+  dir: string
+  /** RuleLayout.selectors — initial choices of cw-<g> / cw-final / cw-dns */
+  selectors: Record<string, string>
+}
+
 export interface GenParams {
   outbounds: OutboundConfig[]
   /** node id or AUTO_OUTBOUND_ID — the `proxy` selector's default */
   activeOutboundId: string | undefined
-  rules: RulesConfig
+  /** the user's rules, laid out into slots (see rules/compile.ts) */
+  slots: SlotParams
   settings: AppSettings
   /** local ports */
   socksPort: number
   httpPort: number
   clashApiPort: number
+  /** clash_api.secret (random per start) */
+  clashSecret?: string
   logFile: string
-  cacheFile: string
   /** outbound id -> loopback SOCKS port of its xray inbound (VLESS nodes) */
   xrayPorts: Record<string, number>
   /** node host -> IPs resolved before start (TUN: excluded from the routes) */
@@ -203,11 +209,10 @@ export const MODE_RULES: SbRouteRule[] = [
 ]
 
 export function generateSingboxConfig(p: GenParams): SbConfig {
-  const { rules, ruleSets, final } = compileRules(p.rules, p.outbounds)
+  const nodeTags = p.outbounds.map((o) => o.id)
+  const slots = ruleSkeleton(p.slots.groups, p.slots.dir, nodeTags, p.slots.selectors)
   const proxyOutbounds = p.outbounds.map((o) => buildOutbound(o, p.xrayPorts[o.id]))
   const tun = p.settings.proxyMode === 'tun'
-
-  const geositeTags = ruleSets.filter((r) => r.tag.startsWith('geosite-')).map((r) => r.tag)
   const nodeDomains = serverDomains(p.outbounds)
 
   // Loop protection in TUN mode: xray.exe dials the nodes itself. Normally its
@@ -226,14 +231,10 @@ export function generateSingboxConfig(p: GenParams): SbConfig {
     // new (1.12+) typed DNS server format
     dns: {
       servers: [
-        // sing-box 1.12+ refuses to *start* (check passes!) with an explicit
-        // detour to an empty direct outbound — omit it, direct is the default
-        {
-          type: 'https',
-          tag: 'remote',
-          server: '1.1.1.1',
-          ...(final !== TAG_DIRECT ? { detour: TAG_PROXY_GROUP } : {})
-        },
+        // detour = the cw-dns selector: the tunnel, or direct when «Всё
+        // остальное» is direct (sing-box 1.12+ refuses to *start* with an
+        // explicit detour to an empty direct outbound — a selector is fine)
+        { type: 'https', tag: 'remote', server: '1.1.1.1', detour: SLOT_DNS },
         { type: 'https', tag: 'local', server: '77.88.8.8' }
       ],
       rules: [
@@ -241,42 +242,43 @@ export function generateSingboxConfig(p: GenParams): SbConfig {
         // «Напрямую»: nothing goes through the tunnel, DNS included
         { clash_mode: CLASH_MODE.direct, server: 'local' },
         { clash_mode: CLASH_MODE.global, server: 'remote' },
-        // resolve geosite-matched (local) domains via the local resolver
-        ...(geositeTags.length ? [{ rule_set: geositeTags, server: 'local' }] : [])
+        // the user's rules, same order: «напрямую» domains via the local
+        // resolver, «через VPN» ones via the tunnel
+        ...slots.dnsRules
       ],
       final: 'remote',
       strategy: 'ipv4_only'
     },
+    // no cache_file: it would bring back the mode / selector choices of the
+    // previous run for the first seconds after start (Telegram's reconnect
+    // burst went «direct» there) — the config defaults are always current
     experimental: {
       clash_api: {
         external_controller: `127.0.0.1:${p.clashApiPort}`,
-        default_mode: CLASH_MODE[p.settings.routingMode] ?? CLASH_MODE.rule
-      },
-      cache_file: { enabled: true, path: p.cacheFile }
+        default_mode: CLASH_MODE[p.settings.routingMode] ?? CLASH_MODE.rule,
+        ...(p.clashSecret ? { secret: p.clashSecret } : {})
+      }
     },
     inbounds: inbounds(p),
     outbounds: [
       ...proxyOutbounds,
-      ...groupOutbounds(
-        p.outbounds.map((o) => o.id),
-        p.activeOutboundId,
-        p.latencies
-      ),
+      ...groupOutbounds(nodeTags, p.activeOutboundId, p.latencies),
+      ...slots.outbounds,
       { type: 'direct', tag: TAG_DIRECT }
     ],
     route: {
       // xray loop guard first, then sniff (protocol/domain detection), hijack
-      // DNS in TUN mode, the routing-mode switch, then the user's compiled
-      // rules (first match wins).
+      // DNS in TUN mode, the routing-mode switch, then the user's rules in
+      // their slots (first match wins).
       rules: [
         ...loopGuard,
         { action: 'sniff' },
         ...(tun ? [{ protocol: ['dns'], action: 'hijack-dns' as const }] : []),
         ...MODE_RULES,
-        ...rules
+        ...slots.routeRules
       ],
-      rule_set: ruleSets,
-      final,
+      rule_set: slots.ruleSets,
+      final: SLOT_FINAL,
       auto_detect_interface: true,
       // owning process for every connection → «Подключения» screen (works in
       // both TUN and system-proxy mode on Windows) + process rules

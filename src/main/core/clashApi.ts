@@ -39,14 +39,23 @@ function toState(p: RawProxy | undefined): ProxyState {
   }
 }
 export class ClashApi {
-  constructor(private port: number) {}
+  /**
+   * @param secret clash_api.secret of the core: without it any local process
+   *   (other Windows users too) could steer the — possibly elevated — core
+   */
+  constructor(
+    private port: number,
+    private secret?: string
+  ) {}
 
   private url(path: string): string {
     return `http://127.0.0.1:${this.port}${path}`
   }
 
   private async req(path: string, init: RequestInit = {}, timeoutMs = 2000): Promise<Response> {
-    return fetch(this.url(path), { ...init, signal: AbortSignal.timeout(timeoutMs) })
+    const headers = new Headers(init.headers)
+    if (this.secret) headers.set('Authorization', `Bearer ${this.secret}`)
+    return fetch(this.url(path), { ...init, headers, signal: AbortSignal.timeout(timeoutMs) })
   }
 
   /** true once the controller answers (core is up). */
@@ -121,17 +130,22 @@ export class ClashApi {
     }
   }
 
-  /** Forces a check of a urltest group; returns member → delay of the answered ones. */
+  /**
+   * Forces a check of a urltest group; returns member → delay of the answered
+   * ones. sing-box answers only after its slowest member (a silent node: its
+   * own 15 s TCP timeout), so `waitMs` may need to be longer than `timeoutMs`.
+   */
   async groupDelay(
     group: string,
-    timeoutMs = LATENCY_TIMEOUT_MS
+    timeoutMs = LATENCY_TIMEOUT_MS,
+    waitMs = timeoutMs + 3000
   ): Promise<Record<string, number> | null> {
     const q = new URLSearchParams({ url: LATENCY_URL, timeout: String(timeoutMs) })
     try {
       const res = await this.req(
         `/group/${encodeURIComponent(group)}/delay?${q.toString()}`,
         {},
-        timeoutMs + 3000
+        waitMs
       )
       if (!res.ok) return null
       return (await res.json()) as Record<string, number>

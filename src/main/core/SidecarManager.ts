@@ -1,6 +1,7 @@
-import { spawn, type ChildProcess } from 'node:child_process'
+import { execFile, spawn, type ChildProcess } from 'node:child_process'
+import { randomBytes } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { mkdir, open, rm, writeFile, stat } from 'node:fs/promises'
+import { mkdir, open, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { connect } from 'node:net'
 import { networkInterfaces } from 'node:os'
 import { join } from 'node:path'
@@ -15,13 +16,19 @@ import {
   type RoutingMode,
   type RulesConfig,
   type ServerPing,
-  type TrafficStats
+  type TrafficStats,
+  type TunServiceInfo
 } from '@shared/types'
 import { generateProbeConfig, generateSingboxConfig, TUN_ADDRESS4 } from './configGen'
 import { generateXrayConfig, isXrayHandled, XRAY_EXE, type XrayBridge } from './xrayGen'
 import { ClashApi } from './clashApi'
-import { CLASH_MODE, TAG_AUTO, TAG_PROXY_GROUP } from './sbTypes'
-import { brokerScript, hasTunAdapter, psQuote } from './broker'
+import { CLASH_MODE, LATENCY_TIMEOUT_MS, TAG_AUTO, TAG_PROXY_GROUP } from './sbTypes'
+import { hasTunAdapter } from './broker'
+import { LegacyLauncher, TunService, type LauncherPaths, type TunLauncher } from './tunService'
+import { writeAtomic } from './atomicFile'
+import { DirectFailures } from './connections'
+import { groupsFor, layoutRules, planRules, type RuleLayout } from '../rules/compile'
+import { GeoCache } from '../rules/geo'
 import { findFreePort } from '../system/ports'
 import { disableSystemProxy, enableSystemProxy } from '../system/proxy'
 import { allIps, resolveServers, toExcludeCidrs, type ServerIps } from '../system/resolve'
@@ -44,15 +51,26 @@ export interface StartParams {
 
 const MAX_RESTARTS = 5
 const XRAY_READY_TIMEOUT_MS = 8000
-/** system proxy: sing-box is up in well under a second; remote rule-sets may take a few */
+/** system proxy: sing-box is up in well under a second */
 const CORE_READY_TIMEOUT_MS = 25_000
-/** TUN: includes the time the user needs to answer the UAC prompt */
+/** TUN: includes the time the user needs to answer a UAC prompt */
 const CORE_READY_TIMEOUT_TUN_MS = 90_000
 /** TUN: creating the wintun adapter the very first time can take half a minute */
 const TUN_ADAPTER_TIMEOUT_MS = 45_000
 const PROBE_READY_TIMEOUT_MS = 8000
-/** the urltest group's own startup check (dead nodes time out after ~5 s) */
-const AUTO_FIRST_CHECK_MS = 8000
+/**
+ * The urltest group's startup check: `now` appears only once EVERY member
+ * answered or failed — a node that silently drops packets holds it for
+ * sing-box's TCP timeout (15 s). 0.4.1 gave up after 8 s → a false «no
+ * server answers».
+ */
+const AUTO_FIRST_CHECK_MS = 20_000
+/** a failed check is repeated once after this pause before warning */
+const AUTO_RETRY_MS = 5000
+/** explicit group check: sing-box waits for its slowest member (up to 15 s) */
+const AUTO_CHECK_WAIT_MS = 20_000
+/** sing-box re-reads a changed local rule-set within ~0.3 s (1.13.14) */
+const RULE_RELOAD_MS = 800
 
 const NO_AUTO: AutoInfo = { checking: false, dead: false }
 
@@ -110,6 +128,12 @@ function killProc(proc: ChildProcess | null): Promise<void> {
   })
 }
 
+/** The «Служба TUN» task could not run the core — this start falls back to a UAC prompt. */
+class ServiceUnavailable extends Error {}
+
+const sameIds = (a: string[], b: string[]): boolean =>
+  a.length === b.length && a.every((x, i) => x === b[i])
+
 /**
  * Drives the cores: xray (VLESS connections, one loopback SOCKS inbound per
  * node) and sing-box (TUN / system proxy, routing, DNS, Hysteria2).
@@ -117,11 +141,15 @@ function killProc(proc: ChildProcess | null): Promise<void> {
  * connected, everything is stopped with an error (no silent fallback).
  *  - System Proxy mode: sing-box spawned as a normal child (full stdio), the
  *    WinInet registry proxy points at its mixed inbound.
- *  - TUN mode: sing-box needs admin. We launch it through an elevated broker
- *    (one UAC prompt on connect). The broker watches a stop-file so we can
- *    terminate it later without a second prompt. Logs come from the log file.
- * «Connected» is reported only once the Clash API of the new core answers.
- * Routing mode and server switches go through the Clash API — no restart.
+ *  - TUN mode: sing-box needs admin — through the «Служба TUN» task (no UAC
+ *    prompt after the one-time setup) or, if the user removed it, an
+ *    elevated broker per connect (tunService.ts).
+ * Every operation (connect / disconnect / reload / applying rules) runs
+ * through ONE queue — never two starts at once. «Connected» is reported only
+ * once the Clash API of the new core answers. Routing mode, server switches
+ * and the user's rules (local rule-sets + selectors) change on the fly; the
+ * core is restarted only for new servers, TUN ↔ proxy, or when the rules
+ * outgrow the slots reserved at start.
  */
 export class SidecarManager {
   private child: ChildProcess | null = null // system-proxy mode child
@@ -132,7 +160,6 @@ export class SidecarManager {
   private intentionalStop = false
   private starting = false
   private running = false
-  private elevation: 'pending' | 'ok' | 'failed' = 'pending'
   private mode: AppSettings['proxyMode'] = 'system'
   private api: ClashApi | null = null
   private auto: AutoInfo = NO_AUTO
@@ -146,9 +173,26 @@ export class SidecarManager {
   private probing: Promise<ServerPing[]> | null = null
   /** we switched the Windows proxy on and must switch it off again */
   private proxySet = false
+  /** TUN: who runs the elevated core */
+  private launcher: TunLauncher | null = null
+  private tunSvc: TunService | null = null
+  private geoCache: GeoCache | null = null
+
+  /** one queue for start / stop / reload / rules */
+  private queue: Promise<unknown> = Promise.resolve()
+  /** bumped by stop(): a queued or running start of an older generation gives up */
+  private opGen = 0
+
+  // rule slots of the running core
+  private groups = 0
+  private written = new Map<string, string>()
+  private selectors: Record<string, string> = {}
+  private labelMap: Record<string, string> = {}
+  readonly failures = new DirectFailures()
 
   private trafficTimer: NodeJS.Timeout | null = null
   private tailTimer: NodeJS.Timeout | null = null
+  private tailPath = ''
   private tailPos = 0
   private tick = 0
   private prevTotals: { up: number; down: number } | null = null
@@ -181,6 +225,9 @@ export class SidecarManager {
   private get runDir(): string {
     return join(app.getPath('userData'), 'run')
   }
+  private get rulesDir(): string {
+    return join(this.runDir, 'rules')
+  }
   private exePath(): string {
     return join(this.binDir, 'sing-box.exe')
   }
@@ -196,14 +243,41 @@ export class SidecarManager {
   private get logPath(): string {
     return join(this.runDir, 'sing-box.log')
   }
-  private get stopFile(): string {
-    return join(this.runDir, 'stop.signal')
+  private get paths(): LauncherPaths {
+    return {
+      binDir: this.binDir,
+      runDir: this.runDir,
+      configPath: this.configPath,
+      rulesDir: this.rulesDir,
+      logPath: this.logPath
+    }
   }
-  private get restartFile(): string {
-    return join(this.runDir, 'restart.signal')
+
+  private get tunService(): TunService {
+    this.tunSvc ??= new TunService({
+      binDir: this.binDir,
+      runDir: this.runDir,
+      appVersion: typeof app.getVersion === 'function' ? app.getVersion() : '0',
+      log: (level, msg) => this.log(level, 'app', msg)
+    })
+    return this.tunSvc
   }
-  private get exitFile(): string {
-    return join(this.runDir, 'core.exit')
+
+  private get geo(): GeoCache {
+    this.geoCache ??= new GeoCache({
+      dir: join(app.getPath('userData'), 'geo'),
+      decompile: (srs, json) =>
+        new Promise<void>((resolve, reject) =>
+          execFile(
+            this.exePath(),
+            ['rule-set', 'decompile', srs, '-o', json],
+            { windowsHide: true, timeout: 30_000 },
+            (err) => (err ? reject(err) : resolve())
+          )
+        ),
+      warn: (msg) => this.log('warn', 'app', msg)
+    })
+    return this.geoCache
   }
 
   /** Clash API of the running core (null while disconnected). */
@@ -216,19 +290,106 @@ export class SidecarManager {
   get isRunning(): boolean {
     return this.running
   }
+  /** rule-set tag → the user's rule it holds (for «Подключения») */
+  get labels(): Record<string, string> {
+    return this.labelMap
+  }
+  /** tests: pid of the system-proxy mode sing-box */
+  get corePid(): number | undefined {
+    return this.child?.pid
+  }
 
   private log(level: LogEntry['level'], source: LogEntry['source'], message: string): void {
     if (!message) return
     this.onLog({ ts: Date.now(), level, source, message })
   }
 
-  async start(p: StartParams): Promise<void> {
+  private coreLine(raw: string): void {
+    // sing-box colours its stdout (ESC[31mFATAL ESC[0m) — not for the UI / error texts
+    // eslint-disable-next-line no-control-regex
+    const line = raw.replace(/\x1b\[[0-9;]*m/g, '')
+    if (!line) return
+    this.coreTail = [...this.coreTail.slice(-6), line]
+    this.failures.noteLog(line)
+    this.log(singboxLevel(line), 'singbox', line)
+  }
+
+  /** Runs `fn` after every operation queued before it. */
+  private serial<T>(fn: () => Promise<T>): Promise<T> {
+    const run = this.queue.then(fn, fn)
+    this.queue = run.catch(() => undefined)
+    return run
+  }
+
+  // --- public operations (all queued) --------------------------------------
+
+  /** Connect. A no-op if already connected; cancelled by a later stop(). */
+  start(p: StartParams): Promise<void> {
+    const gen = this.opGen
+    return this.serial(async () => {
+      if (gen !== this.opGen || this.running) return
+      await this.doStart(p, gen)
+    })
+  }
+
+  /** Disconnect. Cancels a start that is still waiting (UAC, adapter). */
+  stop(): Promise<void> {
+    this.opGen++
+    this.intentionalStop = true
+    return this.serial(() => this.doStop(false))
+  }
+
+  /** Restart with a new config (TUN ↔ proxy, the server list changed). */
+  reload(p: StartParams): Promise<void> {
+    const gen = this.opGen
+    return this.serial(async () => {
+      if (gen !== this.opGen || !this.running) return
+      this.log('info', 'app', 'Перезапуск ядра с новой конфигурацией…')
+      await this.doStop(true)
+      await this.doStart(p, gen)
+    })
+  }
+
+  /**
+   * The user's rules changed: rewrite the slot rule-sets + switch selectors,
+   * no restart. While disconnected only remembers them (next start uses the store).
+   */
+  applyRules(p: StartParams): Promise<void> {
+    const gen = this.opGen
+    return this.serial(async () => {
+      if (gen !== this.opGen || !this.running || !this.api) return
+      await this.doApplyRules(p, gen)
+    })
+  }
+
+  // --- «Служба TUN» ----------------------------------------------------------
+
+  tunServiceStatus(): Promise<TunServiceInfo> {
+    return this.tunService.status()
+  }
+
+  installTunService(): Promise<'ok' | 'cancelled' | 'failed'> {
+    return this.serial(() => this.tunService.install())
+  }
+
+  removeTunService(): Promise<'ok' | 'cancelled' | 'failed'> {
+    return this.serial(async () => {
+      if (this.running && this.launcher?.kind === 'service') {
+        throw new Error('Сначала отключите VPN')
+      }
+      return this.tunService.remove()
+    })
+  }
+
+  // --- start -----------------------------------------------------------------
+
+  private async doStart(p: StartParams, gen: number, keepRestarts = false): Promise<void> {
     // a latency probe holds its own cores — let it finish first
     if (this.probing) await this.probing.catch(() => undefined)
     // a previous xray (e.g. auto-restart path) must be gone before ports are re-bound
     await this.stopXray()
     this.intentionalStop = false
-    this.restarts = 0
+    if (!keepRestarts) this.restarts = 0
     this.lastParams = p
     this.mode = p.settings.proxyMode
     this.running = false
@@ -237,7 +398,9 @@ export class SidecarManager {
     this.setAuto(NO_AUTO)
     this.nodeIds = p.outbounds.map((o) => o.id)
     this.coreTail = []
+    this.failures.clear()
     this.onState('connecting')
+    const cancelled = (): boolean => gen !== this.opGen || this.intentionalStop
 
     if (!existsSync(this.exePath())) {
       this.onState('error', 'sing-box.exe не найден — переустановите приложение')
@@ -255,18 +418,23 @@ export class SidecarManager {
       throw new Error('xray.exe missing')
     }
 
+    const tun = this.mode === 'tun'
     this.starting = true
     try {
-      await mkdir(this.runDir, { recursive: true })
-      for (const f of [this.stopFile, this.restartFile, this.exitFile, this.logPath]) {
-        await rm(f, { force: true }).catch(() => undefined)
-      }
+      await mkdir(this.rulesDir, { recursive: true })
+      await rm(this.logPath, { force: true }).catch(() => undefined)
+      // 0.4.1 kept a cache_file (mode / selector of the previous run) — no longer used
+      await rm(join(this.runDir, 'cache.db'), { force: true }).catch(() => undefined)
+
+      // TUN: who will run the elevated core (may set up the service: one UAC prompt)
+      if (tun) this.launcher = await this.pickLauncher(p, cancelled)
+      if (cancelled()) return
 
       // TUN: node IPs are resolved now (system DNS, TUN not up yet), excluded
       // from the TUN routes and pinned in xray — its connections to the nodes
       // go straight out of the physical NIC instead of through sing-box again
       let serverIps: ServerIps = {}
-      if (this.mode === 'tun') {
+      if (tun) {
         serverIps = await resolveServers(p.outbounds)
         this.onServerIps(allIps(serverIps))
         const hosts = new Set(p.outbounds.map((o) => o.server)).size
@@ -284,16 +452,32 @@ export class SidecarManager {
       const bridges = await allocBridges(xrayNodes, new Set([this.ports.http, this.ports.clashApi]))
       const xrayPorts = Object.fromEntries(bridges.map((b) => [b.outbound.id, b.port]))
 
+      // the user's rules → slot rule-sets (rules/compile.ts)
+      const plan = planRules(p.rules, p.outbounds)
+      const geo = await this.geo.load(plan.geo)
+      if (cancelled()) return
+      this.groups = groupsFor(plan)
+      const layout = layoutRules(plan, this.groups, geo) as RuleLayout
+      await this.writeRuleFiles(layout, true)
+      this.selectors = { ...layout.selectors }
+      this.labelMap = layout.labels
+
+      const logFile = this.launcher?.coreLogPath ?? this.logPath
+      const clashSecret = randomBytes(16).toString('hex')
       const cfg = generateSingboxConfig({
         outbounds: p.outbounds,
         activeOutboundId: p.activeOutboundId,
-        rules: p.rules,
+        slots: {
+          groups: this.groups,
+          dir: this.launcher?.coreRuleDir ?? this.rulesDir,
+          selectors: layout.selectors
+        },
         settings: p.settings,
         socksPort: p.settings.socksPort,
         httpPort: this.ports.http,
         clashApiPort: this.ports.clashApi,
-        logFile: this.logPath,
-        cacheFile: join(this.runDir, 'cache.db'),
+        clashSecret,
+        logFile,
         xrayPorts,
         serverIps,
         latencies: { ...(p.latencies ?? {}), ...this.recentPings }
@@ -309,27 +493,36 @@ export class SidecarManager {
         await this.startXray(bridges.map((b) => b.port))
       }
 
-      this.api = new ClashApi(this.ports.clashApi)
-      this.startLogTail()
-      if (this.mode === 'tun') {
+      this.api = new ClashApi(this.ports.clashApi, clashSecret)
+      // the service's log lives in its own folder and is appended to: skip what is there
+      const skip =
+        this.launcher?.kind === 'service'
+          ? await stat(logFile).then(
+              (s) => s.size,
+              () => 0
+            )
+          : 0
+      this.startLogTail(logFile, skip)
+      if (this.launcher) {
         // after a reload the old adapter may take a moment to disappear
         for (let i = 0; i < 15 && hasTunAdapter(networkInterfaces(), TUN_ADDRESS4); i++)
           await sleep(200)
         this.staleAdapter = hasTunAdapter(networkInterfaces(), TUN_ADDRESS4)
         if (this.staleAdapter)
           this.log('warn', 'app', 'Сетевой адаптер CipherWay остался от прошлого запуска')
-        await this.startElevated()
+        await this.launcher.launch()
+        const why = this.launcher.failure()
+        if (why)
+          throw this.launcher.kind === 'service' ? new ServiceUnavailable(why) : new Error(why)
       } else {
         this.startChild()
       }
-      await this.waitCoreReady()
-      if (this.mode === 'tun') await this.waitTunReady()
+      await this.waitCoreReady(cancelled)
+      if (tun) await this.waitTunReady(cancelled)
 
-      // cache.db remembers the last mode / selector choice and would override
-      // the config defaults — apply what the user picked explicitly
       await this.applyRuntimeChoices(p)
 
-      if (this.mode !== 'tun') {
+      if (!tun) {
         await enableSystemProxy(this.ports.http)
         this.proxySet = true
         this.log('info', 'app', `Системный прокси включён на 127.0.0.1:${this.ports.http}`)
@@ -340,12 +533,62 @@ export class SidecarManager {
       void this.autoCheck()
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
-      await this.stop(true)
+      // (read before doStop — it sets intentionalStop itself)
+      const byUser = cancelled()
+      await this.doStop(true)
+      // a stop() took over — it reports «disconnected» itself
+      if (byUser) return
+      if (err instanceof ServiceUnavailable) {
+        // «Если службы нет — как раньше»: one UAC prompt for this connection
+        this.log('warn', 'app', `${msg} — подключаемся с запросом прав администратора`)
+        this.starting = false
+        return this.doStart(
+          { ...p, settings: { ...p.settings, tunService: false } },
+          gen,
+          keepRestarts
+        )
+      }
       this.onState('error', msg)
       throw err
     } finally {
       this.starting = false
     }
+  }
+
+  /** TUN: the «Служба TUN» task if allowed (set up / updated with one UAC prompt), else per-connect UAC. */
+  private async pickLauncher(p: StartParams, cancelled: () => boolean): Promise<TunLauncher> {
+    const legacy = (): TunLauncher =>
+      new LegacyLauncher(this.paths, (l, m) => this.log(l, 'app', m), cancelled)
+    if (!p.settings.tunService) return legacy()
+    const svc = this.tunService
+    let st = await svc.status()
+    if (st.detail) this.log('warn', 'app', `Служба TUN: ${st.detail}`)
+    if (st.state !== 'ok') {
+      this.onState(
+        'connecting',
+        st.state === 'outdated'
+          ? 'Обновляем службу TUN — подтвердите запрос Windows…'
+          : 'Устанавливаем службу TUN — подтвердите запрос Windows (только один раз)…'
+      )
+      const res = await svc.install().catch((err: unknown) => {
+        this.log('warn', 'app', `Служба TUN: ${err instanceof Error ? err.message : err}`)
+        return 'failed' as const
+      })
+      if (res === 'cancelled') {
+        throw new Error('Не удалось получить права администратора для режима TUN')
+      }
+      st = res === 'ok' ? await svc.status() : st
+      if (st.state !== 'ok') {
+        this.log(
+          'warn',
+          'app',
+          'Служба TUN недоступна — запускаем TUN с запросом прав администратора'
+        )
+        return legacy()
+      }
+      this.onState('connecting')
+    }
+    return svc.launcher(this.paths, cancelled).catch(() => legacy())
   }
 
   private async applyRuntimeChoices(p: StartParams): Promise<void> {
@@ -361,21 +604,20 @@ export class SidecarManager {
   }
 
   /** Waits until the new sing-box answers on its Clash API, or explains why not. */
-  private async waitCoreReady(timeoutMs?: number): Promise<void> {
+  private async waitCoreReady(cancelled: () => boolean, timeoutMs?: number): Promise<void> {
     const api = this.api
     if (!api) throw new Error('Ядро не запущено')
-    const tun = this.mode === 'tun'
+    const l = this.launcher
     const deadline =
-      Date.now() + (timeoutMs ?? (tun ? CORE_READY_TIMEOUT_TUN_MS : CORE_READY_TIMEOUT_MS))
+      Date.now() + (timeoutMs ?? (l ? CORE_READY_TIMEOUT_TUN_MS : CORE_READY_TIMEOUT_MS))
     while (Date.now() < deadline) {
-      if (this.intentionalStop) throw new Error('Подключение отменено')
+      if (cancelled()) throw new Error('Подключение отменено')
       if (await api.ping()) return
-      if (tun && this.elevation === 'failed') {
-        throw new Error('Не удалось получить права администратора для режима TUN')
-      }
-      if (!tun && !this.child) break // sing-box exited during startup
-      if (tun && existsSync(this.exitFile)) break // ... or under the broker
-      if (this.coreTail.some((l) => /\bFATAL\b/.test(l))) break
+      const why = l?.failure()
+      if (why) throw new Error(why)
+      if (!l && !this.child) break // sing-box exited during startup
+      if (l && (await l.exited())) break // ... or under the broker
+      if (this.coreTail.some((x) => /\bFATAL\b/.test(x))) break
       await sleep(250)
     }
     throw new Error(`Ядро sing-box не запустилось${await this.coreReason()}`)
@@ -392,17 +634,17 @@ export class SidecarManager {
   /**
    * TUN: the Clash API answers before the TUN inbound is up — wait for the
    * wintun adapter itself. The first one on a machine can take 20–40 s
-   * («open interface take too much time»); on failure the broker restarts
-   * sing-box once (no second UAC prompt).
+   * («open interface take too much time»); on failure the core is restarted
+   * once (no second UAC prompt).
    */
-  private async waitTunReady(): Promise<void> {
+  private async waitTunReady(cancelled: () => boolean): Promise<void> {
     let why = ''
     for (let attempt = 1; attempt <= 2; attempt++) {
       this.onState(
         'connecting',
         attempt === 1 ? 'Создаём сетевой адаптер…' : 'Повторная попытка: создаём сетевой адаптер…'
       )
-      const res = await this.pollAdapter(TUN_ADAPTER_TIMEOUT_MS)
+      const res = await this.pollAdapter(TUN_ADAPTER_TIMEOUT_MS, cancelled)
       if (res === 'ok') {
         this.log('info', 'app', 'Сетевой адаптер TUN готов')
         return
@@ -418,7 +660,9 @@ export class SidecarManager {
       )
       if (attempt === 1) {
         this.log('info', 'app', 'Повторная попытка запуска TUN')
-        await this.restartElevatedCore()
+        this.coreTail = []
+        await this.launcher?.restartCore()
+        await this.waitCoreReady(cancelled, CORE_READY_TIMEOUT_MS)
       }
     }
     throw new Error(
@@ -426,13 +670,16 @@ export class SidecarManager {
     )
   }
 
-  private async pollAdapter(timeoutMs: number): Promise<'ok' | 'exited' | 'timeout' | 'cancel'> {
+  private async pollAdapter(
+    timeoutMs: number,
+    cancelled: () => boolean
+  ): Promise<'ok' | 'exited' | 'timeout' | 'cancel'> {
     const api = this.api
     const since = Date.now()
     const deadline = since + timeoutMs
     while (Date.now() < deadline) {
-      if (this.intentionalStop) return 'cancel'
-      if (existsSync(this.exitFile)) return 'exited'
+      if (cancelled()) return 'cancel'
+      if (await this.launcher?.exited()) return 'exited'
       // a leftover adapter proves nothing: then give the core a few seconds to fail
       const up =
         hasTunAdapter(networkInterfaces(), TUN_ADDRESS4) &&
@@ -443,21 +690,8 @@ export class SidecarManager {
     return 'timeout'
   }
 
-  /** Asks the elevated broker for a fresh sing-box and waits for its Clash API. */
-  private async restartElevatedCore(): Promise<void> {
-    this.coreTail = []
-    await writeFile(this.restartFile, '1', 'utf8')
-    // the broker removes the signal once the new sing-box is launched
-    for (let i = 0; i < 40 && existsSync(this.restartFile); i++) await sleep(200)
-    if (existsSync(this.restartFile)) {
-      await rm(this.restartFile, { force: true }).catch(() => undefined)
-      throw new Error('Служебный процесс TUN не отвечает — попробуйте подключиться ещё раз')
-    }
-    await this.waitCoreReady(CORE_READY_TIMEOUT_MS)
-  }
-
   /**
-   * Starts xray-core and waits until its first SOCKS inbound accepts
+   * Starts xray-core and waits until every SOCKS inbound accepts
    * connections. Throws (with a readable reason) if xray exits or times out.
    */
   private async startXray(ports: number[]): Promise<void> {
@@ -490,7 +724,11 @@ export class SidecarManager {
       // xray died while connected: tear everything down and show why
       const reason = this.xrayTail.at(-1)
       const msg = `Ядро Xray остановилось (код ${code ?? '?'}), соединение разорвано.${reason ? ` ${reason}` : ''}`
-      void this.stop(true).then(() => this.onState('error', msg))
+      void this.serial(async () => {
+        if (!this.running) return
+        await this.doStop(true)
+        this.onState('error', msg)
+      })
     })
     this.log('info', 'app', `Запуск xray: узлов VLESS — ${ports.length}, вход 127.0.0.1`)
 
@@ -506,7 +744,11 @@ export class SidecarManager {
       if (pending.size === 0) return
       await sleep(150)
     }
-    const reason = this.xrayTail.at(-1) ?? 'нет ответа'
+    // «Xray … started» is its normal banner, not a reason
+    const last = this.xrayTail.filter((l) => !/\bstarted\b/i.test(l)).at(-1)
+    const reason = exited
+      ? (last ?? `xray завершился`)
+      : `входы xray не отвечают (${pending.size} из ${ports.length})`
     await this.stopXray()
     throw new Error(`Не удалось запустить ядро Xray: ${reason}`)
   }
@@ -528,9 +770,7 @@ export class SidecarManager {
     const onData = (d: Buffer): void => {
       for (const raw of d.toString().split(/\r?\n/)) {
         const line = raw.trim()
-        if (!line) continue
-        this.coreTail = [...this.coreTail.slice(-6), line]
-        this.log(singboxLevel(line), 'singbox', line)
+        if (line) this.coreLine(line)
       }
     }
     proc.stdout?.on('data', onData)
@@ -543,81 +783,103 @@ export class SidecarManager {
     })
   }
 
-  /**
-   * TUN mode: launch an elevated PowerShell broker that starts sing-box and
-   * watches the stop-file. Triggers a single UAC prompt; disconnect just
-   * writes the stop-file (no second prompt).
-   */
-  private async startElevated(): Promise<void> {
-    this.elevation = 'pending'
-    const brokerPath = join(this.runDir, 'broker.ps1')
-    const script = brokerScript({
-      exe: this.exePath(),
-      config: this.configPath,
-      workDir: this.binDir,
-      stopFile: this.stopFile,
-      restartFile: this.restartFile,
-      exitFile: this.exitFile,
-      parentPid: process.pid
-    })
-    // BOM: Windows PowerShell 5.1 reads BOM-less scripts as ANSI (Cyrillic user names)
-    await writeFile(brokerPath, `\ufeff${script}`, 'utf8')
-
-    // outer (non-elevated) PowerShell requests elevation for the broker -> UAC
-    const launchCmd = `Start-Process -FilePath 'powershell.exe' -Verb RunAs -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',${psQuote(brokerPath)})`
-    const launcher = spawn(
-      'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-Command', launchCmd],
-      { windowsHide: true }
-    )
-    launcher.on('exit', (code) => {
-      // code 0 = UAC accepted & broker launched; non-zero/null = likely denied
-      this.elevation = code === 0 ? 'ok' : 'failed'
-      if (code !== 0 && !this.intentionalStop) {
-        this.log('error', 'app', `UAC отклонён или ошибка запуска (code=${code})`)
-      }
-    })
-    this.log('info', 'app', 'Запуск sing-box в режиме TUN (запрошены права администратора)')
-  }
-
   /** TUN: sing-box died under the broker while connected. */
-  private async coreDied(): Promise<void> {
-    if (!this.running || this.intentionalStop) return
-    this.running = false
-    const reason = await this.coreReason()
-    this.log('error', 'singbox', `sing-box завершился${reason}`)
-    await this.stop(true)
-    this.onState('error', `Ядро sing-box остановилось, соединение разорвано${reason}`)
+  private coreDied(): Promise<void> {
+    return this.serial(async () => {
+      if (!this.running || this.intentionalStop) return
+      this.running = false
+      const reason = await this.coreReason()
+      this.log('error', 'singbox', `sing-box завершился${reason}`)
+      await this.doStop(true)
+      this.onState('error', `Ядро sing-box остановилось, соединение разорвано${reason}`)
+    })
   }
 
   private maybeRestart(): void {
     if (this.intentionalStop || !this.lastParams) return
-    if (this.mode === 'tun') return // broker owns the elevated lifecycle
+    if (this.launcher) return // TUN: the broker owns the elevated lifecycle
     if (this.restarts >= MAX_RESTARTS) {
-      this.onState('error', 'Превышено число перезапусков ядра')
-      void this.stop(true)
+      void this.serial(async () => {
+        await this.doStop(true)
+        this.onState('error', 'Превышено число перезапусков ядра')
+      })
       return
     }
     this.restarts++
     this.log('warn', 'app', `Авто-перезапуск ядра (${this.restarts}/${MAX_RESTARTS})`)
     const params = this.lastParams
-    const restarts = this.restarts
+    const gen = this.opGen
     setTimeout(() => {
-      if (this.intentionalStop) return
-      void this.start(params)
-        .then(() => {
-          this.restarts = restarts
-        })
-        .catch(() => undefined)
+      void this.serial(async () => {
+        if (this.intentionalStop || gen !== this.opGen) return
+        await this.doStop(true)
+        await this.doStart(params, gen, true)
+      }).catch(() => undefined)
     }, 1500)
   }
 
-  /** Restart with a new config (rules changed, proxy mode changed). */
-  async reload(p: StartParams): Promise<void> {
-    if (!this.running) return
-    this.log('info', 'app', 'Применение новой конфигурации…')
-    await this.stop(true)
-    await this.start(p)
+  // --- rules on the fly ------------------------------------------------------
+
+  /** Writes the slot files that changed; `clean` = fresh start (old files removed). */
+  private async writeRuleFiles(layout: RuleLayout, clean: boolean): Promise<number> {
+    if (clean) {
+      this.written.clear()
+      for (const f of await readdir(this.rulesDir).catch(() => [] as string[])) {
+        if (/^cw-.*\.json/.test(f)) await rm(join(this.rulesDir, f), { force: true })
+      }
+    }
+    let changed = 0
+    for (const [name, text] of Object.entries(layout.files)) {
+      if (this.written.get(name) === text) continue
+      await writeAtomic(join(this.rulesDir, name), text)
+      this.written.set(name, text)
+      changed++
+    }
+    return changed
+  }
+
+  private async doApplyRules(p: StartParams, gen: number): Promise<void> {
+    const api = this.api
+    if (!api) return
+    const restart = async (why: string): Promise<void> => {
+      this.log('info', 'app', why)
+      await this.doStop(true)
+      await this.doStart(p, gen)
+    }
+    if (p.settings.proxyMode !== this.mode) {
+      return restart('Режим подключения изменился — перезапуск ядра')
+    }
+    if (
+      !sameIds(
+        p.outbounds.map((o) => o.id),
+        this.nodeIds
+      )
+    ) {
+      return restart('Список серверов изменился — перезапуск ядра')
+    }
+    const plan = planRules(p.rules, p.outbounds)
+    const geo = await this.geo.load(plan.geo)
+    if (gen !== this.opGen || !this.running) return
+    const layout = layoutRules(plan, this.groups, geo)
+    if (!layout) return restart('Правил стало намного больше — перезапуск ядра')
+
+    const changedFiles = await this.writeRuleFiles(layout, false)
+    if (changedFiles > 0) await this.launcher?.syncRules()
+    let changedSel = 0
+    for (const [sel, target] of Object.entries(layout.selectors)) {
+      if (this.selectors[sel] === target) continue
+      if (await api.select(sel, target).catch(() => false)) changedSel++
+      else this.log('warn', 'app', `Не удалось переключить ${sel}`)
+    }
+    this.selectors = { ...layout.selectors }
+    this.labelMap = layout.labels
+    if (this.lastParams) this.lastParams = { ...this.lastParams, rules: p.rules }
+    if (changedFiles === 0 && changedSel === 0) return
+    // let sing-box re-read the files, then move open connections to the new routes
+    await sleep(RULE_RELOAD_MS)
+    if (gen !== this.opGen || !this.running) return
+    await api.closeAll()
+    this.log('info', 'app', 'Правила применены без переподключения')
   }
 
   /** Правила / Весь трафик / Напрямую — on the fly; open connections are reset. */
@@ -754,19 +1016,19 @@ export class SidecarManager {
     }
   }
 
-  async stop(keepIntent = false): Promise<void> {
+  // --- stop ------------------------------------------------------------------
+
+  private async doStop(keepIntent: boolean): Promise<void> {
     this.intentionalStop = true
     this.running = false
     this.stopTrafficPolling()
 
     this.autoGen++
 
-    if (this.mode === 'tun') {
-      // signal the elevated broker to kill sing-box
-      await writeFile(this.stopFile, '1', 'utf8').catch(() => undefined)
-      // the broker deletes the stop-file once sing-box is gone
-      for (let i = 0; i < 20 && existsSync(this.stopFile); i++) await sleep(150)
-      await rm(this.exitFile, { force: true }).catch(() => undefined)
+    const launcher = this.launcher
+    this.launcher = null
+    if (launcher) {
+      await launcher.stop()
     } else {
       const child = this.child
       this.child = null
@@ -794,9 +1056,10 @@ export class SidecarManager {
 
   // --- log file tailing (TUN mode has no stdio) ---------------------------
 
-  private startLogTail(): void {
+  private startLogTail(path: string, from = 0): void {
     this.stopLogTail()
-    this.tailPos = 0
+    this.tailPath = path
+    this.tailPos = from
     this.tailTimer = setInterval(() => void this.tailOnce(), 600)
   }
   private stopLogTail(): void {
@@ -804,21 +1067,20 @@ export class SidecarManager {
     this.tailTimer = null
   }
   private async tailOnce(): Promise<void> {
+    if (!this.tailPath) return
     try {
-      const st = await stat(this.logPath)
+      const st = await stat(this.tailPath)
       if (st.size < this.tailPos) this.tailPos = 0 // a restarted core recreated the file
       if (st.size <= this.tailPos) return
-      const fh = await open(this.logPath, 'r')
-      const len = st.size - this.tailPos
+      const fh = await open(this.tailPath, 'r')
+      const len = Math.min(st.size - this.tailPos, 4 * 1024 * 1024)
       const buf = Buffer.alloc(len)
       await fh.read(buf, 0, len, this.tailPos)
       await fh.close()
-      this.tailPos = st.size
+      this.tailPos += len
       for (const line of buf.toString('utf8').split(/\r?\n/)) {
         const t = line.trim()
-        if (!t) continue
-        this.coreTail = [...this.coreTail.slice(-6), t]
-        this.log(singboxLevel(t), 'singbox', t)
+        if (t) this.coreLine(t)
       }
     } catch {
       /* log file not created yet */
@@ -854,9 +1116,10 @@ export class SidecarManager {
   /**
    * Right after connecting: «Лучший сервер (авто)» shows «проверяем…» until
    * the urltest group has checked its members (sing-box does that on start;
-   * the explicit /group/auto/delay is a no-op then, and a real check if the
-   * startup one didn't happen). Then: the chosen node and its latency, every
-   * node's latency for the list, or an honest «no server answers».
+   * `now` only appears once the slowest member answered or timed out). Then:
+   * the chosen node and its latency, every node's latency for the list.
+   * «No server answers» only after TWO failed checks 5 s apart — one miss
+   * right after a (TUN) start is not a verdict.
    */
   private async autoCheck(): Promise<void> {
     const api = this.api
@@ -864,7 +1127,6 @@ export class SidecarManager {
     const gen = this.autoGen
     const alive = (): boolean => this.running && this.autoGen === gen && this.api === api
     this.setAuto({ checking: true, dead: false })
-    void api.groupDelay(TAG_AUTO)
 
     const deadline = Date.now() + AUTO_FIRST_CHECK_MS
     let st = await api.proxyState(TAG_AUTO)
@@ -872,37 +1134,47 @@ export class SidecarManager {
       await sleep(400)
       st = await api.proxyState(TAG_AUTO)
     }
-    if (!alive()) return
-    if (!st?.now) {
-      // nothing yet — one explicit check, it ends within its own timeout
-      await api.groupDelay(TAG_AUTO)
+    let failures = 0
+    while (alive()) {
+      const all = await api.proxies()
+      if (!alive()) return
+      let anyAlive = false
+      if (all) {
+        const pings = this.nodeIds.map((id) => ({
+          outboundId: id,
+          latencyMs: all[id]?.delay ?? null
+        }))
+        anyAlive = pings.some((x) => x.latencyMs !== null)
+        this.remember(pings)
+        this.onPings(pings)
+      }
+      const dead = (!st?.now || st.delay === undefined) && !anyAlive
+      if (!dead) {
+        this.setAuto({
+          nodeId: st?.now || undefined,
+          delayMs: st?.delay ?? null,
+          checking: false,
+          dead: false
+        })
+        return
+      }
+      failures++
+      if (failures >= 2) {
+        this.setAuto({ nodeId: st?.now || undefined, delayMs: null, checking: false, dead: true })
+        this.log(
+          'warn',
+          'app',
+          'Ни один сервер не ответил на проверку — проверьте интернет или выберите сервер вручную'
+        )
+        return
+      }
+      this.log('info', 'app', 'Проверка серверов не дала ответа — повтор через 5 с')
+      await sleep(AUTO_RETRY_MS)
+      if (!alive()) return
+      // a real check now (the startup one is over); it ends with its slowest member
+      await api.groupDelay(TAG_AUTO, LATENCY_TIMEOUT_MS, AUTO_CHECK_WAIT_MS)
       if (!alive()) return
       st = await api.proxyState(TAG_AUTO)
-    }
-
-    const all = await api.proxies()
-    if (!alive()) return
-    if (all) {
-      const pings = this.nodeIds.map((id) => ({
-        outboundId: id,
-        latencyMs: all[id]?.delay ?? null
-      }))
-      this.remember(pings)
-      this.onPings(pings)
-    }
-    const dead = !st?.now || st.delay === undefined
-    this.setAuto({
-      nodeId: st?.now || undefined,
-      delayMs: dead ? null : st?.delay,
-      checking: false,
-      dead
-    })
-    if (dead) {
-      this.log(
-        'warn',
-        'app',
-        'Ни один сервер не ответил на проверку — проверьте интернет или выберите сервер вручную'
-      )
     }
   }
 
@@ -913,13 +1185,9 @@ export class SidecarManager {
     if (!api) return
     const st = await api.proxyState(TAG_AUTO)
     if (!st || !this.running || this.auto.checking) return
-    const dead = !st.now || st.delay === undefined
-    this.setAuto({
-      nodeId: st.now || undefined,
-      delayMs: dead ? null : st.delay,
-      checking: false,
-      dead
-    })
+    // a «dead» verdict is only lifted by a real answer, never set here
+    if (!st.now || st.delay === undefined) return
+    this.setAuto({ nodeId: st.now, delayMs: st.delay, checking: false, dead: false })
   }
 
   private async pollTraffic(): Promise<void> {
@@ -928,7 +1196,7 @@ export class SidecarManager {
     ++this.tick
     if (this.tick % 5 === 0) void this.refreshAuto()
     // TUN: the broker reports a sing-box that died on its own
-    if (this.mode === 'tun' && this.tick % 2 === 0 && existsSync(this.exitFile)) {
+    if (this.launcher && this.tick % 2 === 0 && (await this.launcher.exited())) {
       void this.coreDied()
       return
     }
