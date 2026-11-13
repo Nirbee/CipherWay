@@ -68,13 +68,19 @@ export class ClashApi {
     }
   }
 
+  /**
+   * true only if the core really is in `mode` afterwards: sing-box answers 204
+   * to a mode it doesn't know (not in its mode-list) and keeps the old one.
+   */
   async setMode(mode: string): Promise<boolean> {
     const res = await this.req('/configs', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ mode })
     })
-    return res.ok
+    if (!res.ok) return false
+    const now = await this.getMode()
+    return now !== null && now.toLowerCase() === mode.toLowerCase()
   }
 
   async getMode(): Promise<string | null> {

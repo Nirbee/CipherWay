@@ -44,6 +44,8 @@ export interface ConnContext {
   now: number
   /** rule-set tag of a rule slot → what the user wrote (rules/compile.ts) */
   labels?: Record<string, string>
+  /** rule-set tag → PROCESS-NAME values of its run (rules/compile.ts) */
+  programs?: Record<string, string[]>
 }
 
 /** a direct connection that got nothing back for this long is probably blocked */
@@ -57,6 +59,9 @@ export function exeOf(path: string | undefined): string | undefined {
   return name || undefined
 }
 
+/** a rule slot of the user's rules (rules/compile.ts) in sing-box's rule text */
+const SLOT_RE = /rule_set=\[?(cw-\d+-[dpx])\]?/
+
 /** `domain_suffix=[x.com] => route(ob_1)` → «домен x.com»; no node ids survive. */
 export function describeRule(
   rule: string | undefined,
@@ -66,11 +71,13 @@ export function describeRule(
   if (!r || r === 'final') return 'Всё остальное'
   const cond = r.split('=>')[0].trim()
   // the user's rules live in slots (rule_set=cw-3-p) — show what they wrote
-  const slot = /rule_set=\[?(cw-\d+-[dpx])\]?/.exec(cond)?.[1]
+  const slot = SLOT_RE.exec(cond)?.[1]
   if (slot) return labels[slot] ?? 'Правило'
   const mode = /clash_mode=(\w+)/i.exec(cond)?.[1]?.toLowerCase()
   if (mode === 'global') return 'Режим «Весь трафик через VPN»'
   if (mode === 'direct') return 'Режим «Напрямую»'
+  // the tail rule of the «Правила» mode (configGen RULE_MODE_TAIL) = route.final
+  if (mode === 'rule') return 'Всё остальное'
   if (/ip_is_private/.test(cond)) return 'Локальная сеть'
   const list = (key: string): string | undefined => {
     const m =
@@ -95,6 +102,26 @@ export function describeRule(
   }
   if (/process_name|process_path/.test(cond)) return 'Правило по процессу'
   return 'Правило'
+}
+
+/**
+ * The rule of one connection. A run of «программа …» rules is one slot: its
+ * label names the first program («программа lyrebird.exe и ещё 9») — for a
+ * connection of a program from that run say which one matched.
+ */
+export function connectionRule(
+  rule: string | undefined,
+  process: string | undefined,
+  labels: Record<string, string> = {},
+  programs: Record<string, string[]> = {}
+): string {
+  const slot = SLOT_RE.exec((rule ?? '').split('=>')[0])?.[1]
+  if (slot && process) {
+    const p = process.toLowerCase()
+    const hit = programs[slot]?.find((x) => x.toLowerCase() === p)
+    if (hit) return `программа ${hit}`
+  }
+  return describeRule(rule, labels)
 }
 
 /** Node hosts / IPs, lower-case, for hiding connections that target them. */
@@ -139,7 +166,7 @@ export function toConnItems(raw: RawConnections, ctx: ConnContext): ConnItem[] {
       host: host || '—',
       port: md.destinationPort ?? '',
       network: md.network ?? 'tcp',
-      rule: describeRule(c.rule, ctx.labels),
+      rule: connectionRule(c.rule, process, ctx.labels, ctx.programs),
       route,
       serverName,
       ...(route === 'direct' &&

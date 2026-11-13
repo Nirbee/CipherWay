@@ -20,7 +20,8 @@ const UPLOAD =
 const DOWNLOAD = 'ERROR [1 1s] connection: connection download closed: EOF'
 const ABORTED =
   'ERROR [2882759649 627ms] connection: connection upload closed: raw read: An established connection was aborted by the software in your host machine.'
-const FORCED = 'ERROR [1 1s] connection: read tcp: wsarecv: An existing connection was forcibly closed by the remote host.'
+const FORCED =
+  'ERROR [1 1s] connection: read tcp: wsarecv: An existing connection was forcibly closed by the remote host.'
 const REFUSED =
   'ERROR [3437728933 0ms] connection: open connection to 149.154.167.41:80 using outbound/socks[ob_10jcdoh]: dial tcp 127.0.0.1:54760: connectex: No connection could be made because the target machine actively refused it.'
 const REALITY =
@@ -88,5 +89,36 @@ describe('LogFilter: endless repeats', () => {
     f.tick(5000)
     f.flush(5000)
     expect(out).toHaveLength(1)
+  })
+})
+
+describe('LogFilter: connection errors that flood the log (0.4.5)', () => {
+  const TIMEOUT = (ip: string) =>
+    `ERROR [1 5.0s] connection: open connection to ${ip}:443 using outbound/direct[direct]: dial tcp ${ip}:443: i/o timeout`
+  const IDLE =
+    'ERROR [2 30s] connection: open connection to 1.1.1.1:443 using outbound/hysteria2[ob_de]: timeout: no recent network activity'
+
+  it('one line + one summary per window, per kind of error and outbound', () => {
+    const { f, out } = setup(1000)
+    for (let t = 0; t < 40; t++) {
+      f.push(line(TIMEOUT(`149.154.167.${t}`), t), false)
+      f.push(line(IDLE, t), false)
+    }
+    expect(out.map((e) => e.message)).toEqual([TIMEOUT('149.154.167.0'), IDLE])
+    f.tick(1000)
+    expect(out).toHaveLength(4)
+    expect(out[2].message).toBe(
+      '… ещё строк: 39 за 1 с (нет ответа (timeout), outbound/direct[direct])'
+    )
+    expect(out[3].message).toMatch(
+      /^… ещё строк: 39 .*no recent network activity.*hysteria2\[ob_de\]/
+    )
+  })
+
+  it('the same error through another outbound is a group of its own', () => {
+    const { f, out } = setup(1000)
+    f.push(line(TIMEOUT('1.2.3.4'), 0), false)
+    f.push(line(TIMEOUT('1.2.3.4').replace('direct[direct]', 'socks[ob_fi]'), 1), false)
+    expect(out).toHaveLength(2)
   })
 })

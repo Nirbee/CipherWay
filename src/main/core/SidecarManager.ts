@@ -51,6 +51,8 @@ export interface StartParams {
   settings: AppSettings
   /** last known latency per node id (persisted) — orders the urltest group */
   latencies?: Record<string, number | null>
+  /** hosts the app reaches outside the tunnel in every mode (the subscription server) */
+  directHosts?: string[]
 }
 
 /** Optional reactions of the app + what tests replace. */
@@ -61,6 +63,12 @@ export interface ManagerHooks {
   onRealityHeal?: () => void
   /** node id → hint for the server list */
   onServerHints?: (hints: Record<string, string>) => void
+  /**
+   * The routing mode the user has chosen right now (the store). StartParams are
+   * a snapshot: a start / reload waiting in the queue or creating the adapter
+   * must not bring back the mode of the moment it was requested.
+   */
+  routingMode?: () => RoutingMode
   /** tests: a broker that needs no elevation */
   launcherFactory?: (paths: LauncherPaths, cancelled: () => boolean) => Promise<TunLauncher>
 }
@@ -98,6 +106,10 @@ const AUTO_RETRY_MS = 5000
 const AUTO_CHECK_WAIT_MS = 20_000
 /** sing-box re-reads a changed local rule-set within ~0.3 s (1.13.14) */
 const RULE_RELOAD_MS = 800
+/** PATCH /configs + read-back attempts right after a start */
+const MODE_SET_TRIES = 3
+/** the core's mode is compared with the chosen one this often (s) */
+const MODE_CHECK_TICKS = 5
 
 const NO_AUTO: AutoInfo = { checking: false, dead: false }
 
@@ -163,7 +175,9 @@ const sameIds = (a: string[], b: string[]): boolean =>
 
 /** 12500 → «12,5 с» */
 const seconds = (ms: number | null | undefined): string =>
-  ms === null || ms === undefined ? '?' : `${(ms / 1000).toFixed(1).replace('.', ',').replace(',0', '')} с`
+  ms === null || ms === undefined
+    ? '?'
+    : `${(ms / 1000).toFixed(1).replace('.', ',').replace(',0', '')} с`
 
 /** `ERROR [123 5ms] connection: …` is about one connection, never about the core itself. */
 const CONNECTION_LINE_RE = /ERROR\s+\[\d+ [^\]]*\]|\bconnection: /
@@ -242,6 +256,9 @@ export class SidecarManager {
   private written = new Map<string, string>()
   private selectors: Record<string, string> = {}
   private labelMap: Record<string, string> = {}
+  private programMap: Record<string, string[]> = {}
+  /** «mode differs» already logged for this core mode → chosen mode */
+  private modeWarned = ''
   readonly failures = new DirectFailures()
 
   private trafficTimer: NodeJS.Timeout | null = null
@@ -351,6 +368,10 @@ export class SidecarManager {
   get labels(): Record<string, string> {
     return this.labelMap
   }
+  /** rule-set tag → PROCESS-NAME values of its run (for «Подключения») */
+  get programs(): Record<string, string[]> {
+    return this.programMap
+  }
   /** tests: pid of the system-proxy mode sing-box */
   get corePid(): number | undefined {
     return this.child?.pid
@@ -458,7 +479,14 @@ export class SidecarManager {
 
   // --- start -----------------------------------------------------------------
 
+  /** Правила / Весь трафик / Напрямую as chosen now (see ManagerHooks.routingMode). */
+  private wantedMode(p: StartParams | null = this.lastParams): RoutingMode {
+    return this.hooks.routingMode?.() ?? p?.settings.routingMode ?? 'rule'
+  }
+
   private async doStart(p: StartParams, gen: number): Promise<void> {
+    // a reload queued a while ago carries the mode of that moment
+    p = { ...p, settings: { ...p.settings, routingMode: this.wantedMode(p) } }
     // a latency probe holds its own cores — let it finish first
     if (this.probing) await this.probing.catch(() => undefined)
     // a previous xray (e.g. auto-restart path) must be gone before ports are re-bound
@@ -539,6 +567,7 @@ export class SidecarManager {
       await this.writeRuleFiles(layout, true)
       this.selectors = { ...layout.selectors }
       this.labelMap = layout.labels
+      this.programMap = layout.programs
 
       const logFile = this.launcher?.coreLogPath ?? this.logPath
       const clashSecret = randomBytes(16).toString('hex')
@@ -558,7 +587,8 @@ export class SidecarManager {
         logFile,
         xrayPorts,
         serverIps,
-        latencies: { ...(p.latencies ?? {}), ...this.recentPings }
+        latencies: { ...(p.latencies ?? {}), ...this.recentPings },
+        directHosts: p.directHosts
       })
       await writeFile(this.configPath, JSON.stringify(cfg, null, 2), 'utf8')
 
@@ -604,6 +634,9 @@ export class SidecarManager {
         this.log('info', 'app', `Системный прокси включён на 127.0.0.1:${this.ports.http}`)
       }
       this.running = true
+      this.modeWarned = ''
+      // the mode may have been switched while the adapter was being created
+      await this.ensureMode()
       this.startTrafficPolling()
       this.onState('connected')
       void this.autoCheck()
@@ -667,7 +700,22 @@ export class SidecarManager {
   private async applyRuntimeChoices(p: StartParams): Promise<void> {
     const api = this.api
     if (!api) return
-    await api.setMode(CLASH_MODE[p.settings.routingMode]).catch(() => false)
+    const mode = this.wantedMode(p)
+    p.settings = { ...p.settings, routingMode: mode }
+    // read back: a 204 alone proves nothing (see RULE_MODE_TAIL in configGen.ts)
+    let ok = false
+    for (let i = 0; i < MODE_SET_TRIES && !ok; i++) {
+      if (i > 0) await sleep(300)
+      ok = await api.setMode(CLASH_MODE[mode]).catch(() => false)
+    }
+    const now = await api.getMode().catch(() => null)
+    this.log(
+      ok ? 'info' : 'warn',
+      'app',
+      ok
+        ? `Режим ядра: ${now ?? CLASH_MODE[mode]}`
+        : `Ядро не переключилось в режим ${CLASH_MODE[mode]} (сейчас ${now ?? '?'})`
+    )
     const ids = new Set(p.outbounds.map((o) => o.id))
     const target =
       p.activeOutboundId && (p.activeOutboundId === AUTO_OUTBOUND_ID || ids.has(p.activeOutboundId))
@@ -1016,7 +1064,8 @@ export class SidecarManager {
       }
     }
     // the reason only if the process itself said why it couldn't start
-    const told = /: /.test(startError) && !/входы xray не отвечают|xray завершился$/.test(startError)
+    const told =
+      /: /.test(startError) && !/входы xray не отвечают|xray завершился$/.test(startError)
     await this.doStop(true)
     this.onState(
       'error',
@@ -1103,6 +1152,7 @@ export class SidecarManager {
     }
     this.selectors = { ...layout.selectors }
     this.labelMap = layout.labels
+    this.programMap = layout.programs
     if (this.lastParams) this.lastParams = { ...this.lastParams, rules: p.rules }
     if (changedFiles === 0 && changedSel === 0) return
     // let sing-box re-read the files, then move open connections to the new routes
@@ -1118,13 +1168,15 @@ export class SidecarManager {
       this.lastParams.settings = { ...this.lastParams.settings, routingMode: mode }
     const api = this.clash
     if (!api) return false
+    // true only once GET /configs shows the new mode
     const ok = await api.setMode(CLASH_MODE[mode]).catch(() => false)
     // existing connections keep their old route otherwise
     if (ok) await api.closeAll()
+    if (ok) this.modeWarned = ''
     this.log(
       ok ? 'info' : 'warn',
       'app',
-      ok ? `Режим: ${CLASH_MODE[mode]}` : 'Не удалось сменить режим'
+      ok ? `Режим ядра: ${CLASH_MODE[mode]}` : `Ядро не переключилось в режим ${CLASH_MODE[mode]}`
     )
     return ok
   }
@@ -1425,6 +1477,31 @@ export class SidecarManager {
     this.setAuto({ nodeId: st.now, delayMs: st.delay, checking: false, dead: false })
   }
 
+  /**
+   * The core's mode must be the chosen one (the app shows that one). A
+   * difference is repaired and logged once — whatever caused it.
+   */
+  private async ensureMode(): Promise<void> {
+    const api = this.clash
+    if (!api) return
+    const want = CLASH_MODE[this.wantedMode()]
+    const now = await api.getMode().catch(() => null)
+    if (now === null || now.toLowerCase() === want.toLowerCase()) return
+    const ok = await api.setMode(want).catch(() => false)
+    if (ok) await api.closeAll()
+    const key = `${now}>${want}`
+    if (ok) this.modeWarned = ''
+    else if (this.modeWarned === key) return
+    else this.modeWarned = key
+    this.log(
+      'warn',
+      'app',
+      ok
+        ? `Режим ядра был ${now} вместо ${want} — исправлено`
+        : `Ядро осталось в режиме ${now}, выбран ${want} — переподключитесь`
+    )
+  }
+
   private async pollTraffic(): Promise<void> {
     const api = this.clash
     if (!api) return
@@ -1432,6 +1509,7 @@ export class SidecarManager {
     this.logFilter.tick()
     if (this.tick % 60 === 0 && this.reality.prune()) this.publishHints()
     if (this.tick % 5 === 0) void this.refreshAuto()
+    if (this.tick % MODE_CHECK_TICKS === 0 && !this.recovering) void this.ensureMode()
     // nothing may stay dead unnoticed (an exit that fell between two restarts)
     if (!this.recovering && !this.intentionalStop) {
       if (this.xrayPorts.length > 0 && !this.xray) return this.recover('Xray', null)

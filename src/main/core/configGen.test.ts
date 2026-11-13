@@ -8,6 +8,7 @@ import { parseOutbounds } from '../remnawave/parsers'
 import { filterSubscription } from '../remnawave/subscriptionGuard'
 import {
   buildOutbound,
+  directHostRules,
   generateProbeConfig,
   generateSingboxConfig,
   groupOutbounds,
@@ -315,9 +316,58 @@ describe('routing modes (Правила / Весь трафик / Напряму
     expect(rules).toContainEqual({ clash_mode: 'Global', server: 'remote' })
   })
 
+  it('every mode stays reachable over the Clash API, whatever default_mode (0.4.5)', () => {
+    // sing-box 1.13 accepts only modes named by a clash_mode rule (+ default_mode):
+    // a core started in Global used to answer 204 to «Rule» and stay in Global
+    for (const routingMode of ['rule', 'global', 'direct'] as const) {
+      const rules = singbox({ routingMode }).route.rules
+      const modes = new Set(rules.map((r) => r.clash_mode).filter(Boolean))
+      expect([...modes].sort()).toEqual(['Direct', 'Global', 'Rule'])
+    }
+  })
+
+  it('the «Rule» tail rule is the last one and does what route.final does', () => {
+    const cfg = singbox()
+    expect(cfg.route.rules.at(-1)).toEqual({
+      clash_mode: 'Rule',
+      action: 'route',
+      outbound: 'cw-final'
+    })
+    expect(cfg.route.final).toBe('cw-final')
+  })
+
   it('process lookup is on (Подключения screen) in both proxy modes', () => {
     expect(singbox().route.find_process).toBe(true)
     expect(singbox({ proxyMode: 'tun' }).route.find_process).toBe(true)
+  })
+})
+
+describe('the subscription server bypasses the tunnel (0.4.5)', () => {
+  it('domains by name, IP literals by address — one matcher kind per rule', () => {
+    expect(directHostRules(['Sub.Example.com', '', '203.0.113.5', '[2001:db8::1]'])).toEqual([
+      { domain: ['sub.example.com'], action: 'route', outbound: 'direct' },
+      { ip_cidr: ['203.0.113.5/32', '2001:db8::1/128'], action: 'route', outbound: 'direct' }
+    ])
+    expect(directHostRules([])).toEqual([])
+    expect(directHostRules()).toEqual([])
+  })
+
+  it('direct before the mode switch (works in «Весь трафик» too), resolved locally', () => {
+    for (const proxyMode of ['system', 'tun'] as const) {
+      const cfg = singbox(
+        { proxyMode, routingMode: 'global' },
+        { directHosts: ['sub.example.com'] }
+      )
+      const rules = cfg.route.rules
+      const sub = rules.findIndex((r) => r.domain?.includes('sub.example.com'))
+      const global = rules.findIndex((r) => r.clash_mode === 'Global')
+      expect(sub).toBeGreaterThan(rules.findIndex((r) => r.action === 'sniff'))
+      expect(sub).toBeLessThan(global)
+      expect(rules[sub].outbound).toBe('direct')
+      const dns = (cfg.dns as { rules: { domain?: string[]; server: string }[] }).rules
+      expect(dns[0].server).toBe('local')
+      expect(dns[0].domain).toContain('sub.example.com')
+    }
   })
 })
 
@@ -488,6 +538,7 @@ describe('real core validation', () => {
           {
             serverIps: SERVER_IPS,
             latencies: { [outbounds[0].id]: null },
+            directHosts: ['sub.example.com', '203.0.113.5'],
             slots: writeSlots(TEST_RULES, `slots-${mode}-${routingMode}`)
           }
         )

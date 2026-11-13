@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { OutboundConfig } from '@shared/types'
 import {
+  connectionRule,
   describeRule,
   DirectFailures,
   exeOf,
@@ -85,7 +86,11 @@ describe('toConnItems', () => {
     const items = toConnItems(
       {
         connections: [
-          conn({ id: 'x', ip: '203.0.113.10', path: 'C:\\CipherWay\\resources\\bin\\cipherway-xray.exe' }),
+          conn({
+            id: 'x',
+            ip: '203.0.113.10',
+            path: 'C:\\CipherWay\\resources\\bin\\cipherway-xray.exe'
+          }),
           conn({ id: 'y', host: 'fi.example.com', path: 'C:\\x\\curl.exe' }),
           conn({ id: 'z', ip: '203.0.113.10', path: 'C:\\x\\curl.exe' }),
           conn({ id: 'ok', host: 'example.org' })
@@ -181,6 +186,39 @@ describe('rule slots (0.4.2)', () => {
       serverName: 'Финляндия',
       rule: 'программа discord.exe и ещё 2'
     })
+  })
+
+  it('«Правила» mode tail rule (clash_mode=Rule → cw-final) is «Всё остальное», not a mode', () => {
+    expect(describeRule('clash_mode=Rule => route(cw-final)')).toBe('Всё остальное')
+    expect(describeRule('clash_mode=Global => route(proxy)')).toBe('Режим «Весь трафик через VPN»')
+  })
+
+  it('a run of programs: the connection names the program that matched (0.4.5)', () => {
+    const programs = { 'cw-0-p': ['lyrebird.exe', 'Discord.exe', 'chrome.exe'] }
+    const lbl = { 'cw-0-p': 'программа lyrebird.exe и ещё 2' }
+    const rule = 'rule_set=cw-0-p => route(cw-0)'
+    expect(connectionRule(rule, 'chrome.exe', lbl, programs)).toBe('программа chrome.exe')
+    expect(connectionRule(rule, 'discord.exe', lbl, programs)).toBe('программа Discord.exe')
+    // matched by another rule of the run (or no process known): the run label
+    expect(connectionRule(rule, 'curl.exe', lbl, programs)).toBe('программа lyrebird.exe и ещё 2')
+    expect(connectionRule(rule, undefined, lbl, programs)).toBe('программа lyrebird.exe и ещё 2')
+    // a mode / final rule is never renamed after the program
+    expect(connectionRule('final', 'chrome.exe', lbl, programs)).toBe('Всё остальное')
+    const [item] = toConnItems(
+      {
+        connections: [
+          conn({
+            id: 'y',
+            host: 'yoomoney.ru',
+            path: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+            chains: ['ob_de', 'proxy', 'cw-0'],
+            rule
+          })
+        ]
+      },
+      { outbounds, prev: new Map(), now, labels: lbl, programs }
+    )
+    expect(item).toMatchObject({ rule: 'программа chrome.exe', serverName: 'Германия' })
   })
 
   it('a direct connection with nothing received for a few seconds is «stalled»', () => {

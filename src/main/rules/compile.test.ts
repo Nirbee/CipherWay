@@ -212,6 +212,8 @@ describe('layoutRules: runs → slots D0 P0 X0 D1 …, first match wins', () => 
       'cw-1-x': 'домен ads.com',
       'cw-2-p': 'домен b.com'
     })
+    // «Подключения» names the matched program of a run (0.4.5)
+    expect(l.programs).toEqual({ 'cw-0-p': ['Telegram.exe'] })
     // every slot has its files (5 per group), every file is a rule-set the broker accepts
     expect(Object.keys(l.files)).toHaveLength(8 * 5)
     for (const t of Object.values(l.files)) expect(t.startsWith('{"version":3,')).toBe(true)

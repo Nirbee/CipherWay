@@ -281,3 +281,22 @@ proxy mocked): `CW_E2E=1 npx vitest run src/main/core/sidecar.e2e.test.ts`.
   Dev / unpacked: no feed; `CIPHERWAY_DEV_FAKE_UPDATE=0.4.99` (or `0.4.99:flaky`,
   `fail`) simulates one.
 - **«LAN»** in the sidebar: a placeholder for rooms to play over the network.
+
+## 0.4.5: the traffic mode on screen is the mode of the core
+
+- **Bug**: a core started in «Весь трафик» / «Напрямую» could never go back to
+  «По правилам». sing-box 1.13 only accepts modes named by some `clash_mode` rule
+  (plus `default_mode`); there was no rule for `Rule`, so `PATCH /configs` answered
+  204 and the core stayed in Global/Direct while the app showed «По правилам».
+  Now the last route rule is `clash_mode: Rule → cw-final` (same as `route.final`),
+  so all three modes are always switchable.
+- The mode is read back (`GET /configs`) after every switch and start (three tries,
+  «Режим ядра: Rule» in «Логи»), and checked every 5 s while connected — a mismatch is
+  repaired and logged. A start / reload takes the mode from the store at the moment it
+  runs, not from the queued snapshot (mode switched while connecting).
+- The subscription server goes direct in every mode (TUN too): the refresh that fixes
+  a broken tunnel no longer goes through it.
+- «Подключения»: a connection matched by a run of program rules names its program
+  («программа chrome.exe», not «программа lyrebird.exe и ещё 9»).
+- «Логи»: endless `i/o timeout` / `no recent network activity` lines are collapsed per
+  error and outbound («… ещё строк: N за 30 с»).

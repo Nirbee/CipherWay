@@ -5,8 +5,10 @@ import type { LogEntry } from '@shared/types'
 //  * ordinary broken connections (the user closed a tab, a site reset the
 //    stream) — hidden unless «Подробный журнал» is on;
 //  * endless repeats (REALITY with a stale key, «connection refused» to our own
-//    loopback ports while a core restarts) — the first line stays, the rest
-//    become one «… ещё N таких строк» per window.
+//    loopback ports while a core restarts, a dead node / a blocked direct
+//    route: thousands of «i/o timeout» / «no recent network activity» a minute)
+//    — the first line stays, the rest become one «… ещё строк: N за 30 с» per
+//    window, per kind of error and outbound.
 // Application lines are never touched. Pure — unit tested in logFilter.test.ts.
 // ---------------------------------------------------------------------------
 
@@ -38,10 +40,28 @@ const COLLAPSE: CollapseRule[] = [
   }
 ]
 
+/** connection errors that repeat endlessly when a node or the direct route is dead */
+const CONN_KINDS: { re: RegExp; label: string }[] = [
+  { re: /i\/o timeout|timed out|did not properly respond/i, label: 'нет ответа (timeout)' },
+  { re: /no recent network activity/i, label: 'нет активности (no recent network activity)' }
+]
+const OUTBOUND_RE = /\b(outbound\/[\w-]+\[[^\]]*\])/
+
+/** Collapse group of a line: a fixed one, or kind + outbound of a connection error. */
+export function collapseKey(message: string): { key: string; label: string } | null {
+  const rule = COLLAPSE.find((c) => c.re.test(message))
+  if (rule) return { key: rule.key, label: rule.label }
+  if (!/connection: |outbound\//.test(message)) return null
+  const kind = CONN_KINDS.find((k) => k.re.test(message))
+  if (!kind) return null
+  const out = OUTBOUND_RE.exec(message)?.[1]
+  return { key: `${kind.label}|${out ?? ''}`, label: out ? `${kind.label}, ${out}` : kind.label }
+}
+
 export const COLLAPSE_WINDOW_MS = 30_000
 
 interface Group {
-  rule: CollapseRule
+  label: string
   first: number
   count: number
   level: LogEntry['level']
@@ -61,15 +81,21 @@ export class LogFilter {
   push(e: LogEntry, verbose: boolean): void {
     if (e.source === 'app') return this.emit(e)
     if (!verbose && isOrdinaryClose(e.message)) return
-    const rule = COLLAPSE.find((c) => c.re.test(e.message))
-    if (!rule) return this.emit(e)
-    const g = this.groups.get(rule.key)
+    const c = collapseKey(e.message)
+    if (!c) return this.emit(e)
+    const g = this.groups.get(c.key)
     if (!g) {
-      this.groups.set(rule.key, { rule, first: e.ts, count: 0, level: e.level, source: e.source })
+      this.groups.set(c.key, {
+        label: c.label,
+        first: e.ts,
+        count: 0,
+        level: e.level,
+        source: e.source
+      })
       return this.emit(e)
     }
     g.count++
-    if (e.ts - g.first >= this.windowMs) this.close(rule.key, g, e.ts)
+    if (e.ts - g.first >= this.windowMs) this.close(c.key, g, e.ts)
   }
 
   /** Closes the windows that ended (called once a second while connected). */
@@ -92,7 +118,7 @@ export class LogFilter {
       ts: now,
       level: g.level,
       source: g.source,
-      message: `… ещё строк: ${g.count} за ${sec} с (${g.rule.label})`
+      message: `… ещё строк: ${g.count} за ${sec} с (${g.label})`
     })
   }
 }

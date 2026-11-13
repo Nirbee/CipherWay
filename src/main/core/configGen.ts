@@ -47,6 +47,11 @@ export interface GenParams {
   serverIps?: ServerIps
   /** last measured latency per node id (null = no answer) — urltest order */
   latencies?: Record<string, number | null | undefined>
+  /**
+   * hosts the app itself must reach outside the tunnel in every mode (the
+   * subscription server: its refresh is what repairs a broken tunnel)
+   */
+  directHosts?: string[]
 }
 
 /**
@@ -101,6 +106,32 @@ export function buildOutbound(o: OutboundConfig, xrayPort?: number): SbOutbound 
 }
 
 const IPV4_RE = /^\d{1,3}(\.\d{1,3}){3}$/
+
+/**
+ * Route rules for hosts that always go direct (see GenParams.directHosts):
+ * domains by name (sniffed SNI / Host), IP literals by address. Matchers of
+ * different kinds in one sing-box rule are AND-ed — so one rule per kind.
+ */
+export function directHostRules(hosts: string[] = []): SbRouteRule[] {
+  const domains = new Set<string>()
+  const cidrs = new Set<string>()
+  for (const raw of hosts) {
+    const h = raw
+      .trim()
+      .toLowerCase()
+      .replace(/^\[|\]$/g, '')
+    if (!h) continue
+    if (IPV4_RE.test(h)) cidrs.add(`${h}/32`)
+    else if (h.includes(':')) cidrs.add(`${h}/128`)
+    else domains.add(h)
+  }
+  return [
+    ...(domains.size
+      ? [{ domain: [...domains], action: 'route' as const, outbound: TAG_DIRECT }]
+      : []),
+    ...(cidrs.size ? [{ ip_cidr: [...cidrs], action: 'route' as const, outbound: TAG_DIRECT }] : [])
+  ]
+}
 
 /** Node hostnames (not IP literals) — resolved directly, never via the tunnel. */
 export function serverDomains(outbounds: OutboundConfig[]): string[] {
@@ -209,12 +240,29 @@ export const MODE_RULES: SbRouteRule[] = [
   { clash_mode: CLASH_MODE.global, action: 'route', outbound: TAG_PROXY_GROUP }
 ]
 
+/**
+ * Last route rule: in the «Правила» mode whatever no slot matched goes to
+ * cw-final — exactly what route.final does. It exists for the Clash API:
+ * sing-box (checked on 1.13.14) accepts only the modes named in some rule's
+ * clash_mode plus default_mode. A core started in «Весь трафик» knew only
+ * Global / Direct, and `PATCH /configs {mode: Rule}` answered 204 and changed
+ * nothing — the core stayed in Global while the app showed «По правилам» (0.4.5).
+ */
+export const RULE_MODE_TAIL: SbRouteRule = {
+  clash_mode: CLASH_MODE.rule,
+  action: 'route',
+  outbound: SLOT_FINAL
+}
+
 export function generateSingboxConfig(p: GenParams): SbConfig {
   const nodeTags = p.outbounds.map((o) => o.id)
   const slots = ruleSkeleton(p.slots.groups, p.slots.dir, nodeTags, p.slots.selectors)
   const proxyOutbounds = p.outbounds.map((o) => buildOutbound(o, p.xrayPorts[o.id]))
   const tun = p.settings.proxyMode === 'tun'
   const nodeDomains = serverDomains(p.outbounds)
+  // the subscription server: direct and resolved directly in every mode
+  const directRules = directHostRules(p.directHosts)
+  const localDomains = [...new Set([...nodeDomains, ...directRules.flatMap((r) => r.domain ?? [])])]
 
   // Loop protection in TUN mode: cipherway-xray.exe dials the nodes itself. Normally its
   // sockets never reach the TUN (node IPs are in route_exclude_address); if a
@@ -239,7 +287,7 @@ export function generateSingboxConfig(p: GenParams): SbConfig {
         { type: 'https', tag: 'local', server: '77.88.8.8' }
       ],
       rules: [
-        ...(nodeDomains.length ? [{ domain: nodeDomains, server: 'local' }] : []),
+        ...(localDomains.length ? [{ domain: localDomains, server: 'local' }] : []),
         // «Напрямую»: nothing goes through the tunnel, DNS included
         { clash_mode: CLASH_MODE.direct, server: 'local' },
         { clash_mode: CLASH_MODE.global, server: 'remote' },
@@ -275,8 +323,10 @@ export function generateSingboxConfig(p: GenParams): SbConfig {
         ...loopGuard,
         { action: 'sniff' },
         ...(tun ? [{ protocol: ['dns'], action: 'hijack-dns' as const }] : []),
+        ...directRules,
         ...MODE_RULES,
-        ...slots.routeRules
+        ...slots.routeRules,
+        RULE_MODE_TAIL
       ],
       rule_set: slots.ruleSets,
       final: SLOT_FINAL,

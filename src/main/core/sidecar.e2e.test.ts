@@ -28,6 +28,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import type {
   AutoInfo,
   OutboundConfig,
+  RoutingMode,
   RoutingRule,
   RulesConfig,
   ServerPing,
@@ -1378,7 +1379,9 @@ describe.skipIf(!enabled)('SidecarManager with real cores', () => {
         expect(await waitFor(code204, (c) => c === '204', 10_000)).toBe('204')
         expect(m.isRunning).toBe(true)
         expect(states.map((s) => s[0])).not.toContain('error')
-        expect(logs.some((l) => /Ядро Xray остановилось \(код \d+\) — перезапуск/.test(l.message))).toBe(true)
+        expect(
+          logs.some((l) => /Ядро Xray остановилось \(код \d+\) — перезапуск/.test(l.message))
+        ).toBe(true)
       } finally {
         await m.stop()
       }
@@ -1407,7 +1410,7 @@ describe.skipIf(!enabled)('SidecarManager with real cores', () => {
       }
     }, 60_000)
 
-    it('xray can\'t come back: after 3 tries an honest error with its own start failure', async () => {
+    it("xray can't come back: after 3 tries an honest error with its own start failure", async () => {
       const { m, states, notices, logs } = await connected()
       try {
         // the next start fails by itself, with a message from xray
@@ -1497,7 +1500,7 @@ describe.skipIf(!enabled)('SidecarManager with real cores', () => {
       )
     }, 60_000)
 
-    it('a stale core.exit is not an exit; the broker\'s report of this session is', async () => {
+    it("a stale core.exit is not an exit; the broker's report of this session is", async () => {
       const { LegacyLauncher } = await import('./tunService')
       const { generateProbeConfig } = await import('./configGen')
       const { ClashApi } = await import('./clashApi')
@@ -1522,7 +1525,13 @@ describe.skipIf(!enabled)('SidecarManager with real cores', () => {
       writeFileSync(join(dir, 'restart.signal'), '1')
       let proc: ChildProcess | null = null
       const l = new LegacyLauncher(
-        { binDir: BIN, runDir: dir, configPath: cfgPath, rulesDir: dir, logPath: join(dir, 'sb.log') },
+        {
+          binDir: BIN,
+          runDir: dir,
+          configPath: cfgPath,
+          rulesDir: dir,
+          logPath: join(dir, 'sb.log')
+        },
         () => undefined,
         () => false,
         {
@@ -1949,7 +1958,7 @@ describe.skipIf(!enabled)('SidecarManager with real cores', () => {
       }
     }, 90_000)
 
-    it('the subscription can\'t be fetched: the connect goes on with the saved copy', async () => {
+    it("the subscription can't be fetched: the connect goes on with the saved copy", async () => {
       reset([link('Германия', goodKey)])
       memory.set('url', 'http://127.0.0.1:1/nothing-listens-here')
       const { m, sync, logs, states, params } = await app()
@@ -1978,7 +1987,9 @@ describe.skipIf(!enabled)('SidecarManager with real cores', () => {
         expect(logs.some((l) => /Перезапуск ядра с новой конфигурацией/.test(l))).toBe(true)
         expect(readFileSync(join(tmp, 'run', 'xray.json'), 'utf8')).toContain(goodKey)
         // the lines were collapsed, not repeated
-        expect(logs.filter((l) => /REALITY: received real certificate/.test(l)).length).toBeLessThan(4)
+        expect(
+          logs.filter((l) => /REALITY: received real certificate/.test(l)).length
+        ).toBeLessThan(4)
       } finally {
         await m.stop()
       }
@@ -2029,11 +2040,7 @@ describe.skipIf(!enabled)('SidecarManager with real cores', () => {
         serve(link('Германия', goodKey))
         expect((await sync.refresh()).changed).toBe(true)
         expect(memory.get('activeOutboundId')).toBe('auto')
-        await waitFor(
-          () => m.corePid !== pid && m.isRunning,
-          Boolean,
-          30_000
-        )
+        await waitFor(() => m.corePid !== pid && m.isRunning, Boolean, 30_000)
         expect(m.isRunning).toBe(true)
         expect(await m.clash!.groupNow('proxy')).toBe('auto')
         expect(de.id).toBe(rw.getCached()!.outbounds[0].id)
@@ -2044,5 +2051,193 @@ describe.skipIf(!enabled)('SidecarManager with real cores', () => {
         await m.stop()
       }
     }, 90_000)
+  })
+
+  // --- 0.4.5 ---------------------------------------------------------------
+
+  describe('the mode the app shows is the mode of the core (0.4.5)', () => {
+    /** «РФ напрямую»: a .ru site — a big file, so the connection stays open a while */
+    const RU_URL = 'https://mirror.yandex.ru/ubuntu/ls-lR.gz'
+    const RU_HOST = 'mirror.yandex.ru'
+    const OTHER_URL = 'https://speed.cloudflare.com/__down?bytes=400000'
+    const OTHER_HOST = 'speed.cloudflare.com'
+    const ruRules: RulesConfig = {
+      defaultBehavior: 'proxy',
+      rules: [rule('DomainSuffix', 'ru', 'DIRECT')]
+    }
+    /** what the store holds (handlers.ts passes getSettings().routingMode) */
+    let chosen: RoutingMode = 'rule'
+    const params = (mode: RoutingMode = chosen, extra: { directHosts?: string[] } = {}) => ({
+      outbounds: [live, dead],
+      activeOutboundId: 'ob_live',
+      rules: ruRules,
+      settings: { ...TEST_SETTINGS, httpPort: HTTP_PORT, routingMode: mode },
+      ...extra
+    })
+
+    async function make() {
+      const { SidecarManager } = await import('./SidecarManager')
+      const logs: string[] = []
+      const states: StatusUpdate['state'][] = []
+      const notices: string[] = []
+      const m = new SidecarManager(
+        (e) => logs.push(e.message),
+        (s) => states.push(s),
+        () => undefined,
+        undefined,
+        undefined,
+        undefined,
+        { routingMode: () => chosen, onNotice: (n) => notices.push(n.text) }
+      )
+      return { m, logs, states, notices }
+    }
+
+    type Mgr = Awaited<ReturnType<typeof make>>['m']
+
+    /** the live connection of a slow curl download through the mixed inbound */
+    async function via(m: Mgr, url: string, host: string) {
+      const { toConnItems } = await import('./connections')
+      const slow = curl([
+        '-s',
+        '-o',
+        'NUL',
+        '-x',
+        `http://127.0.0.1:${HTTP_PORT}`,
+        '--limit-rate',
+        '20k',
+        '--max-time',
+        '4',
+        url
+      ])
+      const found = await waitFor(
+        async () => {
+          const raw = (await m.clash?.connections()) ?? {}
+          return toConnItems(raw, {
+            outbounds: [live, dead],
+            prev: new Map(),
+            now: Date.now(),
+            labels: m.labels,
+            programs: m.programs
+          }).find((i) => i.host === host)
+        },
+        (c) => !!c,
+        8000
+      )
+      await slow
+      return found
+    }
+
+    async function expectRuleMode(m: Mgr): Promise<void> {
+      expect(await m.clash!.getMode()).toBe('Rule')
+      expect(await via(m, RU_URL, RU_HOST)).toMatchObject({ route: 'direct', rule: 'домен ru' })
+      expect(await via(m, OTHER_URL, OTHER_HOST)).toMatchObject({
+        route: 'proxy',
+        serverName: 'Live',
+        rule: 'Всё остальное'
+      })
+    }
+
+    const runConfig = () => JSON.parse(readFileSync(join(tmp, 'run', 'config.json'), 'utf8'))
+
+    it('a core started in «Весь трафик» really switches to «По правилам»; after a self-heal, a stale reload and a drift it stays there', async () => {
+      chosen = 'global'
+      const { m, logs, notices, states } = await make()
+      await m.start(params())
+      try {
+        // what the owner saw: everything through the VPN with the «Весь трафик» label
+        expect(await m.clash!.getMode()).toBe('Global')
+        expect(await via(m, RU_URL, RU_HOST)).toMatchObject({
+          route: 'proxy',
+          rule: 'Режим «Весь трафик через VPN»'
+        })
+        // ≤0.4.4: 204 and still Global («Rule» was not in the core's mode-list)
+        chosen = 'rule'
+        expect(await m.setRoutingMode('rule')).toBe(true)
+        await expectRuleMode(m)
+        expect(logs).toContain('Режим ядра: Rule')
+
+        // self-heal: the same config (default_mode Global) comes back → Rule again
+        expect(runConfig().experimental.clash_api.default_mode).toBe('Global')
+        const c1 = m.corePid!
+        process.kill(c1)
+        await waitFor(
+          () => notices,
+          (n) => n.includes('Ядро перезапущено'),
+          15_000
+        )
+        expect(m.corePid).not.toBe(c1)
+        await expectRuleMode(m)
+
+        // a reload whose params were built while «Весь трафик» was on (the queue)
+        const stale = params('global')
+        await m.reload(stale)
+        expect(m.isRunning).toBe(true)
+        expect(runConfig().experimental.clash_api.default_mode).toBe('Rule')
+        await expectRuleMode(m)
+
+        // whatever moves the core away from the chosen mode is repaired
+        await m.clash!.setMode('Direct')
+        expect(await m.clash!.getMode()).toBe('Direct')
+        expect(
+          await waitFor(
+            () => m.clash!.getMode(),
+            (v) => v === 'Rule',
+            12_000
+          )
+        ).toBe('Rule')
+        expect(logs.some((l) => /Режим ядра был Direct вместо Rule — исправлено/.test(l))).toBe(
+          true
+        )
+        expect(states).not.toContain('error')
+      } finally {
+        await m.stop()
+      }
+    }, 120_000)
+
+    it('a mode chosen while connecting is the mode after «connected»; a new app run starts in it', async () => {
+      chosen = 'global'
+      const { m, states } = await make()
+      rmSync(join(tmp, 'run', 'config.json'), { force: true })
+      const started = m.start(params())
+      // the config is written with Global — then the user picks «По правилам»
+      // (handlers.ts: the store changes, the manager is not running yet)
+      await waitFor(() => existsSync(join(tmp, 'run', 'config.json')), Boolean, 15_000)
+      expect(runConfig().experimental.clash_api.default_mode).toBe('Global')
+      chosen = 'rule'
+      await started
+      try {
+        expect(states.at(-1)).toBe('connected')
+        await expectRuleMode(m)
+      } finally {
+        await m.stop()
+      }
+
+      // the app restarted (update, autostart): a fresh manager, the store says rule
+      const again = await make()
+      await again.m.start(params())
+      try {
+        expect(runConfig().experimental.clash_api.default_mode).toBe('Rule')
+        await expectRuleMode(again.m)
+      } finally {
+        await again.m.stop()
+      }
+    }, 120_000)
+
+    it('the subscription server goes direct even in «Весь трафик»', async () => {
+      chosen = 'global'
+      const { m } = await make()
+      await m.start(params('global', { directHosts: [RU_HOST] }))
+      try {
+        expect(await m.clash!.getMode()).toBe('Global')
+        expect(await via(m, RU_URL, RU_HOST)).toMatchObject({
+          route: 'direct',
+          rule: `домен ${RU_HOST}`
+        })
+        expect(await via(m, OTHER_URL, OTHER_HOST)).toMatchObject({ route: 'proxy' })
+      } finally {
+        await m.stop()
+        chosen = 'rule'
+      }
+    }, 60_000)
   })
 })

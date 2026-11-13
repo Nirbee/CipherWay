@@ -182,7 +182,21 @@ function buildStartParams() {
     activeOutboundId: store.get('activeOutboundId') ?? undefined,
     rules: store.get('rules'),
     settings: getSettings(),
-    latencies: store.get('latencyCache') ?? {}
+    latencies: store.get('latencyCache') ?? {},
+    // its refresh must work while the tunnel is broken (a stale REALITY key)
+    directHosts: subscriptionHosts()
+  }
+}
+
+/** Host of the subscription link (empty if none / unparsable). */
+function subscriptionHosts(): string[] {
+  const url = getSubscriptionUrl()
+  if (!url) return []
+  try {
+    const host = new URL(url).hostname
+    return host ? [host] : []
+  } catch {
+    return []
   }
 }
 
@@ -307,6 +321,8 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
     },
     {
       onNotice: notify,
+      // the store, not the snapshot a queued start / reload was built with
+      routingMode: () => getSettings().routingMode,
       onRealityHeal: () => void sync.heal().finally(() => manager.realityHealDone()),
       onServerHints: (hints) => {
         serverHints = hints
@@ -401,7 +417,8 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
     publishSettings(next)
     if (manager.isRunning) {
       const ok = await manager.setRoutingMode(mode)
-      // the Clash API refused (shouldn't happen) — fall back to a restart
+      // the core didn't take the mode (GET /configs shows another one) — a new
+      // config with the mode as its default_mode
       if (!ok) await manager.reload(buildStartParams()).catch(() => undefined)
     }
     return next
@@ -477,7 +494,8 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
       outbounds,
       prev: prevConn,
       now,
-      labels: manager.labels
+      labels: manager.labels,
+      programs: manager.programs
     })
     manager.failures.noteConnections(snapshot.items, now)
     snapshot.failed = manager.failures.list(

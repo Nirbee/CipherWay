@@ -46,6 +46,8 @@ export interface RuleRun {
   geo: string[]
   /** human-readable description for the «Подключения» screen */
   label: string
+  /** PROCESS-NAME values of the run, as typed — «программа chrome.exe» per connection */
+  programs: string[]
 }
 
 export interface RulePlan {
@@ -234,13 +236,20 @@ function resolveAction(
 export function planRules(config: RulesConfig, outbounds: OutboundConfig[]): RulePlan {
   const byName = new Map(outbounds.map((o) => [o.name, o.id]))
   const runs: (RuleRun & { count: number })[] = []
-  const push = (kind: RunKind, target: string, m: Matcher, label: string): void => {
+  const push = (
+    kind: RunKind,
+    target: string,
+    m: Matcher,
+    label: string,
+    program?: string
+  ): void => {
     if (!m) return
     let run = runs.at(-1)
     if (!run || run.kind !== kind || run.target !== target) {
-      run = { kind, target, rules: [], geo: [], label, count: 0 }
+      run = { kind, target, rules: [], geo: [], label, programs: [], count: 0 }
       runs.push(run)
     }
+    if (program && !run.programs.includes(program)) run.programs.push(program)
     if ('rule' in m) run.rules.push(m.rule)
     else if (!run.geo.includes(m.geo)) run.geo.push(m.geo)
     run.count++
@@ -249,7 +258,13 @@ export function planRules(config: RulesConfig, outbounds: OutboundConfig[]): Rul
   for (const rule of config.rules) {
     if (!rule.enabled) continue
     const act = resolveAction(rule.action, byName)
-    push(act.kind, act.target, matcher(rule), describeUserRule(rule))
+    push(
+      act.kind,
+      act.target,
+      matcher(rule),
+      describeUserRule(rule),
+      rule.conditionType === 'ProcessName' ? rule.value.trim() : undefined
+    )
   }
 
   // «Авто: Россия напрямую»: Russian IPs / sites direct, the rest via the VPN
@@ -305,6 +320,8 @@ export interface RuleLayout {
   selectors: Record<string, string>
   /** rule-set tag → description of the run in it («Подключения») */
   labels: Record<string, string>
+  /** rule-set tag → PROCESS-NAME values of its run (only runs that have some) */
+  programs: Record<string, string[]>
   /** geo sets that could not be loaded (their rules are skipped) */
   missing: string[]
 }
@@ -322,6 +339,7 @@ export function layoutRules(
   const files: Record<string, string> = {}
   const selectors: Record<string, string> = {}
   const labels: Record<string, string> = {}
+  const programs: Record<string, string[]> = {}
   const content = new Map<string, HeadlessRule[]>()
   const missing = new Set<string>()
 
@@ -341,6 +359,7 @@ export function layoutRules(
     const tag = slotTag(g, run.kind)
     content.set(tag, rules)
     labels[tag] = run.label
+    if (run.programs.length) programs[tag] = [...run.programs]
     if (run.kind === 'proxy') selectors[slotSelector(g)] = run.target
     pos++
   }
@@ -357,7 +376,7 @@ export function layoutRules(
   }
   selectors[SLOT_FINAL] = plan.final
   selectors[SLOT_DNS] = plan.final === TAG_DIRECT ? TAG_DIRECT : TAG_PROXY_GROUP
-  return { files, selectors, labels, missing: [...missing] }
+  return { files, selectors, labels, programs, missing: [...missing] }
 }
 
 export interface RuleSkeleton {
