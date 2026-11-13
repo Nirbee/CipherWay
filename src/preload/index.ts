@@ -72,6 +72,7 @@ const api: ExposedApi = {
     markRead: () => ipcRenderer.send(IPC.supportMarkRead)
   },
   updater: {
+    getState: () => ipcRenderer.invoke(IPC.updaterGetState),
     check: () => ipcRenderer.invoke(IPC.updaterCheck),
     download: () => ipcRenderer.invoke(IPC.updaterDownload),
     install: () => ipcRenderer.send(IPC.updaterInstall)

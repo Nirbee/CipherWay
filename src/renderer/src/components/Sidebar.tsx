@@ -1,26 +1,27 @@
 import { useNav, type PageKey } from '../store/navStore'
 import { useConnection } from '../store/connectionStore'
-import { useUpdater } from '../store/updaterStore'
 import { useSupport } from '../store/supportStore'
 import { cn } from '../lib/cn'
 import {
   ActivityIcon,
   CardIcon,
   HomeIcon,
+  LanIcon,
   LogsIcon,
   RulesIcon,
   ServerIcon,
   SettingsIcon,
-  SupportIcon,
-  UpdateIcon
+  SupportIcon
 } from './icons'
 import { ModeSwitch } from './ModeSwitch'
+import { UpdateButton } from './UpdateButton'
 import shield from '../assets/logo-shield.png'
 
 const NAV: { key: PageKey; label: string; Icon: typeof HomeIcon }[] = [
   { key: 'home', label: 'Главная', Icon: HomeIcon },
   { key: 'servers', label: 'Серверы', Icon: ServerIcon },
   { key: 'connections', label: 'Подключения', Icon: ActivityIcon },
+  { key: 'lan', label: 'LAN', Icon: LanIcon },
   { key: 'rules', label: 'Правила', Icon: RulesIcon },
   { key: 'subscription', label: 'Подписка', Icon: CardIcon },
   { key: 'support', label: 'Поддержка', Icon: SupportIcon },
@@ -122,79 +123,8 @@ export function Sidebar() {
 
       <div className="no-drag space-y-2 p-3">
         <ModeSwitch />
-        <UpdateButton onOpenSettings={() => setPage('settings')} />
+        <UpdateButton />
       </div>
     </nav>
-  )
-}
-
-function UpdateButton({ onOpenSettings }: { onOpenSettings: () => void }) {
-  const { phase, version, percent, check, download, install } = useUpdater()
-
-  if (phase === 'available' || phase === 'downloaded') {
-    const ready = phase === 'downloaded'
-    return (
-      <button
-        onClick={() => {
-          if (ready) install()
-          else {
-            download()
-            onOpenSettings()
-          }
-        }}
-        className="animate-fade flex h-10 w-full items-center gap-2.5 rounded-xl border border-accent-green/40 bg-accent-green/10 px-3 text-left text-[13px] font-medium text-accent-green transition-colors hover:bg-accent-green/20"
-      >
-        <span className="relative flex h-5 w-5 items-center justify-center">
-          <UpdateIcon width={17} height={17} />
-          {!ready && (
-            <span className="absolute -right-0.5 -top-0.5 h-2 w-2 animate-ping rounded-full bg-accent-green" />
-          )}
-        </span>
-        <span className="flex-1">{ready ? 'Установить' : 'Обновить'}</span>
-        {version && <span className="font-mono text-[10px] opacity-70">v{version}</span>}
-      </button>
-    )
-  }
-
-  if (phase === 'downloading') {
-    return (
-      <div className="rounded-xl border border-accent-blue/40 bg-accent-blue/10 px-3 py-2">
-        <div className="mb-1.5 flex items-center gap-2 text-xs font-medium text-accent-blue-bright">
-          <UpdateIcon width={15} height={15} className="animate-pulse" />
-          Загрузка {percent}%
-        </div>
-        <div className="h-1 overflow-hidden rounded-pill bg-bg-elevated">
-          <div
-            className="h-full rounded-pill bg-accent-blue transition-all"
-            style={{ width: `${percent}%` }}
-          />
-        </div>
-      </div>
-    )
-  }
-
-  const label =
-    phase === 'checking'
-      ? 'Проверка…'
-      : phase === 'not-available'
-        ? 'Версия актуальна'
-        : phase === 'error'
-          ? 'Повторить проверку'
-          : 'Проверить обновления'
-
-  return (
-    <button
-      onClick={check}
-      disabled={phase === 'checking'}
-      className={cn(
-        'flex h-9 w-full items-center gap-2.5 rounded-xl px-3 text-left text-xs font-medium transition-colors',
-        phase === 'error'
-          ? 'text-accent-red hover:bg-accent-red/10'
-          : 'text-text-faint hover:bg-bg-elevated/60 hover:text-text-primary'
-      )}
-    >
-      <UpdateIcon width={15} height={15} className={cn(phase === 'checking' && 'animate-pulse')} />
-      {label}
-    </button>
   )
 }

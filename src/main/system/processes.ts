@@ -96,3 +96,23 @@ export function runningProcessNames(): Promise<string[]> {
 export function exeName(fullPath: string): string {
   return basename(fullPath)
 }
+
+/**
+ * Waits until none of `names` runs any more (case-insensitive), at most
+ * `timeoutMs`. true — gone. Before an update: the installer can't replace an
+ * exe that is still running.
+ */
+export async function waitProcessesGone(
+  names: readonly string[],
+  timeoutMs: number,
+  list: () => Promise<string[]> = runningProcessNames
+): Promise<boolean> {
+  const want = new Set(names.map((n) => n.toLowerCase()))
+  const end = Date.now() + timeoutMs
+  for (;;) {
+    const running = await list()
+    if (!running.some((n) => want.has(n.toLowerCase()))) return true
+    if (Date.now() >= end) return false
+    await new Promise((r) => setTimeout(r, 300))
+  }
+}

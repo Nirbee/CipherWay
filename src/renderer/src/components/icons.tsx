@@ -112,6 +112,16 @@ export const UpdateIcon = (p: P) => (
   </svg>
 )
 
+/** LAN: devices joined into one network (play with friends) */
+export const LanIcon = (p: P) => (
+  <svg {...base(p)}>
+    <rect x="9" y="3" width="6" height="5" rx="1.2" />
+    <rect x="3" y="16" width="6" height="5" rx="1.2" />
+    <rect x="15" y="16" width="6" height="5" rx="1.2" />
+    <path d="M12 8v4M6 16v-2a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v2" />
+  </svg>
+)
+
 export const ActivityIcon = (p: P) => (
   <svg {...base(p)}>
     <path d="M3 12h4l3-8 4 16 3-8h4" />

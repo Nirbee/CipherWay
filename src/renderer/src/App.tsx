@@ -20,6 +20,7 @@ import { LogsPage } from './pages/LogsPage'
 import { SubscriptionPage } from './pages/SubscriptionPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { SupportPage } from './pages/SupportPage'
+import { LanPage } from './pages/LanPage'
 import { ImportSubscriptionDialog } from './components/ImportSubscriptionDialog'
 import { cn } from './lib/cn'
 
@@ -30,7 +31,8 @@ export default function App() {
   const addLogs = useLogs((s) => s.addBatch)
   const applyPings = useServers((s) => s.applyPings)
   const applySupport = useSupport((s) => s.apply)
-  const applyUpdater = useUpdater((s) => s.apply)
+  const applyUpdater = useUpdater((s) => s.set)
+  const loadUpdater = useUpdater((s) => s.load)
   const applySettings = useSettings((s) => s.apply)
   const loadSettings = useSettings((s) => s.load)
   const setSubscription = useSubscription((s) => s.set)
@@ -56,6 +58,7 @@ export default function App() {
     })
     void window.api.support.get().then(applySupport)
     const offUpdater = window.api.on.updater(applyUpdater)
+    void loadUpdater()
     const offMax = window.api.on.windowMaximized(setMaximized)
     void window.api.vpn.getStatus().then((s) => {
       setStatus(s)
@@ -89,6 +92,7 @@ export default function App() {
     applySupport,
     setPage,
     applyUpdater,
+    loadUpdater,
     applySettings,
     loadSettings,
     setSubscription,
@@ -120,6 +124,8 @@ function PageView({ page }: { page: string }) {
       return <ServersPage />
     case 'connections':
       return <ConnectionsPage />
+    case 'lan':
+      return <LanPage />
     case 'subscription':
       return <SubscriptionPage />
     case 'rules':

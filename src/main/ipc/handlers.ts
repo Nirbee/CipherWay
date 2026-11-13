@@ -1,6 +1,6 @@
 import { writeFile, readFile, stat } from 'node:fs/promises'
 import { isAbsolute } from 'node:path'
-import { app, BrowserWindow, ipcMain, dialog, shell, Notification } from 'electron'
+import { app, BrowserWindow, ipcMain, dialog, shell, Notification, powerMonitor } from 'electron'
 import { z } from 'zod'
 import { IPC } from '@shared/ipc'
 import type {
@@ -21,7 +21,12 @@ import type {
 } from '@shared/types'
 import { LogBatcher } from '@shared/logBuffer'
 import { DEFAULT_SETTINGS, getSettings, store } from '../store'
-import { findOtherVpnClients, listProcesses, runningProcessNames } from '../system/processes'
+import {
+  findOtherVpnClients,
+  listProcesses,
+  runningProcessNames,
+  waitProcessesGone
+} from '../system/processes'
 import { remnawave } from '../remnawave/RemnawaveClient'
 import { SubscriptionSync } from '../remnawave/SubscriptionSync'
 import { toSubscriptionView } from '../remnawave/view'
@@ -30,6 +35,10 @@ import { createMasker, type Masker } from '../mask'
 import { SidecarManager } from '../core/SidecarManager'
 import { nodeAddressSet, toConnItems } from '../core/connections'
 import { AppUpdater } from '../updater/AppUpdater'
+import { electronUpdaterBackend } from '../updater/electronBackend'
+import { devFakeBackend } from '../updater/devFakeBackend'
+import type { UpdaterState } from '@shared/updater'
+import { CORE_EXE, XRAY_EXE } from '../core/coreNames'
 import {
   SUPPORT_CAPTION_MAX,
   SUPPORT_IMAGE_MAX_BYTES,
@@ -716,10 +725,50 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
   ipcMain.on(IPC.supportMarkRead, () => support.markRead())
 
   // ---- updater -----------------------------------------------------------
-  const updater = new AppUpdater((e) => send(IPC.evtUpdater, e))
+  // dev / unpacked: no feed, unless CIPHERWAY_DEV_FAKE_UPDATE simulates one
+  const fakeUpdate = app.isPackaged ? '' : (process.env.CIPHERWAY_DEV_FAKE_UPDATE ?? '')
+  const updater = new AppUpdater({
+    backend: fakeUpdate ? devFakeBackend(fakeUpdate, () => app.quit()) : electronUpdaterBackend(),
+    enabled: app.isPackaged || !!fakeUpdate,
+    log: appLog,
+    onState: (s) => {
+      send(IPC.evtUpdater, s)
+      for (const cb of updaterListeners) cb(s)
+    },
+    onReady: (version) => {
+      // one Windows notification per version, ever
+      if (store.get('updateNotifiedVersion') === version) return
+      store.set('updateNotifiedVersion', version)
+      if (!Notification.isSupported()) return
+      const n = new Notification({
+        title: `Доступна версия ${version}`,
+        body: 'Обновление CipherWay VPN загружено. Нажмите «Перезапустить и обновить» в меню слева — или оно установится при выходе из приложения.',
+        ...(hooks?.notificationIcon ? { icon: hooks.notificationIcon } : {})
+      })
+      n.on('click', () => hooks?.showWindow())
+      n.show()
+    },
+    beforeInstall: async () => {
+      await disconnectVpn()
+      if (!(await waitProcessesGone([CORE_EXE, XRAY_EXE], 10_000))) {
+        appLog('warn', 'Ядро ещё работает — установщик может не заменить его файлы')
+      }
+    }
+  })
   appUpdater = updater
+  updater.start()
+  powerMonitor.on('resume', () => updater.onResume())
 
-  ipcMain.handle(IPC.updaterCheck, async () => updater.check())
-  ipcMain.handle(IPC.updaterDownload, async () => updater.download())
-  ipcMain.on(IPC.updaterInstall, () => updater.install())
+  ipcMain.handle(IPC.updaterGetState, (): UpdaterState => updater.state)
+  ipcMain.handle(IPC.updaterCheck, async (): Promise<UpdaterState> => updater.check())
+  ipcMain.handle(IPC.updaterDownload, async (): Promise<UpdaterState> => updater.download())
+  ipcMain.on(IPC.updaterInstall, () => void updater.install())
+}
+
+const updaterListeners = new Set<(s: UpdaterState) => void>()
+
+/** Update state changes (used by the tray). */
+export function onUpdaterState(cb: (s: UpdaterState) => void): () => void {
+  updaterListeners.add(cb)
+  return () => updaterListeners.delete(cb)
 }

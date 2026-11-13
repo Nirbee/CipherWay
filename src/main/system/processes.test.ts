@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { findOtherVpnClients, parseTasklist } from './processes'
+import { findOtherVpnClients, parseTasklist, waitProcessesGone } from './processes'
 
 describe('other VPN clients', () => {
   it('recognised by the exe name, any case; each once', () => {
@@ -40,5 +40,26 @@ describe('parseTasklist', () => {
       'INFO: nothing'
     ].join('\r\n')
     expect(parseTasklist(csv)).toEqual(['System Idle Process', 'Koala Clash.exe'])
+  })
+})
+
+describe('waitProcessesGone', () => {
+  it('true once the cores are gone (case-insensitive)', async () => {
+    const lists = [['CipherWay-Core.exe', 'explorer.exe'], ['explorer.exe']]
+    let i = 0
+    const gone = await waitProcessesGone(
+      ['cipherway-core.exe'],
+      5000,
+      async () => lists[Math.min(i++, lists.length - 1)]
+    )
+    expect(gone).toBe(true)
+    expect(i).toBe(2)
+  })
+
+  it('false after the timeout', async () => {
+    const gone = await waitProcessesGone(['cipherway-xray.exe'], 0, async () => [
+      'cipherway-xray.exe'
+    ])
+    expect(gone).toBe(false)
   })
 })

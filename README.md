@@ -89,7 +89,7 @@ Without that, `electron-builder` still produces a fully working unpacked app at
 - [x] **Step 5** — Core engine: sing-box orchestration, config gen, rule compiler,
       System Proxy + TUN (elevated broker), traffic stats, hot-reload
 - [x] **Step 6** — Home / Servers / Logs / Subscription / Settings screens
-- [x] **Step 7** — Auto-update (electron-updater): silent check, banner, progress, install
+- [x] **Step 7** — Auto-update (electron-updater): background checks, one sidebar button, install (see 0.4.4)
 - [x] **Step 8** — Packaging (electron-builder): app assembled (`dist/win-unpacked`), config
       validated against the real sing-box binary
 
@@ -265,3 +265,19 @@ proxy mocked): `CW_E2E=1 npx vitest run src/main/core/sidecar.e2e.test.ts`.
 - **Journal**: ordinary broken connections are hidden without «Подробный журнал»;
   REALITY lines and «refused» to our own loopback ports are collapsed.
 - A warning (nothing blocked) when TUN is started next to Happ, Koala Clash, FlClash, v2rayN.
+
+## 0.4.4: updates by themselves, «LAN» tab
+
+- **Updates** (`src/main/updater/`): checked ~30 s after start, every 3 h and 20 s
+  after waking from sleep (if the last check is older than 30 min) — silently, a
+  failure only goes to «Логи». A found version is downloaded in the background; the
+  sidebar button turns green («Доступно обновление 0.4.x» → «Загрузка 42%» →
+  «Перезапустить и обновить»), one Windows notification per version, an item in the
+  tray menu. Install: on the button (VPN disconnected, `cipherway-core.exe` /
+  `cipherway-xray.exe` waited for, then the installer) or quietly on «Выход»
+  (`autoInstallOnAppQuit`; switched off on Windows shutdown). A manual check that
+  fails shows a short toast. The state lives in main only (`AppUpdater`,
+  `src/shared/updater.ts`); sidebar, «Настройки → Обновления» and tray draw from it.
+  Dev / unpacked: no feed; `CIPHERWAY_DEV_FAKE_UPDATE=0.4.99` (or `0.4.99:flaky`,
+  `fail`) simulates one.
+- **«LAN»** in the sidebar: a placeholder for rooms to play over the network.

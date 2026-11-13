@@ -3,14 +3,15 @@ import { DEFAULT_API_BASE, type AppSettings, type TunServiceInfo } from '@shared
 import { buildDiagnostics } from '@shared/diagnostics'
 import { PageHeader } from '../components/PageHeader'
 import { Button, Card, Input, Toggle } from '../components/ui'
-import { CheckIcon, CopyIcon } from '../components/icons'
+import { CopyIcon } from '../components/icons'
+import { UpdateButton } from '../components/UpdateButton'
 import { useSettings } from '../store/settingsStore'
 import { useLogs } from '../store/logsStore'
 import { useUpdater } from '../store/updaterStore'
 import { useConnection } from '../store/connectionStore'
 import { useSubscription } from '../store/subscriptionStore'
 import { toast } from '../store/toastStore'
-import { errorText } from '../lib/format'
+import { errorText, formatAgo } from '../lib/format'
 import { cn } from '../lib/cn'
 
 export function SettingsPage() {
@@ -145,12 +146,15 @@ export function SettingsPage() {
         </Section>
 
         <Section title="Обновления">
-          <Row label="Версия приложения" hint="Обновления приходят с GitHub автоматически">
+          <Row
+            label="Версия приложения"
+            hint="Проверяется сама при запуске и каждые 3 часа; новая версия скачивается в фоне"
+          >
             <span className="font-mono text-sm text-text-secondary">
               {version ? `v${version}` : '—'}
             </span>
           </Row>
-          <UpdaterControls />
+          <UpdaterRow />
         </Section>
 
         <Section title="Диагностика" hint="Пригодится, если пишете в поддержку.">
@@ -210,61 +214,17 @@ function Row({
   )
 }
 
-function UpdaterControls() {
-  const { phase, version, percent, error, check, download, install } = useUpdater()
-
-  if (phase === 'available') {
-    return (
-      <div className="flex items-center justify-between gap-3 rounded-xl border border-accent-green/40 bg-accent-green/10 px-3 py-2.5">
-        <span className="text-sm text-accent-green">
-          Доступна версия {version ? `v${version}` : ''}
-        </span>
-        <Button size="sm" onClick={download}>
-          Скачать
-        </Button>
-      </div>
-    )
-  }
-
-  if (phase === 'downloading') {
-    return (
-      <div className="space-y-2">
-        <div className="h-1.5 overflow-hidden rounded-pill bg-bg-elevated">
-          <div
-            className="h-full rounded-pill bg-accent-blue transition-all"
-            style={{ width: `${percent}%` }}
-          />
-        </div>
-        <div className="font-mono text-xs text-text-muted">Загрузка… {percent}%</div>
-      </div>
-    )
-  }
-
-  if (phase === 'downloaded') {
-    return (
-      <div className="flex items-center justify-between gap-3 rounded-xl border border-accent-green/40 bg-accent-green/10 px-3 py-2.5">
-        <span className="text-sm text-accent-green">
-          Версия {version ? `v${version}` : ''} готова к установке
-        </span>
-        <Button size="sm" onClick={install}>
-          Перезапустить и установить
-        </Button>
-      </div>
-    )
-  }
-
+/** The same control as at the bottom of the sidebar + when it last looked. */
+function UpdaterRow() {
+  const checkedAt = useUpdater((s) => s.state.checkedAt)
   return (
-    <div className="flex items-center gap-3">
-      <Button variant="secondary" size="sm" onClick={check} disabled={phase === 'checking'}>
-        {phase === 'checking' ? 'Проверка…' : 'Проверить обновления'}
-      </Button>
-      {phase === 'not-available' && (
-        <span className="flex items-center gap-1 text-xs text-accent-green">
-          <CheckIcon width={14} height={14} />
-          Установлена последняя версия
-        </span>
-      )}
-      {phase === 'error' && <span className="text-xs text-accent-red">{error}</span>}
+    <div className="flex items-center gap-4">
+      <div className="w-64 shrink-0">
+        <UpdateButton />
+      </div>
+      <span className="text-[11px] text-text-faint">
+        Последняя проверка: {formatAgo(checkedAt)}
+      </span>
     </div>
   )
 }

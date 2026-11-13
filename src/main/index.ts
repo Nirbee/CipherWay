@@ -19,6 +19,7 @@ import {
   disconnectVpn,
   getVpnStatus,
   onSettingsChange,
+  onUpdaterState,
   onVpnStatus,
   registerIpcHandlers,
   setRoutingMode,
@@ -28,6 +29,9 @@ import { remnawave } from './remnawave/RemnawaveClient'
 import { getSettings, store } from './store'
 import { findDeepLinkArg, parseDeepLink, PROTOCOL } from './deeplink'
 import { clearStaleProxy } from './system/proxy'
+import { waitProcessesGone } from './system/processes'
+import { CORE_EXE, XRAY_EXE } from './core/coreNames'
+import { INITIAL_UPDATER_STATE, trayUpdateItem } from '@shared/updater'
 
 const APP_ID = 'com.cipherway.vpn' // = appId in electron-builder.yml (toast notifications)
 
@@ -86,6 +90,8 @@ function createWindow(): void {
   // Windows log-off / shutdown: let the window close and clean up the cores
   mainWindow.on('session-end', () => {
     isQuitting = true
+    // an installer started now would be killed by the shutdown halfway
+    appUpdater?.setInstallOnQuit(false)
     void disconnectVpn()
   })
   mainWindow.on('closed', () => {
@@ -166,10 +172,25 @@ function updateTray(): void {
   tray.setToolTip(
     `CipherWay VPN — ${STATE_LABEL[s.state]}${connected ? ` · ${MODE_LABEL[routingMode]}` : ''}`
   )
+  const upd = trayUpdateItem(appUpdater?.state ?? INITIAL_UPDATER_STATE)
+  const updateItems: Electron.MenuItemConstructorOptions[] = upd
+    ? [
+        {
+          label: upd.label,
+          enabled: upd.action !== null,
+          click: () => {
+            if (upd.action === 'install') void appUpdater?.install()
+            else showWindow()
+          }
+        },
+        { type: 'separator' }
+      ]
+    : []
   tray.setContextMenu(
     Menu.buildFromTemplate([
       { label: 'Открыть', click: showWindow },
       { type: 'separator' },
+      ...updateItems,
       { label: `Состояние: ${STATE_LABEL[s.state]}`, enabled: false },
       {
         label: connected || busy ? 'Отключить' : 'Подключить',
@@ -209,6 +230,15 @@ function createTray(): void {
   updateTray()
   onVpnStatus(() => updateTray())
   onSettingsChange(() => updateTray())
+  // the menu is rebuilt only when the update item changes (not per progress step)
+  let updKey = ''
+  onUpdaterState((st) => {
+    const it = trayUpdateItem(st)
+    const key = it ? `${it.label}|${it.action}` : ''
+    if (key === updKey) return
+    updKey = key
+    updateTray()
+  })
 }
 
 function showTrayHintOnce(): void {
@@ -291,8 +321,7 @@ if (!app.requestSingleInstanceLock()) {
     remnawave.prefetchDevice()
     startSubscriptionSync()
 
-    // quiet update check in the background (no-op in dev / unpackaged)
-    void appUpdater?.checkSilently()
+    // update checks run by themselves (AppUpdater: 30 s after start, every 3 h)
 
     app.on('activate', showWindow)
   })
@@ -304,7 +333,15 @@ if (!app.requestSingleInstanceLock()) {
     // ensure cores are killed and the system proxy is reverted before exit
     e.preventDefault()
     cleanupDone = true
-    void disconnectVpn().finally(() => app.quit())
+    void disconnectVpn()
+      .then(async () => {
+        // a downloaded update is installed on quit: its installer needs the cores gone
+        // («Перезапустить и обновить» = phase 'installing' has waited already)
+        if (appUpdater?.state.phase === 'downloaded') {
+          await waitProcessesGone([CORE_EXE, XRAY_EXE], 8000)
+        }
+      })
+      .finally(() => app.quit())
   })
 
   // closing the window only hides it; the app lives in the tray until «Выход»

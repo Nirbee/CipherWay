@@ -23,6 +23,8 @@ interface Schema {
   supportReadAt: string | null
   /** ISO time of the newest support reply a Windows notification was shown for */
   supportNotifiedAt: string | null
+  /** the app version a «Доступна версия …» notification was shown for */
+  updateNotifiedVersion: string | null
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -71,7 +73,8 @@ export const store = new Store<Schema>({
     trayHintShown: false,
     latencyCache: {},
     supportReadAt: null,
-    supportNotifiedAt: null
+    supportNotifiedAt: null,
+    updateNotifiedVersion: null
   }
 })
 

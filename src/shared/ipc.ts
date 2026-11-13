@@ -20,6 +20,7 @@ import type {
   TrafficStats,
   TunServiceInfo
 } from './types'
+import type { UpdaterState } from './updater'
 
 export const IPC = {
   // app
@@ -93,7 +94,8 @@ export const IPC = {
   supportSetActive: 'support:setActive',
   supportMarkRead: 'support:markRead',
 
-  // updater
+  // updater (state: src/shared/updater.ts)
+  updaterGetState: 'updater:getState',
   updaterCheck: 'updater:check',
   updaterDownload: 'updater:download',
   updaterInstall: 'updater:install',
@@ -108,6 +110,7 @@ export const IPC = {
   evtSupport: 'evt:support',
   /** main asks the renderer to open a page (notification click) */
   evtNavigate: 'evt:navigate',
+  /** the whole UpdaterState on every change */
   evtUpdater: 'evt:updater',
   /** settings changed outside the renderer (tray mode switch) */
   evtSettings: 'evt:settings',
@@ -118,13 +121,6 @@ export const IPC = {
   /** payload-less ping: a deep-link import is pending, call deeplink.takePending() */
   evtImportRequest: 'evt:importRequest'
 } as const
-
-export interface UpdaterEvent {
-  type: 'checking' | 'available' | 'not-available' | 'progress' | 'downloaded' | 'error'
-  version?: string
-  percent?: number
-  message?: string
-}
 
 /** The typed surface bridged into the renderer via contextBridge. */
 export interface ExposedApi {
@@ -197,8 +193,11 @@ export interface ExposedApi {
     markRead: () => void
   }
   updater: {
-    check: () => Promise<void>
-    download: () => Promise<void>
+    getState: () => Promise<UpdaterState>
+    /** manual check; failures come back as phase 'error' */
+    check: () => Promise<UpdaterState>
+    download: () => Promise<UpdaterState>
+    /** stops the cores, then quits into the installer */
     install: () => void
   }
   on: {
@@ -208,7 +207,7 @@ export interface ExposedApi {
     pings: (cb: (pings: ServerPing[]) => void) => () => void
     support: (cb: (v: SupportView) => void) => () => void
     navigate: (cb: (page: string) => void) => () => void
-    updater: (cb: (e: UpdaterEvent) => void) => () => void
+    updater: (cb: (s: UpdaterState) => void) => () => void
     windowMaximized: (cb: (maximized: boolean) => void) => () => void
     importRequest: (cb: () => void) => () => void
     settings: (cb: (s: AppSettings) => void) => () => void

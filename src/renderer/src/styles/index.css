@@ -142,6 +142,21 @@ body {
 .animate-glow {
   animation: glow-breathe 3s ease-in-out infinite;
 }
+/* «Доступно обновление»: a soft breathing glow around the sidebar button */
+@keyframes update-glow {
+  0%,
+  100% {
+    box-shadow: 0 0 10px -4px rgba(52, 211, 153, 0.35);
+  }
+  50% {
+    box-shadow: 0 0 18px -1px rgba(52, 211, 153, 0.6);
+  }
+}
+.animate-update-glow {
+  animation:
+    fade-in 0.25s ease both,
+    update-glow 2.6s ease-in-out infinite;
+}
 
 @keyframes pop-in {
   from {
