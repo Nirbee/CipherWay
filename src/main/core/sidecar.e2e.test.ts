@@ -931,76 +931,82 @@ describe.skipIf(!enabled)('SidecarManager with real cores', () => {
       }
     }, 90_000)
 
-    it('accepts the real TUN config the app generates for the service', async () => {
-      const { generateSingboxConfig } = await import('./configGen')
-      const { groupsFor, layoutRules, planRules } = await import('../rules/compile')
-      const hy2: OutboundConfig = {
-        id: 'ob_hy',
-        name: 'HY2',
-        protocol: 'hysteria2',
-        server: 'hy.example.com',
-        port: 8443,
-        password: 'p',
-        sni: 'hy.example.com',
-        obfs: 'salamander',
-        obfsPassword: 'o'
-      }
-      const vm: OutboundConfig = {
-        id: 'ob_vm',
-        name: 'VM',
-        protocol: 'vmess',
-        server: '198.51.100.9',
-        port: 443,
-        uuid: UUID,
-        security: 'tls'
-      }
-      const nodes = [live, hy2, vm]
-      const plan = planRules(TEST_RULES, nodes)
-      const groups = groupsFor(plan)
-      const layout = layoutRules(plan, groups, new Map())!
-      for (const [name, text] of Object.entries(layout.files))
-        writeFileSync(join(userRun, 'rules', name), text)
-      const cfg = generateSingboxConfig({
-        outbounds: nodes,
-        activeOutboundId: 'auto',
-        slots: { groups, dir: join(home, 'rules'), selectors: layout.selectors },
-        settings: { ...TEST_SETTINGS, proxyMode: 'tun', verboseLog: true },
-        socksPort: 1,
-        httpPort: 2,
-        clashApiPort: clashPort,
-        clashSecret: randomBytes(16).toString('hex'),
-        logFile: f('sing-box.log'),
-        xrayPorts: { ob_live: 27_499 },
-        serverIps: { 'hy.example.com': ['198.51.100.8'] }
-      })
-      writeFileSync(join(userRun, 'config.json'), JSON.stringify(cfg, null, 2))
-      const session = randomBytes(16).toString('hex')
-      const c = { session, pid: process.pid, cmd: 'run', restart: 0, rules: 0, ts: Date.now() }
-      ctl(c)
-      const b = await broker()
-      try {
-        // «running» = the config passed validation and the core was started (without
-        // admin rights it then fails to open the TUN — that is expected here)
-        const st = await waitFor(
-          state,
-          (s) => s?.session === session && s?.status !== 'starting',
-          20_000
-        )
-        expect(st?.error ?? '').toBe('')
-        expect(st?.status).toBe('running')
-        expect(readdirSync(join(home, 'rules')).filter((n) => n.startsWith('cw-'))).toHaveLength(
-          groups * 5
-        )
-      } finally {
-        ctl({ ...c, cmd: 'stop' })
-        await waitFor(
-          () => b.exitCode,
-          (x) => x !== null,
-          10_000
-        )
-        if (b.exitCode === null) b.kill()
-      }
-    }, 60_000)
+    it.each([false, true])(
+      'accepts the real TUN config the app generates for the service (IPv4-only: %s)',
+      async (ipv4Only) => {
+        const { generateSingboxConfig } = await import('./configGen')
+        const { groupsFor, layoutRules, planRules } = await import('../rules/compile')
+        const hy2: OutboundConfig = {
+          id: 'ob_hy',
+          name: 'HY2',
+          protocol: 'hysteria2',
+          server: 'hy.example.com',
+          port: 8443,
+          password: 'p',
+          sni: 'hy.example.com',
+          obfs: 'salamander',
+          obfsPassword: 'o'
+        }
+        const vm: OutboundConfig = {
+          id: 'ob_vm',
+          name: 'VM',
+          protocol: 'vmess',
+          server: '198.51.100.9',
+          port: 443,
+          uuid: UUID,
+          security: 'tls'
+        }
+        const nodes = [live, hy2, vm]
+        const plan = planRules(TEST_RULES, nodes)
+        const groups = groupsFor(plan)
+        const layout = layoutRules(plan, groups, new Map())!
+        for (const [name, text] of Object.entries(layout.files))
+          writeFileSync(join(userRun, 'rules', name), text)
+        const cfg = generateSingboxConfig({
+          outbounds: nodes,
+          activeOutboundId: 'auto',
+          slots: { groups, dir: join(home, 'rules'), selectors: layout.selectors },
+          settings: { ...TEST_SETTINGS, proxyMode: 'tun', verboseLog: true },
+          socksPort: 1,
+          httpPort: 2,
+          clashApiPort: clashPort,
+          clashSecret: randomBytes(16).toString('hex'),
+          logFile: f('sing-box.log'),
+          xrayPorts: { ob_live: 27_499 },
+          serverIps: { 'hy.example.com': ['198.51.100.8', '2001:db8::8'] },
+          ipv4Only
+        })
+        expect((cfg.inbounds[0] as { address?: string[] }).address).toHaveLength(ipv4Only ? 1 : 2)
+        writeFileSync(join(userRun, 'config.json'), JSON.stringify(cfg, null, 2))
+        const session = randomBytes(16).toString('hex')
+        const c = { session, pid: process.pid, cmd: 'run', restart: 0, rules: 0, ts: Date.now() }
+        ctl(c)
+        const b = await broker()
+        try {
+          // «running» = the config passed validation and the core was started (without
+          // admin rights it then fails to open the TUN — that is expected here)
+          const st = await waitFor(
+            state,
+            (s) => s?.session === session && s?.status !== 'starting',
+            20_000
+          )
+          expect(st?.error ?? '').toBe('')
+          expect(st?.status).toBe('running')
+          expect(readdirSync(join(home, 'rules')).filter((n) => n.startsWith('cw-'))).toHaveLength(
+            groups * 5
+          )
+        } finally {
+          ctl({ ...c, cmd: 'stop' })
+          await waitFor(
+            () => b.exitCode,
+            (x) => x !== null,
+            10_000
+          )
+          if (b.exitCode === null) b.kill()
+        }
+      },
+      60_000
+    )
 
     it('refuses configs that would let the elevated core touch other files', async () => {
       const g = goodConfig()
@@ -1497,6 +1503,123 @@ describe.skipIf(!enabled)('SidecarManager with real cores', () => {
       expect(restarts).toBe(1)
       expect(logs).toContain(
         'Ядро завершилось при создании адаптера (код 1, через 12,5 с), повторяем'
+      )
+    }, 60_000)
+
+    it('IPv6 off in Windows: «set ipv6 address» → at once an IPv4-only restart, kept for the next connect (0.4.6)', async () => {
+      const { SidecarManager } = await import('./SidecarManager')
+      const logFile = join(tmp, 'fake-core-v6.log')
+      const V6_FATAL =
+        'FATAL[0000] start service: start inbound/tun[tun-in]: configure tun interface: set ipv6 address: Element not found.'
+      const OTHER_FATAL = 'FATAL[0000] start service: start inbound/tun[tun-in]: Access is denied.'
+      let cfgPath = ''
+      /** the TUN address of the config each core was started with */
+      const started: string[][] = []
+      const addr = () => JSON.parse(readFileSync(cfgPath, 'utf8')).inbounds[0].address as string[]
+      const launcher = {
+        kind: 'service' as const,
+        coreRuleDir: join(tmp, 'run', 'rules'),
+        coreLogPath: logFile,
+        launch: async () => {
+          writeFileSync(logFile, '')
+          started.push(addr())
+        },
+        restartCore: async () => {
+          started.push(addr())
+        },
+        syncRules: async () => undefined,
+        exited: async () => true,
+        // a core with IPv6 dies on it; without — on something else (no admin rights here)
+        exitInfo: async () => ({
+          code: 1,
+          uptimeMs: 300,
+          stderr: started.at(-1)!.length > 1 ? V6_FATAL : OTHER_FATAL
+        }),
+        failure: () => null,
+        stop: async () => undefined
+      }
+      const logs: string[] = []
+      const states: [StatusUpdate['state'], string | undefined][] = []
+      const m = new SidecarManager(
+        (e) => logs.push(e.message),
+        (s, msg) => states.push([s, msg]),
+        () => undefined,
+        undefined,
+        undefined,
+        undefined,
+        {
+          launcherFactory: async (paths) => {
+            cfgPath = paths.configPath
+            return launcher
+          },
+          // the checks before the start see IPv6 (it is on here): only the safety net acts
+          ipv6Probe: async () => ({ available: true })
+        }
+      )
+      await expect(m.start(tunParams)).rejects.toThrow(/не запустилось/)
+      // with IPv6 → IPv4-only restart (no retry used up) → the one usual retry
+      expect(started).toEqual([
+        ['172.19.0.1/30', 'fdfe:dcba:9876::1/126'],
+        ['172.19.0.1/30'],
+        ['172.19.0.1/30']
+      ])
+      expect(logs).toContain('IPv6 в системе отключён — перезапускаем туннель только с IPv4')
+      expect(logs.filter((l) => /повторяем$/.test(l))).toHaveLength(1)
+      // the error is the real reason of the IPv4-only core, not the IPv6 one
+      expect(states.at(-1)).toEqual([
+        'error',
+        'Ядро sing-box не запустилось: start service: start inbound/tun[tun-in]: Access is denied.'
+      ])
+
+      // the next connect of this app run: IPv4-only from the start
+      started.length = 0
+      logs.length = 0
+      await expect(m.start(tunParams)).rejects.toThrow(/не запустилось/)
+      expect(started[0]).toEqual(['172.19.0.1/30'])
+      expect(logs).toContain('IPv6 в системе отключён — туннель запускается только с IPv4')
+      expect(logs).not.toContain('IPv6 в системе отключён — перезапускаем туннель только с IPv4')
+    }, 60_000)
+
+    it('IPv6 off found before the start: the first core already gets an IPv4-only TUN (0.4.6)', async () => {
+      const { SidecarManager } = await import('./SidecarManager')
+      const logFile = join(tmp, 'fake-core-v6b.log')
+      let first: string[] | null = null
+      let cfgPath = ''
+      const launcher = {
+        kind: 'legacy' as const,
+        coreRuleDir: join(tmp, 'run', 'rules'),
+        coreLogPath: logFile,
+        launch: async () => {
+          writeFileSync(logFile, '')
+          first = JSON.parse(readFileSync(cfgPath, 'utf8')).inbounds[0].address
+        },
+        restartCore: async () => undefined,
+        syncRules: async () => undefined,
+        exited: async () => true,
+        exitInfo: async () => ({ code: 1, uptimeMs: 100, stderr: '' }),
+        failure: () => null,
+        stop: async () => undefined
+      }
+      const logs: string[] = []
+      const m = new SidecarManager(
+        (e) => logs.push(e.message),
+        () => undefined,
+        () => undefined,
+        undefined,
+        undefined,
+        undefined,
+        {
+          launcherFactory: async (paths) => {
+            cfgPath = paths.configPath
+            return launcher
+          },
+          ipv6Probe: async () => ({ available: false, reason: 'DisabledComponents=0xFF' })
+        }
+      )
+      await expect(m.start(tunParams)).rejects.toThrow()
+      expect(first).toEqual(['172.19.0.1/30'])
+      expect(logs).toContain(
+        'IPv6 в системе отключён (DisabledComponents=0xFF) — туннель запускается только с IPv4'
       )
     }, 60_000)
 

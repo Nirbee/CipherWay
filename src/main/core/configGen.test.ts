@@ -14,6 +14,7 @@ import {
   groupOutbounds,
   orderByLatency,
   serverDomains,
+  TUN_PREFIX6,
   type GenParams
 } from './configGen'
 import {
@@ -446,6 +447,52 @@ describe('TUN: node traffic of xray bypasses the TUN (0.4.1)', () => {
   })
 })
 
+describe('TUN with IPv6 switched off in Windows (0.4.6)', () => {
+  type Tun = { address?: string[]; route_exclude_address?: string[]; auto_route?: boolean }
+  const tunOf = (extra: Partial<GenParams> = {}) =>
+    singbox({ proxyMode: 'tun' }, { serverIps: SERVER_IPS, ...extra }).inbounds[0] as Tun
+
+  it('dual stack by default: IPv4 + IPv6 address, IPv6 node IPs excluded too', () => {
+    const tun = tunOf()
+    expect(tun.address).toEqual(['172.19.0.1/30', TUN_PREFIX6])
+    expect(tun.route_exclude_address).toContain('2001:db8::7/128')
+  })
+
+  it('IPv4-only: no IPv6 address, no IPv6 excludes, everything else unchanged', () => {
+    const tun = tunOf({ ipv4Only: true })
+    expect(tun.address).toEqual(['172.19.0.1/30'])
+    expect(tun.route_exclude_address).toEqual([
+      '198.51.100.7/32',
+      '203.0.113.10/32',
+      '198.51.100.8/32'
+    ])
+    expect(JSON.stringify(tun)).not.toMatch(/fdfe|2001:db8/)
+    expect(tun).toMatchObject({ type: 'tun', auto_route: true, strict_route: true, mtu: 9000 })
+    // only IPv6 node IPs: no empty exclude list
+    expect(
+      (
+        singbox(
+          { proxyMode: 'tun' },
+          { serverIps: { 'v6.example.com': ['2001:db8::1'] }, ipv4Only: true }
+        ).inbounds[0] as Tun
+      ).route_exclude_address
+    ).toBeUndefined()
+    // the rest of the config is the same as with IPv6
+    const a = singbox({ proxyMode: 'tun' }, { serverIps: SERVER_IPS })
+    const b = singbox({ proxyMode: 'tun' }, { serverIps: SERVER_IPS, ipv4Only: true })
+    expect({ ...b, inbounds: [] }).toEqual({ ...a, inbounds: [] })
+  })
+
+  it('DNS answers IPv4 only (both shapes): nothing tries to use the missing IPv6', () => {
+    expect(singbox({ proxyMode: 'tun' }, { ipv4Only: true }).dns?.strategy).toBe('ipv4_only')
+    expect(singbox({ proxyMode: 'tun' }).dns?.strategy).toBe('ipv4_only')
+  })
+
+  it('system-proxy mode ignores the flag (no TUN)', () => {
+    expect(singbox({}, { ipv4Only: true })).toEqual(singbox())
+  })
+})
+
 describe('log level (0.4.1)', () => {
   it('warn by default, info with «Подробный журнал»', () => {
     expect(singbox().log.level).toBe('warn')
@@ -547,6 +594,22 @@ describe('real core validation', () => {
       })
     }
   }
+
+  it.skipIf(!existsSync(SINGBOX))('sing-box check accepts the IPv4-only TUN config (0.4.6)', () => {
+    const file = join(tmp, 'sing-box-tun-ipv4.json')
+    const cfg = singbox(
+      { proxyMode: 'tun' },
+      {
+        serverIps: SERVER_IPS,
+        directHosts: ['sub.example.com'],
+        slots: writeSlots(TEST_RULES, 'slots-tun-ipv4'),
+        ipv4Only: true
+      }
+    )
+    expect((cfg.inbounds[0] as { address?: string[] }).address).toEqual(['172.19.0.1/30'])
+    writeFileSync(file, JSON.stringify(cfg, null, 2))
+    check(SINGBOX, ['check', '-c', file])
+  })
 
   it.skipIf(!existsSync(SINGBOX))('sing-box check accepts the latency probe config', () => {
     const file = join(tmp, 'sing-box-probe.json')

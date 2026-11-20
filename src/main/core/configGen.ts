@@ -17,6 +17,8 @@ import { toExcludeCidrs, type ServerIps } from '../system/resolve'
 
 export { TUN_INTERFACE }
 export const TUN_ADDRESS4 = '172.19.0.1'
+/** the TUN's IPv6 half — left out when IPv6 is off in Windows (GenParams.ipv4Only) */
+export const TUN_PREFIX6 = 'fdfe:dcba:9876::1/126'
 
 export interface SlotParams {
   /** number of slot groups (rules/compile.ts groupsFor) */
@@ -52,6 +54,11 @@ export interface GenParams {
    * subscription server: its refresh is what repairs a broken tunnel)
    */
   directHosts?: string[]
+  /**
+   * TUN without its IPv6 half: IPv6 is switched off in Windows and sing-box
+   * would die on «set ipv6 address: Element not found» (system/ipv6.ts, 0.4.6)
+   */
+  ipv4Only?: boolean
 }
 
 /**
@@ -210,13 +217,15 @@ function inbounds(p: GenParams): SbInbound[] {
   if (p.settings.proxyMode === 'tun') {
     // the node IPs get no TUN route: cipherway-xray.exe's connections to them leave via
     // the physical NIC directly instead of looping through sing-box
-    const exclude = toExcludeCidrs(p.serverIps ?? {})
+    // IPv4-only: no IPv6 address → no IPv6 routes either; IPv6 excludes are dropped
+    // too (nothing to carve them out of)
+    const exclude = toExcludeCidrs(p.serverIps ?? {}).filter((c) => !p.ipv4Only || !c.includes(':'))
     return [
       {
         type: 'tun',
         tag: 'tun-in',
         interface_name: TUN_INTERFACE,
-        address: [`${TUN_ADDRESS4}/30`, 'fdfe:dcba:9876::1/126'],
+        address: p.ipv4Only ? [`${TUN_ADDRESS4}/30`] : [`${TUN_ADDRESS4}/30`, TUN_PREFIX6],
         mtu: 9000,
         auto_route: true,
         strict_route: true,

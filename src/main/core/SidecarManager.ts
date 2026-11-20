@@ -20,7 +20,12 @@ import {
   type TrafficStats,
   type TunServiceInfo
 } from '@shared/types'
-import { generateProbeConfig, generateSingboxConfig, TUN_ADDRESS4 } from './configGen'
+import {
+  generateProbeConfig,
+  generateSingboxConfig,
+  TUN_ADDRESS4,
+  type GenParams
+} from './configGen'
 import { generateXrayConfig, isXrayHandled, type XrayBridge } from './xrayGen'
 import { CORE_EXE, XRAY_EXE } from './coreNames'
 import { ClashApi } from './clashApi'
@@ -36,6 +41,7 @@ import { GeoCache } from '../rules/geo'
 import { findFreePort } from '../system/ports'
 import { disableSystemProxy, enableSystemProxy } from '../system/proxy'
 import { allIps, resolveServers, toExcludeCidrs, type ServerIps } from '../system/resolve'
+import { detectIpv6, shouldRetryIpv4Only, type Ipv6Status } from '../system/ipv6'
 
 type LogFn = (entry: LogEntry) => void
 type StateFn = (state: ConnectionState, message?: string) => void
@@ -71,6 +77,8 @@ export interface ManagerHooks {
   routingMode?: () => RoutingMode
   /** tests: a broker that needs no elevation */
   launcherFactory?: (paths: LauncherPaths, cancelled: () => boolean) => Promise<TunLauncher>
+  /** tests: instead of reading the registry / the adapters (system/ipv6.ts) */
+  ipv6Probe?: () => Promise<Ipv6Status>
 }
 
 /** a core that died is restarted up to this many times, after these pauses */
@@ -221,6 +229,13 @@ export class SidecarManager {
   private lastRestartAt = 0
   /** TUN: automatic retries used by this start */
   private tunRetries = 0
+  /**
+   * TUN: a core died on «set ipv6 address» in this app run — IPv6 is off in
+   * Windows, every later TUN start goes IPv4-only straight away (0.4.6)
+   */
+  private ipv4OnlySession = false
+  /** what the config of the current core was generated from (the IPv4-only rewrite) */
+  private coreGen: GenParams | null = null
   /** xray session number → node id */
   private xraySessions = new Map<string, string>()
   private reality = new RealityWatch()
@@ -540,6 +555,7 @@ export class SidecarManager {
       // from the TUN routes and pinned in xray — its connections to the nodes
       // go straight out of the physical NIC instead of through sing-box again
       let serverIps: ServerIps = {}
+      const ipv4Only = tun && (await this.tunIpv4Only())
       if (tun) {
         serverIps = await resolveServers(p.outbounds)
         this.onServerIps(allIps(serverIps))
@@ -571,7 +587,7 @@ export class SidecarManager {
 
       const logFile = this.launcher?.coreLogPath ?? this.logPath
       const clashSecret = randomBytes(16).toString('hex')
-      const cfg = generateSingboxConfig({
+      this.coreGen = {
         outbounds: p.outbounds,
         activeOutboundId: p.activeOutboundId,
         slots: {
@@ -588,9 +604,10 @@ export class SidecarManager {
         xrayPorts,
         serverIps,
         latencies: { ...(p.latencies ?? {}), ...this.recentPings },
-        directHosts: p.directHosts
-      })
-      await writeFile(this.configPath, JSON.stringify(cfg, null, 2), 'utf8')
+        directHosts: p.directHosts,
+        ...(ipv4Only ? { ipv4Only: true } : {})
+      }
+      await this.writeCoreConfig()
 
       if (bridges.length > 0) {
         const xcfg = generateXrayConfig(bridges, { serverIps })
@@ -745,6 +762,11 @@ export class SidecarManager {
       if (!l && this.coreTail.some((x) => /\bFATAL\b/.test(x))) break
       if (l && (await l.exited())) {
         exit = await this.noteCoreExit(l)
+        if (await this.ipv6Fallback(l, exit)) {
+          exit = null
+          deadline = Date.now() + CORE_READY_TIMEOUT_TUN_MS
+          continue
+        }
         if (this.tunRetries >= TUN_RETRIES) break
         this.tunRetries++
         this.log(
@@ -766,6 +788,60 @@ export class SidecarManager {
     const reason = await this.coreReason()
     const details = !reason && exit ? ` (${this.exitWords(exit)})` : ''
     throw new Error(`Ядро sing-box не запустилось${reason || details}`)
+  }
+
+  private async writeCoreConfig(): Promise<void> {
+    if (!this.coreGen) return
+    const cfg = generateSingboxConfig(this.coreGen)
+    await writeFile(this.configPath, JSON.stringify(cfg, null, 2), 'utf8')
+  }
+
+  /**
+   * TUN: start the core without the IPv6 half? Once the core has died on it in
+   * this app run — always; otherwise when Windows has IPv6 switched off.
+   */
+  private async tunIpv4Only(): Promise<boolean> {
+    if (this.ipv4OnlySession) {
+      this.log('info', 'app', 'IPv6 в системе отключён — туннель запускается только с IPv4')
+      return true
+    }
+    const v6 = await (this.hooks.ipv6Probe ?? detectIpv6)().catch((): Ipv6Status => ({
+      available: true
+    }))
+    if (v6.available) return false
+    this.log(
+      'info',
+      'app',
+      `IPv6 в системе отключён (${v6.reason}) — туннель запускается только с IPv4`
+    )
+    return true
+  }
+
+  /**
+   * The TUN core died because the adapter could not get its IPv6 address
+   * («set ipv6 address: Element not found» — IPv6 is off in Windows and the
+   * checks before the start missed it): once, the same config without IPv6 and
+   * an immediate restart (no UAC prompt, no retry used up). true = restarted.
+   */
+  private async ipv6Fallback(l: TunLauncher, exit: CoreExit | null): Promise<boolean> {
+    const gen = this.coreGen
+    const output = [...this.coreTail, ...(exit?.stderr.split('\n') ?? [])]
+    if (
+      !gen ||
+      !shouldRetryIpv4Only(output, { tun: this.mode === 'tun', ipv4Only: !!gen.ipv4Only })
+    ) {
+      return false
+    }
+    this.ipv4OnlySession = true
+    this.coreGen = { ...gen, ipv4Only: true }
+    await this.writeCoreConfig()
+    this.log('warn', 'app', 'IPv6 в системе отключён — перезапускаем туннель только с IPv4')
+    this.onState('connecting', 'IPv6 отключён — запускаем туннель только с IPv4…')
+    this.coreTail = []
+    await l.restartCore()
+    const failed = l.failure()
+    if (failed) throw new Error(failed)
+    return true
   }
 
   /** «код 1, через 12,5 с» */
@@ -839,6 +915,10 @@ export class SidecarManager {
       }
       if (res === 'cancel') throw new Error('Подключение отменено')
       const exit = res === 'exited' && this.launcher ? await this.noteCoreExit(this.launcher) : null
+      if (res === 'exited' && this.launcher && (await this.ipv6Fallback(this.launcher, exit))) {
+        await this.waitCoreReady(cancelled, CORE_READY_TIMEOUT_TUN_MS)
+        continue
+      }
       why = res === 'exited' ? await this.coreReason() : ''
       const what =
         res === 'exited'

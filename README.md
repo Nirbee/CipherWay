@@ -300,3 +300,19 @@ proxy mocked): `CW_E2E=1 npx vitest run src/main/core/sidecar.e2e.test.ts`.
   («программа chrome.exe», not «программа lyrebird.exe и ещё 9»).
 - «Логи»: endless `i/o timeout` / `no recent network activity` lines are collapsed per
   error and outbound («… ещё строк: N за 30 с»).
+
+## 0.4.6: TUN on a Windows with IPv6 switched off
+
+- **Bug**: with IPv6 off in Windows (`Tcpip6\Parameters\DisabledComponents = 0xFF`, or
+  IPv6 unticked on every adapter) TUN never started: «start inbound/tun[tun-in]:
+  configure tun interface: set ipv6 address: Element not found». The TUN inbound
+  always had an IPv6 address next to `172.19.0.1/30`.
+- Before every TUN start (`src/main/system/ipv6.ts`, no admin rights): bit `0x10` of
+  `DisabledComponents` (0xFF includes it), or no IPv6 address — not even `fe80::` — on
+  any adapter but loopback → the TUN gets only its IPv4 address and no IPv6 route
+  excludes (`GenParams.ipv4Only`). DNS stays `ipv4_only`. «Логи»: «IPv6 в системе
+  отключён (…) — туннель запускается только с IPv4».
+- Safety net: a TUN core that still dies on `set ipv6 address` / `set ipv6 options`
+  is restarted at once with the IPv4-only config (service and UAC broker alike — both
+  re-read `config.json`; this restart does not use up the usual retry), and every
+  later TUN start of this app run is IPv4-only.
