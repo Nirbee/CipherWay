@@ -12,7 +12,7 @@ import {
   type SbRouteRule
 } from './sbTypes'
 import { isXrayHandled } from './xrayGen'
-import { TUN_INTERFACE, XRAY_EXE } from './coreNames'
+import { LAN_CIDR4, LAN_CIDR6, LAN_LOGIN_HOST, TUN_INTERFACE, XRAY_EXE } from './coreNames'
 import { toExcludeCidrs, type ServerIps } from '../system/resolve'
 
 export { TUN_INTERFACE }
@@ -59,6 +59,8 @@ export interface GenParams {
    * would die on «set ipv6 address: Element not found» (system/ipv6.ts, 0.4.6)
    */
   ipv4Only?: boolean
+  /** «LAN» is switched on: its bypass rules (lanRules) go into the config */
+  lan?: LanBypass
 }
 
 /**
@@ -213,13 +215,49 @@ export function groupOutbounds(
   ]
 }
 
+export interface LanBypass {
+  /**
+   * full path of the daemon the service runs: %ProgramData%\CipherWay\bin\cipherway-lan.exe
+   * (process_path, not the bare file name: any program can call itself that)
+   */
+  exePath: string
+  /** host of the login server (Headscale, from the bot); LAN_LOGIN_HOST if unknown */
+  loginHost?: string
+}
+
+/**
+ * «LAN» (0.5.0) next to the VPN — only while LAN is switched on (the app rebuilds
+ * the config when it is toggled), then in every proxy mode and routing mode:
+ *  - the virtual LAN (100.64.0.0/10, fd7a:115c:a1e0::/48) never enters our
+ *    TUN (route_exclude_address) — the LAN daemon's own adapter routes it; a
+ *    connection that still reaches sing-box (system proxy: a browser opening
+ *    http://100.x…) goes direct, i.e. to that adapter;
+ *  - the daemon's own traffic (control server, relay, peer-to-peer UDP from
+ *    its fixed port) goes direct — through the VPN, peers could not reach it
+ *    directly and every game packet would make a detour via the VPN node;
+ *  - the login server (Headscale) is direct and resolved directly.
+ * Placed before sniff and the routing-mode switch: «Весь трафик через VPN»
+ * doesn't take it either.
+ */
+export const LAN_ROUTE_EXCLUDE = [LAN_CIDR4, LAN_CIDR6]
+
+export function lanRules(lan: LanBypass): SbRouteRule[] {
+  return [
+    { process_path: [lan.exePath], action: 'route', outbound: TAG_DIRECT },
+    { ip_cidr: [...LAN_ROUTE_EXCLUDE], action: 'route', outbound: TAG_DIRECT }
+  ]
+}
+
 function inbounds(p: GenParams): SbInbound[] {
   if (p.settings.proxyMode === 'tun') {
     // the node IPs get no TUN route: cipherway-xray.exe's connections to them leave via
-    // the physical NIC directly instead of looping through sing-box
+    // the physical NIC directly instead of looping through sing-box; nor does the LAN.
     // IPv4-only: no IPv6 address → no IPv6 routes either; IPv6 excludes are dropped
-    // too (nothing to carve them out of)
-    const exclude = toExcludeCidrs(p.serverIps ?? {}).filter((c) => !p.ipv4Only || !c.includes(':'))
+    // too (nothing to carve them out of) — the LAN's fd7a::/48 included
+    const exclude = [
+      ...toExcludeCidrs(p.serverIps ?? {}),
+      ...(p.lan ? LAN_ROUTE_EXCLUDE : [])
+    ].filter((c) => !p.ipv4Only || !c.includes(':'))
     return [
       {
         type: 'tun',
@@ -269,8 +307,14 @@ export function generateSingboxConfig(p: GenParams): SbConfig {
   const proxyOutbounds = p.outbounds.map((o) => buildOutbound(o, p.xrayPorts[o.id]))
   const tun = p.settings.proxyMode === 'tun'
   const nodeDomains = serverDomains(p.outbounds)
-  // the subscription server: direct and resolved directly in every mode
-  const directRules = directHostRules(p.directHosts)
+  // the subscription server and the LAN login server: direct and resolved
+  // directly in every mode
+  // the login host: a rule of its own — «Подключения» names exactly the host matched
+  const lanHost = p.lan ? (p.lan.loginHost || LAN_LOGIN_HOST).trim().toLowerCase() : ''
+  const directRules = [
+    ...directHostRules(p.directHosts),
+    ...(lanHost ? [{ domain: [lanHost], action: 'route' as const, outbound: TAG_DIRECT }] : [])
+  ]
   const localDomains = [...new Set([...nodeDomains, ...directRules.flatMap((r) => r.domain ?? [])])]
 
   // Loop protection in TUN mode: cipherway-xray.exe dials the nodes itself. Normally its
@@ -330,6 +374,7 @@ export function generateSingboxConfig(p: GenParams): SbConfig {
       // their slots (first match wins).
       rules: [
         ...loopGuard,
+        ...(p.lan ? lanRules(p.lan) : []),
         { action: 'sniff' },
         ...(tun ? [{ protocol: ['dns'], action: 'hijack-dns' as const }] : []),
         ...directRules,

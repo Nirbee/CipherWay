@@ -1840,12 +1840,25 @@ describe.skipIf(!enabled)('SidecarManager with real cores', () => {
         expect((await svc.status()).state).toBe('outdated')
 
         const brokerText = await svc.brokerText(sid)
+        // 0.5.0: a build with the LAN daemon installs its task too (as install() does)
+        const lanBrokerText = await svc.lanBrokerText(sid)
+        const lanExe = join(BIN, 'cipherway-lan.exe')
         const script = installScript({
           sid,
           srcBinDir: BIN,
           brokerText,
-          hashes: { [CORE_EXE]: sha(SINGBOX), 'wintun.dll': sha(join(BIN, 'wintun.dll')) },
+          hashes: {
+            [CORE_EXE]: sha(SINGBOX),
+            'wintun.dll': sha(join(BIN, 'wintun.dll')),
+            ...(lanBrokerText ? { 'cipherway-lan.exe': sha(lanExe) } : {})
+          },
           brokerHash: createHash('sha256').update(brokerText, 'utf8').digest('hex'),
+          ...(lanBrokerText
+            ? {
+                lanBrokerText,
+                lanBrokerHash: createHash('sha256').update(lanBrokerText, 'utf8').digest('hex')
+              }
+            : {}),
           appVersion: '0.4.3',
           testRoot: root
         })

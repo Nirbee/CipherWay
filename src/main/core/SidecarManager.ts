@@ -24,7 +24,8 @@ import {
   generateProbeConfig,
   generateSingboxConfig,
   TUN_ADDRESS4,
-  type GenParams
+  type GenParams,
+  type LanBypass
 } from './configGen'
 import { generateXrayConfig, isXrayHandled, type XrayBridge } from './xrayGen'
 import { CORE_EXE, XRAY_EXE } from './coreNames'
@@ -59,6 +60,8 @@ export interface StartParams {
   latencies?: Record<string, number | null>
   /** hosts the app reaches outside the tunnel in every mode (the subscription server) */
   directHosts?: string[]
+  /** «LAN» is on: its daemon + login server bypass the VPN (configGen lanRules) */
+  lan?: LanBypass
 }
 
 /** Optional reactions of the app + what tests replace. */
@@ -306,12 +309,12 @@ export class SidecarManager {
     this.logFilter = new LogFilter((e) => this.onLog(e))
   }
 
-  private get binDir(): string {
+  get binDir(): string {
     return app.isPackaged
       ? join(process.resourcesPath, 'bin')
       : join(process.cwd(), 'resources', 'bin')
   }
-  private get runDir(): string {
+  get runDir(): string {
     return join(app.getPath('userData'), 'run')
   }
   private get rulesDir(): string {
@@ -342,7 +345,8 @@ export class SidecarManager {
     }
   }
 
-  private get tunService(): TunService {
+  /** the «Служба CipherWay» (TUN + LAN tasks) */
+  get tunService(): TunService {
     this.tunSvc ??= new TunService({
       binDir: this.binDir,
       runDir: this.runDir,
@@ -394,6 +398,10 @@ export class SidecarManager {
   /** tests: pid of xray */
   get xrayPid(): number | undefined {
     return this.xray?.pid
+  }
+  /** the running core lets the LAN daemon bypass the VPN (configGen lanRules) */
+  get lanBypass(): boolean {
+    return this.running && !!this.coreGen?.lan
   }
   /** Restarting a legacy (non-service) TUN core would mean a UAC prompt. */
   get reloadNeedsPrompt(): boolean {
@@ -605,6 +613,7 @@ export class SidecarManager {
         serverIps,
         latencies: { ...(p.latencies ?? {}), ...this.recentPings },
         directHosts: p.directHosts,
+        ...(p.lan ? { lan: p.lan } : {}),
         ...(ipv4Only ? { ipv4Only: true } : {})
       }
       await this.writeCoreConfig()

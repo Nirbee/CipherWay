@@ -265,7 +265,7 @@ function TunServiceControls({ enabled }: { enabled: boolean }) {
   const connected = state === 'connected' || state === 'connecting'
   const hint = !enabled
     ? 'Выключена: Windows спрашивает права администратора при каждом подключении TUN.'
-    : 'Задача Планировщика Windows запускает ядро с правами администратора без запроса. Файлы ядра хранятся в защищённой папке ProgramData\\CipherWay.'
+    : 'Задача Планировщика Windows запускает ядро (и LAN) с правами администратора без запроса. Файлы хранятся в защищённой папке ProgramData\\CipherWay.'
 
   return (
     <div className="flex items-center justify-between gap-4 rounded-xl border border-border-subtle bg-bg-panel-alt px-3.5 py-3">

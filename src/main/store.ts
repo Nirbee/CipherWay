@@ -25,6 +25,14 @@ interface Schema {
   supportNotifiedAt: string | null
   /** the app version a «Доступна версия …» notification was shown for */
   updateNotifiedVersion: string | null
+  /** «LAN» switch (on again after a restart) */
+  lanEnabled: boolean
+  /** Headscale URL the bot gave last (its host stays direct in the VPN config) */
+  lanLoginServer: string | null
+  /** LAN host name the bot gave this computer («cw-xxxxxx»; room members see it) */
+  lanHostname: string | null
+  /** «Что нового»: the app version whose changes the user has seen (null = never) */
+  whatsNewSeenVersion: string | null
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -74,7 +82,11 @@ export const store = new Store<Schema>({
     latencyCache: {},
     supportReadAt: null,
     supportNotifiedAt: null,
-    updateNotifiedVersion: null
+    updateNotifiedVersion: null,
+    lanEnabled: false,
+    lanLoginServer: null,
+    lanHostname: null,
+    whatsNewSeenVersion: null
   }
 })
 

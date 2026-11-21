@@ -32,7 +32,7 @@ export function LogsPage() {
     <div className="flex h-full flex-col">
       <PageHeader
         title="Логи"
-        subtitle="Журнал ядер sing-box, Xray и приложения (последние 1000 строк). Адреса серверов и ссылка подписки скрыты."
+        subtitle="Журнал ядер sing-box, Xray, LAN и приложения (последние 1000 строк). Адреса серверов, ссылка подписки и ключи LAN скрыты."
         actions={
           <>
             <Button variant="secondary" size="sm" onClick={copyAll} disabled={entries.length === 0}>

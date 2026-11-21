@@ -493,6 +493,96 @@ describe('TUN with IPv6 switched off in Windows (0.4.6)', () => {
   })
 })
 
+describe('LAN next to the VPN (0.5.0)', () => {
+  type Tun = { route_exclude_address?: string[] }
+  const EXE = 'C:\\ProgramData\\CipherWay\\bin\\cipherway-lan.exe'
+  const LAN = { exePath: EXE }
+  const LAN_HEAD = [
+    { process_path: [EXE], action: 'route', outbound: 'direct' },
+    {
+      ip_cidr: ['100.64.0.0/10', 'fd7a:115c:a1e0::/48'],
+      action: 'route',
+      outbound: 'direct'
+    }
+  ]
+
+  for (const proxyMode of ['system', 'tun'] as const) {
+    for (const routingMode of ['rule', 'global', 'direct'] as const) {
+      it(`${proxyMode}/${routingMode}: LAN on — the daemon (by full path) and the LAN go direct first`, () => {
+        const cfg = singbox({ proxyMode, routingMode }, { serverIps: SERVER_IPS, lan: LAN })
+        const rules = cfg.route.rules
+        const at = proxyMode === 'tun' ? 1 : 0 // after the xray loop guard
+        expect(rules.slice(at, at + 2)).toEqual(LAN_HEAD)
+        // before sniff, hijack-dns and the routing-mode switch («Весь трафик» too)
+        const sniff = rules.findIndex((r) => r.action === 'sniff')
+        const mode = rules.findIndex((r) => r.clash_mode === 'Global')
+        expect(sniff).toBe(at + 2)
+        expect(mode).toBeGreaterThan(sniff)
+        // the login server: a direct route rule of its own + the direct DNS server
+        expect(rules).toContainEqual({
+          domain: ['lan.cipherway.ru'],
+          action: 'route',
+          outbound: 'direct'
+        })
+        const dns = (cfg.dns as { rules: { domain?: string[]; server?: string }[] }).rules
+        expect(dns[0].server).toBe('local')
+        expect(dns[0].domain).toContain('lan.cipherway.ru')
+        if (proxyMode === 'tun') {
+          const ex = (cfg.inbounds[0] as Tun).route_exclude_address ?? []
+          expect(ex).toContain('100.64.0.0/10')
+          expect(ex).toContain('fd7a:115c:a1e0::/48')
+        }
+      })
+    }
+  }
+
+  it('no bare process name, no source-port rule: nothing another program could imitate', () => {
+    const json = JSON.stringify(singbox({ proxyMode: 'tun' }, { lan: LAN }).route.rules)
+    expect(json).not.toContain('process_name":["cipherway-lan.exe')
+    expect(json).not.toContain('source_port')
+  })
+
+  it('LAN off: no LAN rules, no excludes, no login server — the config of 0.4.6', () => {
+    for (const proxyMode of ['system', 'tun'] as const) {
+      const cfg = singbox({ proxyMode }, { serverIps: SERVER_IPS })
+      const json = JSON.stringify(cfg)
+      expect(json).not.toMatch(/cipherway-lan|100\.64\.0\.0|fd7a:115c|lan\.cipherway\.ru/)
+    }
+  })
+
+  it('LAN on + IPv6 off in Windows: the LAN IPv6 range is dropped like the others', () => {
+    const tun = singbox({ proxyMode: 'tun' }, { serverIps: SERVER_IPS, lan: LAN, ipv4Only: true })
+      .inbounds[0] as Tun
+    expect(tun.route_exclude_address).toEqual([
+      '198.51.100.7/32',
+      '203.0.113.10/32',
+      '198.51.100.8/32',
+      '100.64.0.0/10'
+    ])
+  })
+
+  it('the login server from the bot replaces the default one', () => {
+    const cfg = singbox(
+      {},
+      { lan: { ...LAN, loginHost: 'hs.example.net' }, directHosts: ['sub.example.com'] }
+    )
+    // separate rules: «Подключения» names the one host a connection matched
+    expect(cfg.route.rules).toContainEqual({
+      domain: ['sub.example.com'],
+      action: 'route',
+      outbound: 'direct'
+    })
+    expect(cfg.route.rules).toContainEqual({
+      domain: ['hs.example.net'],
+      action: 'route',
+      outbound: 'direct'
+    })
+    const dns = (cfg.dns as { rules: { domain?: string[] }[] }).rules
+    expect(dns[0].domain).toContain('hs.example.net')
+    expect(dns[0].domain).not.toContain('lan.cipherway.ru')
+  })
+})
+
 describe('log level (0.4.1)', () => {
   it('warn by default, info with «Подробный журнал»', () => {
     expect(singbox().log.level).toBe('warn')
@@ -586,6 +676,10 @@ describe('real core validation', () => {
             serverIps: SERVER_IPS,
             latencies: { [outbounds[0].id]: null },
             directHosts: ['sub.example.com', '203.0.113.5'],
+            // LAN on in half of the runs: sing-box takes process_path with a Windows path
+            ...(routingMode !== 'direct'
+              ? { lan: { exePath: 'C:\\ProgramData\\CipherWay\\bin\\cipherway-lan.exe' } }
+              : {}),
             slots: writeSlots(TEST_RULES, `slots-${mode}-${routingMode}`)
           }
         )

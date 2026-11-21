@@ -1,5 +1,5 @@
 import { CORE_PROCESS_PS, psQuote, STALE_ADAPTER_PS } from './broker'
-import { CORE_EXE, LEGACY_EXES, TUN_INTERFACE } from './coreNames'
+import { CORE_EXE, LAN_EXE, LEGACY_EXES, TUN_INTERFACE } from './coreNames'
 
 // ---------------------------------------------------------------------------
 // «Служба TUN» (0.4.2): instead of a UAC prompt on every TUN connect, the
@@ -41,6 +41,8 @@ export const SYSTEM_SID = 'S-1-5-18'
 export interface BrokerHashes {
   [CORE_EXE]: string
   'wintun.dll': string
+  /** the LAN daemon (0.5.0); absent in a build without it */
+  [LAN_EXE]?: string
 }
 
 export interface ServiceBrokerParams {
@@ -59,17 +61,75 @@ const SID_RE = /^S-1-5-21(-\d{1,10}){3,6}$|^S-1-5-18$/
 export function isValidSid(sid: string): boolean {
   return SID_RE.test(sid)
 }
-const HASH_RE = /^[0-9a-f]{64}$/
+export const HASH_RE = /^[0-9a-f]{64}$/
 
 export function taskName(sid: string): string {
   return `CipherWay TUN ${sid}`
 }
 
-function rootExpr(override?: string): string {
+/** The second task of the service: the LAN daemon (src/main/lan/lanBroker.ts). */
+export function lanTaskName(sid: string): string {
+  return `CipherWay LAN ${sid}`
+}
+
+export function rootExpr(override?: string): string {
   return override
     ? psQuote(override)
     : `(Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'CipherWay')`
 }
+
+/**
+ * PowerShell helpers of both SYSTEM brokers (TUN and LAN). Expect $Utf8,
+ * $BrokerLog, $State, $StateF, $CtlF. Everything from the user's run folder is
+ * read with Read-UserFile: size-limited, never through a link.
+ */
+export const BROKER_HELPERS_PS = `
+function Now-Ms { [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
+function Is-Reparse([string]$p) {
+  try { return (([IO.File]::GetAttributes($p) -band [IO.FileAttributes]::ReparsePoint) -ne 0) } catch { return $false }
+}
+function Read-UserFile([string]$p, [long]$max) {
+  try {
+    $fi = New-Object IO.FileInfo($p)
+    if (-not $fi.Exists -or $fi.Length -gt $max) { return $null }
+    if (($fi.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $null }
+    return [IO.File]::ReadAllText($p, $Utf8)
+  } catch { return $null }
+}
+function Write-Atomic([string]$p, [string]$text) {
+  $tmp = $p + '.tmp'
+  [IO.File]::WriteAllText($tmp, $text, $Utf8)
+  for ($i = 0; $i -lt 30; $i++) {
+    try {
+      if ([IO.File]::Exists($p)) { [IO.File]::Replace($tmp, $p, [NullString]::Value) } else { [IO.File]::Move($tmp, $p) }
+      return
+    } catch { Start-Sleep -Milliseconds 100 }
+  }
+  throw ('не удалось записать ' + $p)
+}
+function Note([string]$m) {
+  try {
+    if ([IO.File]::Exists($BrokerLog) -and (New-Object IO.FileInfo($BrokerLog)).Length -gt 524288) { [IO.File]::WriteAllText($BrokerLog, '', $Utf8) }
+    [IO.File]::AppendAllText($BrokerLog, ([DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss') + ' ' + $m + [Environment]::NewLine), $Utf8)
+  } catch {}
+}
+function Save-State { $State.ts = Now-Ms; Write-Atomic $StateF (ConvertTo-Json -Compress -InputObject $State) }
+function Alive($id) {
+  try { $null = [Diagnostics.Process]::GetProcessById([int]$id); return $true } catch { return $false }
+}
+function Read-Ctl {
+  $t = Read-UserFile $CtlF 4096
+  if (-not $t) { return $null }
+  try { $c = $t | ConvertFrom-Json } catch { return $null }
+  if (-not ($c.session -is [string]) -or $c.session -notmatch '^[0-9a-f]{16,64}$') { return $null }
+  return $c
+}
+function Sha([string]$p) {
+  $h = [Security.Cryptography.SHA256]::Create()
+  $f = [IO.File]::OpenRead($p)
+  try { return ([BitConverter]::ToString($h.ComputeHash($f)) -replace '-', '').ToLowerInvariant() } finally { $f.Dispose() }
+}
+`.trim()
 
 /** The SYSTEM-side broker (installed into <home>\broker.ps1). */
 export function serviceBrokerScript(p: ServiceBrokerParams): string {
@@ -104,58 +164,14 @@ $Forbidden = '(?i)(path|file|dir|_ui|download|certificate|key|script|command|exe
 $OkOut = @('direct', 'socks', 'hysteria2', 'vmess', 'selector', 'urltest')
 $OkDns = @('https', 'udp', 'tcp', 'tls', 'local')
 
-function Now-Ms { [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
-function Is-Reparse([string]$p) {
-  try { return (([IO.File]::GetAttributes($p) -band [IO.FileAttributes]::ReparsePoint) -ne 0) } catch { return $false }
-}
-function Read-UserFile([string]$p, [long]$max) {
-  try {
-    $fi = New-Object IO.FileInfo($p)
-    if (-not $fi.Exists -or $fi.Length -gt $max) { return $null }
-    if (($fi.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $null }
-    return [IO.File]::ReadAllText($p, $Utf8)
-  } catch { return $null }
-}
-function Write-Atomic([string]$p, [string]$text) {
-  $tmp = $p + '.tmp'
-  [IO.File]::WriteAllText($tmp, $text, $Utf8)
-  for ($i = 0; $i -lt 30; $i++) {
-    try {
-      if ([IO.File]::Exists($p)) { [IO.File]::Replace($tmp, $p, [NullString]::Value) } else { [IO.File]::Move($tmp, $p) }
-      return
-    } catch { Start-Sleep -Milliseconds 100 }
-  }
-  throw ('не удалось записать ' + $p)
-}
-function Note([string]$m) {
-  try {
-    if ([IO.File]::Exists($BrokerLog) -and (New-Object IO.FileInfo($BrokerLog)).Length -gt 524288) { [IO.File]::WriteAllText($BrokerLog, '', $Utf8) }
-    [IO.File]::AppendAllText($BrokerLog, ([DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss') + ' ' + $m + [Environment]::NewLine), $Utf8)
-  } catch {}
-}
 $State = @{ session = ''; status = 'starting'; restart = 0; rules = 0; corePid = 0; exitCode = $null; uptimeMs = $null; stderr = ''; stopReason = ''; error = ''; brokerPid = $PID; ts = 0 }
-function Save-State { $State.ts = Now-Ms; Write-Atomic $StateF (ConvertTo-Json -Compress -InputObject $State) }
-function Alive($id) {
-  try { $null = [Diagnostics.Process]::GetProcessById([int]$id); return $true } catch { return $false }
-}
-function Read-Ctl {
-  $t = Read-UserFile $CtlF 4096
-  if (-not $t) { return $null }
-  try { $c = $t | ConvertFrom-Json } catch { return $null }
-  if (-not ($c.session -is [string]) -or $c.session -notmatch '^[0-9a-f]{16,64}$') { return $null }
-  return $c
-}
-function Sha([string]$p) {
-  $h = [Security.Cryptography.SHA256]::Create()
-  $f = [IO.File]::OpenRead($p)
-  try { return ([BitConverter]::ToString($h.ComputeHash($f)) -replace '-', '').ToLowerInvariant() } finally { $f.Dispose() }
-}
+${BROKER_HELPERS_PS}
 function Test-Keys($node, [string]$where) {
   if ($null -eq $node) { return }
   if ($node -is [System.Management.Automation.PSCustomObject]) {
     foreach ($q in $node.PSObject.Properties) {
       $w = $where + '.' + $q.Name
-      if ($q.Name -match $Forbidden -and $w -notmatch '^\\.route\\.rule_set\\[\\d+\\]\\.path$') { throw ('запрещённое поле ' + $w) }
+      if ($q.Name -match $Forbidden -and $w -notmatch '^\\.route\\.(rule_set\\[\\d+\\]\\.path|rules\\[\\d+\\]\\.process_path)$') { throw ('запрещённое поле ' + $w) }
       Test-Keys $q.Value $w
     }
   } elseif ($node -is [array]) {
@@ -347,6 +363,9 @@ export interface InstallParams {
   hashes: BrokerHashes
   /** sha256 of brokerText, stored in the manifest */
   brokerHash: string
+  /** the LAN broker (lanBrokerScript) + its sha256; absent = no LAN task */
+  lanBrokerText?: string
+  lanBrokerHash?: string
   appVersion: string
   /**
    * tests only: run the file part (copy, hash check, removal of the old names,
@@ -378,16 +397,22 @@ function Remove-LegacyCores {
 `.trim()
 }
 
+const TASK_DESCRIPTION = {
+  tun: 'CipherWay VPN: ядро sing-box в режиме TUN без запроса прав при каждом подключении',
+  lan: 'CipherWay VPN: LAN — виртуальная локальная сеть для игр с друзьями'
+} as const
+
 /**
- * XML of the task: SYSTEM, highest, on demand only, no time limit, also on
+ * XML of a task: SYSTEM, highest, on demand only, no time limit, also on
  * battery, normal priority (the default 7 would make sing-box «below normal»).
- * $PsX / $BrokerX / $DirX are expanded (XML-escaped) by the installer's
- * PowerShell here-string.
+ * $PsX / $BrokerX (TUN) or $LanBrokerX (LAN) / $DirX are expanded
+ * (XML-escaped) by the installer's PowerShell here-string.
  */
-export function taskXml(): string {
+export function taskXml(kind: 'tun' | 'lan' = 'tun'): string {
+  const broker = kind === 'lan' ? '$LanBrokerX' : '$BrokerX'
   return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo><Author>CipherWay VPN</Author><Description>CipherWay VPN: ядро sing-box в режиме TUN без запроса прав при каждом подключении</Description></RegistrationInfo>
+  <RegistrationInfo><Author>CipherWay VPN</Author><Description>${TASK_DESCRIPTION[kind]}</Description></RegistrationInfo>
   <Principals><Principal id="Author"><UserId>${SYSTEM_SID}</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
   <Settings>
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
@@ -405,7 +430,7 @@ export function taskXml(): string {
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
     <Priority>4</Priority>
   </Settings>
-  <Actions Context="Author"><Exec><Command>$PsX</Command><Arguments>-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "$BrokerX"</Arguments><WorkingDirectory>$DirX</WorkingDirectory></Exec></Actions>
+  <Actions Context="Author"><Exec><Command>$PsX</Command><Arguments>-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "${broker}"</Arguments><WorkingDirectory>$DirX</WorkingDirectory></Exec></Actions>
 </Task>`
 }
 
@@ -413,19 +438,39 @@ export function taskXml(): string {
 export function installScript(p: InstallParams): string {
   if (!isValidSid(p.sid)) throw new Error('bad sid')
   const b64 = Buffer.from(p.brokerText, 'utf8').toString('base64')
+  const lan = !!(p.hashes[LAN_EXE] && p.lanBrokerText && p.lanBrokerHash)
+  if (lan && (!HASH_RE.test(p.hashes[LAN_EXE] ?? '') || !HASH_RE.test(p.lanBrokerHash ?? ''))) {
+    throw new Error('bad hash')
+  }
+  const lanB64 = lan ? Buffer.from(p.lanBrokerText ?? '', 'utf8').toString('base64') : ''
   const manifest = JSON.stringify({
     version: 1,
     app: p.appVersion,
     broker: p.brokerHash,
+    ...(lan ? { lanBroker: p.lanBrokerHash } : {}),
     files: p.hashes
   })
+  const want = [
+    `${psQuote(CORE_EXE)} = ${psQuote(p.hashes[CORE_EXE])}`,
+    `'wintun.dll' = ${psQuote(p.hashes['wintun.dll'])}`,
+    ...(lan ? [`${psQuote(LAN_EXE)} = ${psQuote(p.hashes[LAN_EXE] ?? '')}`] : [])
+  ].join('; ')
+  // <Root>\lan\<SID>: the LAN daemon's node key — SYSTEM / Administrators only
   const secureDirs = p.testRoot
-    ? `foreach ($d in @($Root, $Bin, (Join-Path $Root 'u'), $Dir, (Join-Path $Dir 'rules'))) { $null = [IO.Directory]::CreateDirectory($d) }`
+    ? `foreach ($d in @($Root, $Bin, (Join-Path $Root 'u'), $Dir, (Join-Path $Dir 'rules')${lan ? ", (Join-Path $Root 'lan'), $LanDir, (Join-Path $LanDir 'pd'), (Join-Path $LanDir 'tmp')" : ''})) { $null = [IO.Directory]::CreateDirectory($d) }`
     : `Secure-Dir $Root $Shared
   Secure-Dir $Bin $Shared
   Secure-Dir (Join-Path $Root 'u') $Shared
   Secure-Dir $Dir $Mine
-  Secure-Dir (Join-Path $Dir 'rules') $Mine`
+  Secure-Dir (Join-Path $Dir 'rules') $Mine${
+    lan
+      ? `
+  Secure-Dir (Join-Path $Root 'lan') $Admins
+  Secure-Dir $LanDir $Admins
+  Secure-Dir (Join-Path $LanDir 'pd') $Admins
+  Secure-Dir (Join-Path $LanDir 'tmp') $Admins`
+      : ''
+  }`
   const registerTask = p.testRoot
     ? ''
     : `$PsX = Join-Path ([Environment]::GetFolderPath('System')) 'WindowsPowerShell\\v1.0\\powershell.exe'
@@ -433,29 +478,42 @@ export function installScript(p: InstallParams): string {
   $BrokerX = [Security.SecurityElement]::Escape($BrokerX)
   $PsX = [Security.SecurityElement]::Escape($PsX)
   $Xml = @"
-${taskXml()}
+${taskXml('tun')}
 "@
   $svc = New-Object -ComObject 'Schedule.Service'
   $svc.Connect()
   $folder = $svc.GetFolder('\\')
   # the user may read and run the task (FRFX), never change it
   $TaskSddl = 'D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;' + $Sid + ')'
-  $null = $folder.RegisterTask($TaskName, $Xml, 6, $null, $null, 5, $TaskSddl)`
+  $null = $folder.RegisterTask($TaskName, $Xml, 6, $null, $null, 5, $TaskSddl)${
+    lan
+      ? `
+  $LanBrokerX = [Security.SecurityElement]::Escape($LanBrokerX)
+  $LanXml = @"
+${taskXml('lan')}
+"@
+  $null = $folder.RegisterTask($LanTaskName, $LanXml, 6, $null, $null, 5, $TaskSddl)`
+      : ''
+  }`
   return `
 $ErrorActionPreference = 'Stop'
 $env:PSModulePath = Join-Path $PSHOME 'Modules'
 $Sid = ${psQuote(p.sid)}
 $SrcBin = ${psQuote(p.srcBinDir)}
 $TaskName = ${psQuote(taskName(p.sid))}
-$Want = @{ ${psQuote(CORE_EXE)} = ${psQuote(p.hashes[CORE_EXE])}; 'wintun.dll' = ${psQuote(p.hashes['wintun.dll'])} }
+$LanTaskName = ${psQuote(lanTaskName(p.sid))}
+$Want = @{ ${want} }
 $Manifest = ${psQuote(manifest)}
 $BrokerText = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64}'))
+$LanBrokerText = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${lanB64}'))
 $Root = ${rootExpr(p.testRoot)}
 $Dir = Join-Path $Root ('u\\' + $Sid)
 $Bin = Join-Path $Root 'bin'
+$LanDir = Join-Path $Root ('lan\\' + $Sid)
 $Trusted = @('S-1-5-32-544', 'S-1-5-18')
 $Shared = 'O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)'
 $Mine = 'O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;' + $Sid + ')'
+$Admins = 'O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)'
 
 function Sha([string]$p) {
   $h = [Security.Cryptography.SHA256]::Create()
@@ -489,9 +547,17 @@ function Secure-Dir([string]$path, [string]$sddl) {
   }
   if (-not [IO.Directory]::Exists($path)) { $null = [IO.Directory]::CreateDirectory($path, $ds) }
 }
+# a running LAN daemon (of any Windows user) holds its exe: it is stopped for the
+# update — only processes of exactly this file; its broker reports the exit
+function Stop-RunningFrom([string]$path) {
+  foreach ($p in @(Get-Process -Name ([IO.Path]::GetFileNameWithoutExtension($path)) -ErrorAction SilentlyContinue)) {
+    try { if ($p.Path -ieq $path) { $p.Kill(); $null = $p.WaitForExit(5000) } } catch {}
+  }
+}
 function Put-File([string]$src, [string]$name) {
   $dest = Join-Path $Bin $name
   if ([IO.File]::Exists($dest) -and (Sha $dest) -eq $Want[$name]) { return }
+  if ($name -eq ${psQuote(LAN_EXE)} -and [IO.File]::Exists($dest)) { Stop-RunningFrom $dest }
   $tmp = $dest + '.new'
   [IO.File]::Copy($src, $tmp, $true)
   if ((Sha $tmp) -ne $Want[$name]) { [IO.File]::Delete($tmp); throw ('файл подменён при копировании: ' + $name) }
@@ -504,7 +570,14 @@ try {
   Put-File (Join-Path $SrcBin ${psQuote(CORE_EXE)}) ${psQuote(CORE_EXE)}
   Put-File (Join-Path $SrcBin 'wintun.dll') 'wintun.dll'
   $BrokerX = Join-Path $Dir 'broker.ps1'
-  [IO.File]::WriteAllText($BrokerX, $BrokerText, (New-Object Text.UTF8Encoding($true)))
+  [IO.File]::WriteAllText($BrokerX, $BrokerText, (New-Object Text.UTF8Encoding($true)))${
+    lan
+      ? `
+  Put-File (Join-Path $SrcBin ${psQuote(LAN_EXE)}) ${psQuote(LAN_EXE)}
+  $LanBrokerX = Join-Path $Dir 'lan-broker.ps1'
+  [IO.File]::WriteAllText($LanBrokerX, $LanBrokerText, (New-Object Text.UTF8Encoding($true)))`
+      : ''
+  }
   ${registerTask}
   [IO.File]::WriteAllText((Join-Path $Dir 'manifest.json'), $Manifest, (New-Object Text.UTF8Encoding($false)))
   try { [IO.File]::Delete((Join-Path $Dir 'install-error.txt')) } catch {}
@@ -526,14 +599,27 @@ $ErrorActionPreference = 'Stop'
 $env:PSModulePath = Join-Path $PSHOME 'Modules'
 $Sid = ${psQuote(sid)}
 $TaskName = ${psQuote(taskName(sid))}
+$LanTaskName = ${psQuote(lanTaskName(sid))}
 $Root = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'CipherWay'
 $Dir = Join-Path $Root ('u\\' + $Sid)
+$LanDir = Join-Path $Root ('lan\\' + $Sid)
+$LanExe = Join-Path (Join-Path $Root 'bin') ${psQuote(LAN_EXE)}
 try {
   $svc = New-Object -ComObject 'Schedule.Service'
   $svc.Connect()
   try { $svc.GetFolder('\\').DeleteTask($TaskName, 0) } catch {}
-  # our own folders only ever contain files the installer / broker wrote
+  try { $svc.GetFolder('\\').DeleteTask($LanTaskName, 0) } catch {}
+  # this user's LAN daemon (its pid from the broker's state, only if it runs our file)
+  try {
+    $st = [IO.File]::ReadAllText((Join-Path $Dir 'lan-state.json')) | ConvertFrom-Json
+    $o = [Diagnostics.Process]::GetProcessById([int]$st.pid)
+    $cl = [string](Get-CimInstance Win32_Process -Filter ('ProcessId=' + [int]$o.Id)).CommandLine
+    $mine = $cl.IndexOf('"--statedir=' + $LanDir + '"', [StringComparison]::OrdinalIgnoreCase) -ge 0
+    if ($o.MainModule.FileName -ieq $LanExe -and $mine) { $o.Kill(); $null = $o.WaitForExit(5000) }
+  } catch {}
+  # our own folders only ever contain files the installer / broker / daemon wrote
   if ([IO.Directory]::Exists($Dir)) { [IO.Directory]::Delete($Dir, $true) }
+  if ([IO.Directory]::Exists($LanDir)) { [IO.Directory]::Delete($LanDir, $true) }
   $u = Join-Path $Root 'u'
   if ([IO.Directory]::Exists($u) -and [IO.Directory]::GetFileSystemEntries($u).Length -eq 0) {
     try { [IO.Directory]::Delete($Root, $true) } catch {}

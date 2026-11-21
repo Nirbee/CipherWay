@@ -167,6 +167,8 @@ export interface AppSettings {
 /** «Служба TUN» (Task Scheduler) as seen by the app. */
 export interface TunServiceInfo {
   state: 'ok' | 'missing' | 'outdated'
+  /** the LAN task of the service is installed (it may be older than the app) */
+  lan?: boolean
   detail?: string
 }
 
@@ -218,7 +220,7 @@ export interface AutoInfo {
 export interface LogEntry {
   ts: number
   level: 'info' | 'warn' | 'error' | 'debug'
-  source: 'app' | 'singbox' | 'xray'
+  source: 'app' | 'singbox' | 'xray' | 'lan'
   message: string
 }
 
@@ -341,4 +343,106 @@ export interface SupportPhoto {
   data: Uint8Array
   mime: SupportImageMime
   caption: string
+}
+
+// ---------------------------------------------------------------------------
+// «LAN» — virtual LAN for games (bot API /api/app/v1/lan/*, daemon status)
+// ---------------------------------------------------------------------------
+
+export interface LanLimits {
+  maxRoomMembers: number
+  maxRoomsOwned: number
+  /** rooms one may be a member of (own ones included) */
+  maxRoomsJoined: number
+  maxDevices: number
+}
+
+export interface LanMemberDevice {
+  name: string
+  /** LAN IP (100.64.0.0/10), null if the device has none yet */
+  ip: string | null
+  online: boolean
+}
+
+export interface LanMember {
+  memberId: string
+  /** display name from the bot (never an e-mail / Telegram id) */
+  label: string
+  devices: LanMemberDevice[]
+  isSelf: boolean
+}
+
+export interface LanRoom {
+  id: string
+  /** only the owner gets it (null for the other members) */
+  code: string | null
+  name: string
+  isOwner: boolean
+  members: LanMember[]
+}
+
+/** A device of this subscription (a Headscale node). */
+export interface LanDevice {
+  nodeId: string
+  name: string
+  ip: string | null
+  online: boolean
+  /** ISO time, null if unknown */
+  lastSeen: string | null
+  /** expired on the server (doesn't count towards the device limit) */
+  expired?: boolean
+  /** this computer */
+  isThis?: boolean
+}
+
+/** How the daemon reaches a peer right now. */
+export interface LanPeerLink {
+  ip: string
+  online: boolean
+  /** direct = peer-to-peer UDP; relay = through the CipherWay relay server */
+  path: 'direct' | 'relay' | 'unknown'
+  /** the last ping, ms; null = no answer / not measured yet */
+  latencyMs: number | null
+}
+
+export type LanErrorKind =
+  | 'nosub'
+  | 'inactive'
+  | 'disabled'
+  | 'device_limit'
+  | 'tailscale_running'
+  | 'lan_busy'
+  | 'in_use'
+  | 'unsafe_address'
+  | 'service'
+  | 'uac'
+  | 'missing'
+  | 'daemon'
+  | 'login'
+  | 'auth'
+  | 'rate'
+  | 'network'
+  | 'server'
+
+export interface LanView {
+  /** this build ships the LAN daemon */
+  available: boolean
+  hasSubscription: boolean
+  /** the user's switch (remembered across restarts) */
+  enabled: boolean
+  phase: 'off' | 'starting' | 'on' | 'error'
+  /** what is going on while starting */
+  message: string | null
+  error: { kind: LanErrorKind; text: string } | null
+  /** this computer in the LAN */
+  selfIp: string | null
+  selfName: string | null
+  rooms: LanRoom[]
+  /** the last rooms request failed (Russian) */
+  roomsError: string | null
+  /** by LAN IP */
+  links: Record<string, LanPeerLink>
+  /** loaded on demand (device limit, «Мои устройства») */
+  devices: LanDevice[] | null
+  limits: LanLimits | null
 }

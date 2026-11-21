@@ -6,6 +6,7 @@ import type {
   AppSettings,
   ConnSnapshot,
   ImportRequest,
+  LanView,
   LogEntry,
   RoutingMode,
   RoutingRule,
@@ -21,6 +22,7 @@ import type {
   TunServiceInfo
 } from './types'
 import type { UpdaterState } from './updater'
+import type { ChangelogEntry } from './changelog'
 
 export const IPC = {
   // app
@@ -94,6 +96,27 @@ export const IPC = {
   supportSetActive: 'support:setActive',
   supportMarkRead: 'support:markRead',
 
+  // «LAN» (requests to the bot and the daemon are made by main)
+  lanGet: 'lan:get',
+  /** the switch; on may set up the service (one UAC prompt) */
+  lanSetEnabled: 'lan:setEnabled',
+  /** «LAN» is on screen → poll often, ping the peers */
+  lanSetActive: 'lan:setActive',
+  lanRefresh: 'lan:refresh',
+  lanCreateRoom: 'lan:createRoom',
+  lanJoinRoom: 'lan:joinRoom',
+  lanLeaveRoom: 'lan:leaveRoom',
+  lanKick: 'lan:kick',
+  lanRegenerateCode: 'lan:regenerateCode',
+  lanDevices: 'lan:devices',
+  lanDeleteDevice: 'lan:deleteDevice',
+
+  // «Что нового» after an update (src/shared/changelog.ts)
+  /** the entries to show now ([] = nothing) */
+  whatsNewGet: 'whatsNew:get',
+  /** the user has seen them: remember the current version */
+  whatsNewSeen: 'whatsNew:seen',
+
   // updater (state: src/shared/updater.ts)
   updaterGetState: 'updater:getState',
   updaterCheck: 'updater:check',
@@ -112,6 +135,8 @@ export const IPC = {
   evtNavigate: 'evt:navigate',
   /** the whole UpdaterState on every change */
   evtUpdater: 'evt:updater',
+  /** the whole LanView on every change */
+  evtLan: 'evt:lan',
   /** settings changed outside the renderer (tray mode switch) */
   evtSettings: 'evt:settings',
   /** subscription data changed (background refresh) */
@@ -192,6 +217,25 @@ export interface ExposedApi {
     setActive: (active: boolean) => void
     markRead: () => void
   }
+  lan: {
+    get: () => Promise<LanView>
+    setEnabled: (on: boolean) => Promise<LanView>
+    setActive: (active: boolean) => void
+    /** rooms from the bot now */
+    refresh: () => Promise<LanView>
+    createRoom: (name: string) => Promise<LanView>
+    joinRoom: (code: string) => Promise<LanView>
+    leaveRoom: (roomId: string) => Promise<LanView>
+    kick: (roomId: string, memberId: string) => Promise<LanView>
+    regenerateCode: (roomId: string) => Promise<LanView>
+    /** this subscription's LAN devices (view.devices) */
+    devices: () => Promise<LanView>
+    deleteDevice: (nodeId: string) => Promise<LanView>
+  }
+  whatsNew: {
+    get: () => Promise<ChangelogEntry[]>
+    seen: () => void
+  }
   updater: {
     getState: () => Promise<UpdaterState>
     /** manual check; failures come back as phase 'error' */
@@ -208,6 +252,7 @@ export interface ExposedApi {
     support: (cb: (v: SupportView) => void) => () => void
     navigate: (cb: (page: string) => void) => () => void
     updater: (cb: (s: UpdaterState) => void) => () => void
+    lan: (cb: (v: LanView) => void) => () => void
     windowMaximized: (cb: (maximized: boolean) => void) => () => void
     importRequest: (cb: () => void) => () => void
     settings: (cb: (s: AppSettings) => void) => () => void

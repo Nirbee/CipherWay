@@ -40,9 +40,12 @@ export interface CoreExit {
   note?: string
 }
 
-/** PowerShell single-quoted literal: no `$` / backtick interpolation. */
+/**
+ * PowerShell single-quoted literal: no `$` / backtick interpolation. PowerShell
+ * also ends a single-quoted string at ‘ ’ ‚ ‛ (U+2018–U+201B) — doubled like '.
+ */
 export function psQuote(s: string): string {
-  return `'${s.replace(/'/g, "''")}'`
+  return `'${s.replace(/['\u2018\u2019\u201a\u201b]/g, (q) => q + q)}'`
 }
 
 /**

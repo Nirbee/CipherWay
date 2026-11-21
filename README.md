@@ -316,3 +316,77 @@ proxy mocked): `CW_E2E=1 npx vitest run src/main/core/sidecar.e2e.test.ts`.
   is restarted at once with the IPv4-only config (service and UAC broker alike — both
   re-read `config.json`; this restart does not use up the usual retry), and every
   later TUN start of this app run is IPv4-only.
+
+## 0.5.0: «LAN» — a virtual LAN with friends (Minecraft first)
+
+How it works: the bot (`/api/app/v1/lan/*`, same `X-Subscription-Token` auth as the
+support chat) keeps the rooms and hands out single-use pre-auth keys for its
+Headscale (`login_server`, default `lan.cipherway.ru`); the app runs the official
+Tailscale daemon against it. Members of a room see only each other (the bot writes
+the Headscale ACL). Code: `src/main/lan/`, UI: `src/renderer/src/pages/LanPage.tsx`.
+
+- **Daemon**: the official Tailscale **1.104.7** Windows build, unmodified,
+  `tailscaled.exe` → `resources/bin/cipherway-lan.exe`, `tailscale.exe` →
+  `cipherway-lanctl.exe`. `npm run download:cores -- lan` fetches the amd64 MSI from
+  pkgs.tailscale.com, checks it against its `.sha256` and a pinned SHA-256, unpacks it
+  with `msiexec /a` (no install, no UAC) and checks both exes against pinned hashes.
+  Licence: BSD-3-Clause + PATENTS in `resources/THIRD-PARTY-NOTICES.txt` (shipped
+  next to the app).
+- **Privileges**: the same «Служба CipherWay» as TUN — the installer (one UAC prompt,
+  shared with TUN) copies `cipherway-lan.exe` into `%ProgramData%\CipherWay\bin`
+  and registers a second SYSTEM task `CipherWay LAN <SID>` running `lan-broker.ps1`
+  (`src/main/lan/lanBroker.ts`). The broker starts only that hash-checked copy with
+  a fixed command line: `--statedir=%ProgramData%\CipherWay\lan\<SID>` (SYSTEM /
+  Administrators only), `--socket=\\.\pipe\ProtectedPrefix\Administrators\CipherWay\lan-<SID>`,
+  `--tun="CipherWay LAN"`, `--port=41642`, `--no-logs-no-support`,
+  `--syspolicy-file=<statedir>\syspolicy.json` (written by the broker: no updates, no DNS /
+  subnets from the server, never an exit node), `TS_LOGS_DIR` = its state dir, and
+  `ProgramData` / `ALLUSERSPROFILE` / `TEMP` pointed into admin-only folders under
+  its state dir — tailscaled reads `%ProgramData%\Tailscale\tailscaled-env.txt`,
+  which any user could plant (`TS_*` env, e.g. a log dir through a junction = a
+  SYSTEM write primitive). From the user it reads only `run\lan-ctl.json`
+  (`{session,pid,cmd,ts}`). An orphan daemon is stopped only if pid, file *and*
+  `--statedir` of its command line are ours.
+- **Next to a user's own Tailscale**: own state dir, pipe, adapter name, port and
+  log dir; the «Tailscale» service is never touched. The official binary still shares
+  machine-wide names with any other copy (the wintun adapter GUID compiled into it,
+  the «Tailscale-In» / «Tailscale-Process» firewall rules, the NRPT rule list in
+  `HKLM\SOFTWARE\Tailscale IPN`), so the two never run at once: the broker refuses
+  to start while the «Tailscale» service runs, a `tailscaled.exe` is alive or its
+  adapter exists, and stops ours when one appears (the UI says how to stop it).
+- **Login**: no key on every start — the daemon keeps its login. Only when it needs
+  one: `POST /lan/device` → `cipherway-lanctl up --login-server=… --auth-key=file:…
+  --hostname=<the bot's cw-xxxxxx> --accept-dns=false --accept-routes=false
+  --exit-node= --advertise-exit-node=false --advertise-routes= --unattended --reset`,
+  then `set --auto-update=false`. Every address the daemon reports for itself and its
+  peers must be in 100.64.0.0/10 / fd7a:115c:a1e0::/48 — otherwise LAN stops. The key goes through a file in the user's run folder that is
+  removed right after; it is never logged (and `tskey-` / `hskey-` / hex keys and
+  public IPs are redacted in the `lan` lines of «Логи»).
+- **VPN coexistence** (`configGen.ts lanRules()`), only while LAN is switched on (the
+  switch hot-reloads the running VPN), then in every proxy and routing mode:
+  `route_exclude_address` 100.64.0.0/10 + fd7a:115c:a1e0::/48 (TUN), and before
+  sniff / the mode switch: `process_path %ProgramData%\CipherWay\bin\cipherway-lan.exe`
+  → direct (the full path of the service's copy — not a bare name any program could
+  take; the TUN broker allows exactly `route.rules[N].process_path`), the LAN ranges →
+  direct; the login host gets its own
+  domain → direct rule next to the subscription host and is resolved by the direct
+  DNS server. With IPv6 off in Windows (0.4.6 `ipv4Only`) the IPv6 range is dropped
+  from the excludes like the others. LAN works with the VPN off too.
+- **Lifecycle**: the switch is remembered; the next app start turns LAN on again
+  (never with a UAC prompt: without a LAN task it shows a button). App quit stops the
+  daemon. A daemon that dies is restarted up to 3 times in 10 minutes.
+- **«Что нового»** (`src/shared/changelog.ts`, `components/WhatsNew.tsx`): the
+  changes of each version are bundled as short Russian bullets. On the first start of
+  a newer version a card (top right, hides after 15 s, × closes, «Подробнее» = all
+  entries) shows every entry newer than `whatsNewSeenVersion` in the store. A fresh
+  install only records its version; an update from ≤ 0.4.6 (nothing recorded, but
+  data of an earlier version present) shows the current version only. Counted as
+  seen once the window was actually visible.
+- **Phase 2 (TODO)**: Minecraft announces an open world by UDP multicast
+  224.0.2.60:4445, which does not cross the Tailscale adapter. Plan: a small relay in
+  the app listens on 224.0.2.60:4445 on the physical interfaces, forwards each
+  `[MOTD]…[/MOTD][AD]port[/AD]` packet as unicast UDP to the room peers' LAN IPs on
+  a fixed port; the receiving app checks it comes from a room peer, re-announces it on
+  loopback and, since the game connects to the announcement's source address, forwards
+  TCP 127.0.0.1:<port> → <peer LAN IP>:<port> while the world is announced — then the
+  world appears in «Сетевая игра» by itself.

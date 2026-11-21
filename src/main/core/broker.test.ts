@@ -14,6 +14,13 @@ describe('TUN broker script', () => {
 
   it('paths are single-quoted literals (no $ / backtick expansion, quotes doubled)', () => {
     expect(psQuote("a'b$c`d")).toBe("'a''b$c`d'")
+    // PowerShell also ends a single-quoted string at ‘ ’ ‚ ‛ — doubled too
+    expect(psQuote('a\u2018b\u2019c\u201ad\u201be')).toBe(
+      "'a\u2018\u2018b\u2019\u2019c\u201a\u201ad\u201b\u201be'"
+    )
+    expect(psQuote("C:\\Users\\O\u2019Brien'; calc; '")).toBe(
+      "'C:\\Users\\O\u2019\u2019Brien''; calc; '''"
+    )
     expect(script).toContain(
       "$cfg = 'C:\\Users\\O''Neil $user\\AppData\\Roaming\\cipherway\\run\\config.json'"
     )

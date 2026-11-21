@@ -3,17 +3,26 @@
  *   - cipherway-core.exe  (sing-box, SagerNet/sing-box, Windows amd64) — TUN, routing, DNS, Hysteria2
  *   - cipherway-xray.exe  (xray.exe, XTLS/Xray-core, Windows amd64) — VLESS+REALITY connections
  *   - wintun.dll          (wintun.net, amd64) — required for the TUN inbound
+ *   - cipherway-lan.exe / cipherway-lanctl.exe (tailscaled.exe / tailscale.exe,
+ *     the official Tailscale Windows build, unmodified) — «LAN» (virtual LAN)
  *
  * The cores get our own names: other VPN clients stop theirs with
  * `taskkill /im xray.exe`, which must not hit ours (and the reverse).
  *
  * Run via `npm run download:cores` (also invoked before packaging).
- * Fetch only some cores: `npm run download:cores -- xray` (names: singbox, xray, wintun).
+ * Fetch only some cores: `npm run download:cores -- xray` (names: singbox, xray, wintun, lan).
  * Binaries are NOT committed to git (see .gitignore).
  *
  * Xray is pinned to the exact release the nodes run (26.7.x series): the zip is
  * verified against the release .dgst file AND against the SHA-256 pinned below.
  * Xray geoip/geosite .dat files are not shipped — routing is done by sing-box.
+ *
+ * Tailscale is pinned too: the amd64 MSI from pkgs.tailscale.com is checked
+ * against its published .sha256 AND the SHA-256 pinned below, unpacked with an
+ * administrative install (`msiexec /a`, no elevation, nothing gets installed)
+ * and the two exes are checked against their own pinned hashes. Its wintun.dll
+ * must be the very file we ship (one wintun.dll serves both daemons).
+ * Licence: resources/THIRD-PARTY-NOTICES.txt (BSD-3-Clause + PATENTS).
  *
  * NOTE: the generated sing-box config targets the 1.12+ schema (typed DNS
  * servers, route.default_domain_resolver, action-based route rules, rule-sets
@@ -26,7 +35,7 @@ import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { Readable } from 'node:stream'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 
 const BIN_DIR = join(process.cwd(), 'resources', 'bin')
 const CORE_EXE = 'cipherway-core.exe' // = src/main/core/coreNames.ts
@@ -38,6 +47,23 @@ const WINTUN_URL = 'https://www.wintun.net/builds/wintun-0.14.1.zip'
 const XRAY_TAG = 'v26.7.28'
 const XRAY_ASSET = 'Xray-windows-64.zip'
 const XRAY_ZIP_SHA256 = 'c7172078fca4711bcd92a4774dcd1822544579c58816197575c47533317fd8d1'
+// Tailscale (LAN): exact stable release, Windows amd64 MSI
+const LAN_EXE = 'cipherway-lan.exe' // = src/main/core/coreNames.ts
+const LANCTL_EXE = 'cipherway-lanctl.exe'
+const TAILSCALE_VERSION = '1.104.7'
+const TAILSCALE_MSI = `tailscale-setup-${TAILSCALE_VERSION}-amd64.msi`
+const TAILSCALE_MSI_URL = `https://pkgs.tailscale.com/stable/${TAILSCALE_MSI}`
+const TAILSCALE_MSI_SHA256 = '676b5b32fdd1aeaee90d8e8f38e222635b216fbdfbf877bf01cb1d7cda330ec5'
+const TAILSCALE_FILES: Record<string, { to: string; sha256: string }> = {
+  'tailscaled.exe': {
+    to: LAN_EXE,
+    sha256: 'c2382efe345c13d6e1592d6191118c7ecf7abf8a178d071459926e4094492991'
+  },
+  'tailscale.exe': {
+    to: LANCTL_EXE,
+    sha256: 'e10279fa2f34996b93525484f14984e8a1afa5ccf713d234f7db9aa33873b007'
+  }
+}
 
 interface GhRelease {
   tag_name: string
@@ -196,9 +222,64 @@ async function getWintun(): Promise<void> {
   console.log(`-> ${join(BIN_DIR, 'wintun.dll')}`)
 }
 
+async function getLan(): Promise<void> {
+  console.log(`
+== tailscale ${TAILSCALE_VERSION} (LAN) ==`)
+  if (process.platform !== 'win32')
+    throw new Error('the Tailscale MSI is unpacked with msiexec (Windows only)')
+  const msi = join(BIN_DIR, TAILSCALE_MSI)
+  console.log(`downloading ${TAILSCALE_MSI}…`)
+  await downloadTo(TAILSCALE_MSI_URL, msi)
+  const sumPath = `${msi}.sha256`
+  await downloadTo(`${TAILSCALE_MSI_URL}.sha256`, sumPath)
+  const published = /^([0-9a-f]{64})/i.exec((await readFile(sumPath, 'utf8')).trim())?.[1]
+  await rm(sumPath, { force: true })
+  const actual = await sha256(msi)
+  if (!published || published.toLowerCase() !== actual || actual !== TAILSCALE_MSI_SHA256) {
+    await rm(msi, { force: true })
+    throw new Error(
+      `checksum mismatch for ${TAILSCALE_MSI}: pinned ${TAILSCALE_MSI_SHA256}, published ${published}, got ${actual}`
+    )
+  }
+  console.log(`checksum OK (${actual.slice(0, 12)}…, pinned)`)
+
+  const tmp = join(BIN_DIR, 'tailscale-unpack')
+  await rm(tmp, { recursive: true, force: true })
+  await mkdir(tmp, { recursive: true })
+  // administrative install = unpack the files only: no service, no registry, no UAC
+  // msiexec wants TARGETDIR="C:\path" — quoted by hand (verbatim), not by Node
+  const res = spawnSync('msiexec.exe', ['/a', `"${msi}"`, '/qn', `TARGETDIR="${tmp}"`], {
+    windowsHide: true,
+    windowsVerbatimArguments: true
+  })
+  if (res.status !== 0) throw new Error(`msiexec /a failed: ${res.status ?? res.error?.message}`)
+  for (const [name, f] of Object.entries(TAILSCALE_FILES)) {
+    const exe = await findFile(tmp, name)
+    if (!exe) throw new Error(`${name} not found in ${TAILSCALE_MSI}`)
+    const got = await sha256(exe)
+    if (got !== f.sha256)
+      throw new Error(`checksum mismatch for ${name}: pinned ${f.sha256}, got ${got}`)
+    await writeFile(join(BIN_DIR, f.to), await readFile(exe))
+    console.log(`-> ${join(BIN_DIR, f.to)}`)
+  }
+  const theirWintun = await findFile(tmp, 'wintun.dll')
+  const ours = join(BIN_DIR, 'wintun.dll')
+  if (theirWintun) {
+    try {
+      if ((await sha256(theirWintun)) !== (await sha256(ours))) {
+        console.warn('! the wintun.dll of Tailscale differs from ours — check both before shipping')
+      }
+    } catch {
+      console.warn('! resources/bin/wintun.dll is missing — run `npm run download:cores -- wintun`')
+    }
+  }
+  await rm(tmp, { recursive: true, force: true })
+  await rm(msi, { force: true })
+}
+
 async function main(): Promise<void> {
   await mkdir(BIN_DIR, { recursive: true })
-  const all = { singbox: getSingbox, xray: getXray, wintun: getWintun } as const
+  const all = { singbox: getSingbox, xray: getXray, wintun: getWintun, lan: getLan } as const
   const wanted = process.argv.slice(2).map((a) => a.toLowerCase().replace(/[^a-z]/g, ''))
   for (const name of wanted) {
     if (!(name in all))

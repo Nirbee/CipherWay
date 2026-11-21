@@ -5,17 +5,19 @@ import { readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { TunServiceInfo } from '@shared/types'
 import { brokerScript, parseCoreExit, psQuote, type CoreExit } from './broker'
-import { CORE_EXE } from './coreNames'
+import { CORE_EXE, LAN_EXE } from './coreNames'
 import {
   elevateCommand,
   installScript,
   isValidSid,
+  lanTaskName,
   serviceBrokerScript,
   taskName,
   uninstallScript,
   type BrokerHashes
 } from './serviceScripts'
 import { writeAtomic } from './atomicFile'
+import { lanBrokerScript } from '../lan/lanBroker'
 
 // ---------------------------------------------------------------------------
 // TUN needs admin rights. Two ways to get them (see serviceScripts.ts):
@@ -77,7 +79,8 @@ function run(
 
 /** Signal / report files older than this are left-overs of a crashed broker. */
 const STALE_SIGNAL_MS = 2 * 60_000
-const LEGACY_FILE_RE = /^(core(-[0-9a-f]+)?\.exit(\.tmp)?|restart(-[0-9a-f]+)?\.signal|stop(-[0-9a-f]+)?\.signal)$/
+const LEGACY_FILE_RE =
+  /^(core(-[0-9a-f]+)?\.exit(\.tmp)?|restart(-[0-9a-f]+)?\.signal|stop(-[0-9a-f]+)?\.signal)$/
 
 export interface LegacyOpts {
   /** tests: run the broker script without the UAC prompt */
@@ -266,8 +269,8 @@ export interface TunServiceOpts {
   log: (level: 'info' | 'warn' | 'error', msg: string) => void
   /** tests: %ProgramData%\CipherWay replacement */
   rootOverride?: string
-  /** tests: instead of asking Task Scheduler */
-  taskExists?: () => Promise<boolean>
+  /** tests: instead of asking Task Scheduler (name = the task asked about) */
+  taskExists?: (name: string) => Promise<boolean>
   /** tests: the Windows user instead of `whoami` */
   sidOverride?: string
 }
@@ -296,20 +299,51 @@ export class TunService {
     return join(this.root, 'u', sid)
   }
 
+  /** the LAN daemon's state (node key): SYSTEM / Administrators only */
+  lanStateDir(sid: string): string {
+    return join(this.root, 'lan', sid)
+  }
+
+  /** this build ships the LAN daemon (cipherway-lan.exe in resources\bin) */
+  get hasLan(): boolean {
+    return existsSync(join(this.o.binDir, LAN_EXE))
+  }
+
   private async hashes(): Promise<BrokerHashes> {
     return {
       [CORE_EXE]: await fileSha256(join(this.o.binDir, CORE_EXE)),
-      'wintun.dll': await fileSha256(join(this.o.binDir, 'wintun.dll'))
+      'wintun.dll': await fileSha256(join(this.o.binDir, 'wintun.dll')),
+      ...(this.hasLan ? { [LAN_EXE]: await fileSha256(join(this.o.binDir, LAN_EXE)) } : {})
     }
   }
 
   async brokerText(sid: string): Promise<string> {
+    const h = await this.hashes()
     return serviceBrokerScript({
       sid,
       userRunDir: this.o.runDir,
-      hashes: await this.hashes(),
+      hashes: { [CORE_EXE]: h[CORE_EXE], 'wintun.dll': h['wintun.dll'] },
       rootOverride: this.o.rootOverride
     })
+  }
+
+  /** null = this build has no LAN daemon */
+  async lanBrokerText(sid: string): Promise<string | null> {
+    const h = await this.hashes()
+    const lan = h[LAN_EXE]
+    if (!lan) return null
+    return lanBrokerScript({
+      sid,
+      userRunDir: this.o.runDir,
+      hashes: { [LAN_EXE]: lan, 'wintun.dll': h['wintun.dll'] },
+      rootOverride: this.o.rootOverride
+    })
+  }
+
+  private taskExists(name: string): Promise<boolean> {
+    return this.o.taskExists
+      ? this.o.taskExists(name)
+      : run('schtasks', ['/query', '/tn', name], 10_000).then((r) => r.code === 0)
   }
 
   async status(): Promise<TunServiceInfo> {
@@ -317,23 +351,37 @@ export class TunService {
       const sid = await this.sid()
       const manifest = await readFile(join(this.homeDir(sid), 'manifest.json'), 'utf8')
         .then(
-          (t) => JSON.parse(t.replace(/^\ufeff/, '')) as { broker?: string; files?: BrokerHashes }
+          (t) =>
+            JSON.parse(t.replace(/^\ufeff/, '')) as {
+              broker?: string
+              lanBroker?: string
+              files?: BrokerHashes
+            }
         )
         .catch(() => null)
-      const task = this.o.taskExists
-        ? await this.o.taskExists()
-        : (await run('schtasks', ['/query', '/tn', taskName(sid)], 10_000)).code === 0
-      if (!manifest || !task) return { state: 'missing' }
+      const task = await this.taskExists(taskName(sid))
+      if (!manifest || !task) return { state: 'missing', lan: false }
+      // the installed LAN task works on its own even when the app is newer
+      const lan = !!manifest.lanBroker && (await this.taskExists(lanTaskName(sid)))
       const want = await this.hashes()
       const broker = sha256(await this.brokerText(sid))
+      const lanText = await this.lanBrokerText(sid)
       const same =
         manifest.broker === broker &&
         // a manifest of ≤0.4.2 lists sing-box.exe → «outdated» → one UAC prompt
         manifest.files?.[CORE_EXE] === want[CORE_EXE] &&
-        manifest.files?.['wintun.dll'] === want['wintun.dll']
-      return { state: same ? 'ok' : 'outdated' }
+        manifest.files?.['wintun.dll'] === want['wintun.dll'] &&
+        // ≤0.4.5 had no LAN task → «outdated»
+        manifest.files?.[LAN_EXE] === want[LAN_EXE] &&
+        manifest.lanBroker === (lanText === null ? undefined : sha256(lanText)) &&
+        (lanText === null || lan)
+      return { state: same ? 'ok' : 'outdated', lan }
     } catch (err) {
-      return { state: 'missing', detail: err instanceof Error ? err.message : String(err) }
+      return {
+        state: 'missing',
+        lan: false,
+        detail: err instanceof Error ? err.message : String(err)
+      }
     }
   }
 
@@ -356,7 +404,8 @@ export class TunService {
   async install(): Promise<'ok' | 'cancelled' | 'failed'> {
     const sid = await this.sid()
     const brokerText = await this.brokerText(sid)
-    this.o.log('info', 'Установка службы TUN (один запрос прав администратора)')
+    const lanBrokerText = await this.lanBrokerText(sid)
+    this.o.log('info', 'Установка службы CipherWay (TUN и LAN, один запрос прав администратора)')
     const res = await this.elevated(
       'tun-install',
       installScript({
@@ -365,6 +414,7 @@ export class TunService {
         brokerText,
         hashes: await this.hashes(),
         brokerHash: sha256(brokerText),
+        ...(lanBrokerText ? { lanBrokerText, lanBrokerHash: sha256(lanBrokerText) } : {}),
         appVersion: this.o.appVersion
       })
     )

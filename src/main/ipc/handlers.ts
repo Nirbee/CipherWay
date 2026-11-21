@@ -1,5 +1,5 @@
 import { writeFile, readFile, stat } from 'node:fs/promises'
-import { isAbsolute } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import { app, BrowserWindow, ipcMain, dialog, shell, Notification, powerMonitor } from 'electron'
 import { z } from 'zod'
 import { IPC } from '@shared/ipc'
@@ -17,7 +17,8 @@ import type {
   SubscriptionRefreshResult,
   SubscriptionView,
   SupportView,
-  TunServiceInfo
+  TunServiceInfo,
+  LanView
 } from '@shared/types'
 import { LogBatcher } from '@shared/logBuffer'
 import { DEFAULT_SETTINGS, getSettings, store } from '../store'
@@ -38,7 +39,7 @@ import { AppUpdater } from '../updater/AppUpdater'
 import { electronUpdaterBackend } from '../updater/electronBackend'
 import { devFakeBackend } from '../updater/devFakeBackend'
 import type { UpdaterState } from '@shared/updater'
-import { CORE_EXE, XRAY_EXE } from '../core/coreNames'
+import { CORE_EXE, LAN_EXE, XRAY_EXE } from '../core/coreNames'
 import {
   SUPPORT_CAPTION_MAX,
   SUPPORT_IMAGE_MAX_BYTES,
@@ -48,11 +49,16 @@ import {
   subscriptionToken
 } from '../support/client'
 import { SupportService } from '../support/SupportService'
+import { createLanService } from '../lan'
+import type { LanService } from '../lan/LanService'
+import { lanLogEntries } from '../lan/logLines'
+import { whatsNew, type ChangelogEntry } from '@shared/changelog'
 
 /** Set once handlers are registered; used for graceful shutdown / startup. */
 export let activeManager: SidecarManager | null = null
 export let appUpdater: AppUpdater | null = null
 export let supportService: SupportService | null = null
+export let lanService: LanService | null = null
 
 type GetWindow = () => BrowserWindow | null
 
@@ -149,6 +155,19 @@ const supportPhotoSchema = z.object({
   caption: z.string().max(SUPPORT_CAPTION_MAX)
 })
 
+// «LAN»: ids from the bot, a room name, a room code
+const lanIdSchema = z
+  .string()
+  .min(1)
+  .max(64)
+  .regex(/^[\w-]+$/, 'bad id')
+const lanRoomNameSchema = z
+  .string()
+  .trim()
+  .min(1, 'Назовите комнату')
+  .max(40, 'Не длиннее 40 символов')
+const lanCodeSchema = z.string().max(20)
+
 const exePathSchema = z
   .string()
   .max(1024)
@@ -184,7 +203,27 @@ function buildStartParams() {
     settings: getSettings(),
     latencies: store.get('latencyCache') ?? {},
     // its refresh must work while the tunnel is broken (a stale REALITY key)
-    directHosts: subscriptionHosts()
+    directHosts: subscriptionHosts(),
+    // LAN on: its daemon (the service's copy) and its login server bypass the VPN
+    ...(lanWanted() ? { lan: { exePath: lanExePath, loginHost: lanLoginHost() } } : {})
+  }
+}
+
+function lanWanted(): boolean {
+  return store.get('lanEnabled') === true && !!lanExePath
+}
+
+/** <ProgramData>/CipherWay/bin/cipherway-lan.exe — known once the handlers are up */
+let lanExePath = ''
+
+/** Host of the LAN login server the bot gave last (undefined = the default). */
+function lanLoginHost(): string | undefined {
+  const url = store.get('lanLoginServer')
+  if (!url) return undefined
+  try {
+    return new URL(url).hostname || undefined
+  } catch {
+    return undefined
   }
 }
 
@@ -672,6 +711,8 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
     return manager.tunServiceStatus()
   })
   ipcMain.handle(IPC.tunServiceRemove, async (): Promise<TunServiceInfo> => {
+    // the LAN task goes with the service: LAN off first
+    if (store.get('lanEnabled')) await lan.setEnabled(false)
     const res = await manager.removeTunService()
     if (res === 'cancelled') throw new Error('Запрос прав администратора отклонён')
     if (res === 'failed') throw new Error('Не удалось удалить службу')
@@ -741,6 +782,101 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
     support.setActive(z.boolean().parse(active))
   })
   ipcMain.on(IPC.supportMarkRead, () => support.markRead())
+
+  // ---- «LAN» ---------------------------------------------------------------
+  const lanLog = (level: LogEntry['level'], message: string): void =>
+    logBatcher.push({ ts: Date.now(), level, source: 'lan', message: mask(message) })
+  lanExePath = join(manager.tunService.root, 'bin', LAN_EXE)
+  /** the LAN bypass in the running core = what the switch says (hot reload) */
+  const syncLanBypass = async (): Promise<void> => {
+    if (!manager.isRunning || manager.lanBypass === lanWanted()) return
+    if (manager.reloadNeedsPrompt) {
+      // TUN without the service: a restart would ask for admin rights out of the blue
+      notify({
+        text: 'LAN переключён — переподключите VPN, чтобы они не мешали друг другу',
+        tone: 'info'
+      })
+      return
+    }
+    await manager.reload(buildStartParams()).catch(() => undefined)
+  }
+  const lan = createLanService({
+    onBypassChange: syncLanBypass,
+    binDir: manager.binDir,
+    runDir: manager.runDir,
+    service: manager.tunService,
+    install: () => manager.installTunService(),
+    apiContext: async () => ({
+      apiBase: getSettings().apiBase,
+      subscriptionUrl: getSubscriptionUrl(),
+      deviceHeaders: await remnawave.deviceHeaders()
+    }),
+    hasSubscription: () => !!subscriptionToken(getSubscriptionUrl()),
+    getEnabled: () => store.get('lanEnabled') === true,
+    setEnabled: (on) => store.set('lanEnabled', on),
+    getLoginServer: () => store.get('lanLoginServer') ?? null,
+    getHostname: () => store.get('lanHostname') ?? null,
+    setHostname: (name) => store.set('lanHostname', name),
+    setLoginServer: (url) => {
+      const prev = lanLoginHost()
+      store.set('lanLoginServer', url)
+      // a new Headscale host: the running VPN must let it through directly
+      if (lanLoginHost() !== prev && manager.isRunning && !manager.reloadNeedsPrompt) {
+        void manager.reload(buildStartParams()).catch(() => undefined)
+      }
+    },
+    publish: (v: LanView) => send(IPC.evtLan, v),
+    log: lanLog,
+    daemonLog: (lines) => {
+      for (const e of lanLogEntries(lines, getSettings().verboseLog)) {
+        logBatcher.push({ ...e, message: mask(e.message) })
+      }
+    }
+  })
+  lanService = lan
+  lan.init()
+
+  ipcMain.handle(IPC.lanGet, async (): Promise<LanView> => lan.view())
+  ipcMain.handle(IPC.lanSetEnabled, async (_e, on: unknown) =>
+    lan.setEnabled(z.boolean().parse(on))
+  )
+  ipcMain.on(IPC.lanSetActive, (_e, active: unknown) => lan.setActive(z.boolean().parse(active)))
+  ipcMain.handle(IPC.lanRefresh, async () => lan.refreshRooms())
+  ipcMain.handle(IPC.lanCreateRoom, async (_e, name: unknown) =>
+    lan.createRoom(lanRoomNameSchema.parse(name))
+  )
+  ipcMain.handle(IPC.lanJoinRoom, async (_e, code: unknown) =>
+    lan.joinRoom(lanCodeSchema.parse(code))
+  )
+  ipcMain.handle(IPC.lanLeaveRoom, async (_e, id: unknown) => lan.leaveRoom(lanIdSchema.parse(id)))
+  ipcMain.handle(IPC.lanKick, async (_e, id: unknown, memberId: unknown) =>
+    lan.kick(lanIdSchema.parse(id), lanIdSchema.parse(memberId))
+  )
+  ipcMain.handle(IPC.lanRegenerateCode, async (_e, id: unknown) =>
+    lan.regenerateCode(lanIdSchema.parse(id))
+  )
+  ipcMain.handle(IPC.lanDevices, async () => lan.loadDevices())
+  ipcMain.handle(IPC.lanDeleteDevice, async (_e, nodeId: unknown) =>
+    lan.deleteDevice(lanIdSchema.parse(nodeId))
+  )
+
+  // ---- «Что нового» -------------------------------------------------------
+  // decided once per start; a fresh install only records its version
+  const current = app.getVersion()
+  const hadEarlierVersion =
+    store.get('subscriptionUrlEnc') !== null ||
+    store.get('subscriptionCache') !== null ||
+    store.get('trayHintShown') === true ||
+    store.get('updateNotifiedVersion') !== null ||
+    store.get('supportReadAt') !== null
+  const news = whatsNew(store.get('whatsNewSeenVersion') ?? null, current, hadEarlierVersion)
+  if (news.recordNow) store.set('whatsNewSeenVersion', current)
+  let pendingNews: ChangelogEntry[] = news.entries
+  ipcMain.handle(IPC.whatsNewGet, async (): Promise<ChangelogEntry[]> => pendingNews)
+  ipcMain.on(IPC.whatsNewSeen, () => {
+    pendingNews = []
+    store.set('whatsNewSeenVersion', current)
+  })
 
   // ---- updater -----------------------------------------------------------
   // dev / unpacked: no feed, unless CIPHERWAY_DEV_FAKE_UPDATE simulates one

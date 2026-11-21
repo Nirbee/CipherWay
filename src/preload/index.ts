@@ -71,6 +71,23 @@ const api: ExposedApi = {
     setActive: (active) => ipcRenderer.send(IPC.supportSetActive, active),
     markRead: () => ipcRenderer.send(IPC.supportMarkRead)
   },
+  lan: {
+    get: () => ipcRenderer.invoke(IPC.lanGet),
+    setEnabled: (on) => ipcRenderer.invoke(IPC.lanSetEnabled, on),
+    setActive: (active) => ipcRenderer.send(IPC.lanSetActive, active),
+    refresh: () => ipcRenderer.invoke(IPC.lanRefresh),
+    createRoom: (name) => ipcRenderer.invoke(IPC.lanCreateRoom, name),
+    joinRoom: (code) => ipcRenderer.invoke(IPC.lanJoinRoom, code),
+    leaveRoom: (roomId) => ipcRenderer.invoke(IPC.lanLeaveRoom, roomId),
+    kick: (roomId, memberId) => ipcRenderer.invoke(IPC.lanKick, roomId, memberId),
+    regenerateCode: (roomId) => ipcRenderer.invoke(IPC.lanRegenerateCode, roomId),
+    devices: () => ipcRenderer.invoke(IPC.lanDevices),
+    deleteDevice: (nodeId) => ipcRenderer.invoke(IPC.lanDeleteDevice, nodeId)
+  },
+  whatsNew: {
+    get: () => ipcRenderer.invoke(IPC.whatsNewGet),
+    seen: () => ipcRenderer.send(IPC.whatsNewSeen)
+  },
   updater: {
     getState: () => ipcRenderer.invoke(IPC.updaterGetState),
     check: () => ipcRenderer.invoke(IPC.updaterCheck),
@@ -85,6 +102,7 @@ const api: ExposedApi = {
     support: (cb) => subscribe(IPC.evtSupport, (p) => cb(p as never)),
     navigate: (cb) => subscribe(IPC.evtNavigate, (p) => cb(p as never)),
     updater: (cb) => subscribe(IPC.evtUpdater, (p) => cb(p as never)),
+    lan: (cb) => subscribe(IPC.evtLan, (p) => cb(p as never)),
     windowMaximized: (cb) => subscribe(IPC.evtWindowMaximized, (p) => cb(p as never)),
     importRequest: (cb) => subscribe(IPC.evtImportRequest, () => cb()),
     settings: (cb) => subscribe(IPC.evtSettings, (p) => cb(p as never)),

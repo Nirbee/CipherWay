@@ -18,6 +18,7 @@ import {
   connectVpn,
   disconnectVpn,
   getVpnStatus,
+  lanService,
   onSettingsChange,
   onUpdaterState,
   onVpnStatus,
@@ -333,7 +334,8 @@ if (!app.requestSingleInstanceLock()) {
     // ensure cores are killed and the system proxy is reverted before exit
     e.preventDefault()
     cleanupDone = true
-    void disconnectVpn()
+    // LAN stops with the app (the switch is remembered for the next start)
+    void Promise.all([disconnectVpn(), lanService?.shutdown().catch(() => undefined)])
       .then(async () => {
         // a downloaded update is installed on quit: its installer needs the cores gone
         // («Перезапустить и обновить» = phase 'installing' has waited already)

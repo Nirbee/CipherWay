@@ -13,6 +13,7 @@ export interface SbRouteRule {
   ip_cidr?: string[]
   port?: number[]
   port_range?: string[]
+  network?: ('tcp' | 'udp')[]
   ip_is_private?: boolean
   process_name?: string[]
   process_path?: string[]

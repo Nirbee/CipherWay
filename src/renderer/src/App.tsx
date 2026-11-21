@@ -22,6 +22,7 @@ import { SettingsPage } from './pages/SettingsPage'
 import { SupportPage } from './pages/SupportPage'
 import { LanPage } from './pages/LanPage'
 import { ImportSubscriptionDialog } from './components/ImportSubscriptionDialog'
+import { WhatsNew } from './components/WhatsNew'
 import { cn } from './lib/cn'
 
 export default function App() {
@@ -104,6 +105,7 @@ export default function App() {
       <Sidebar />
       <ImportSubscriptionDialog />
       <Toaster />
+      <WhatsNew />
       <div className="flex min-w-0 flex-1 flex-col">
         <TitleBar />
         <main className="min-h-0 flex-1 overflow-y-auto">
