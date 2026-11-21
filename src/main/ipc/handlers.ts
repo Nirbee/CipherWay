@@ -34,6 +34,7 @@ import { toSubscriptionView } from '../remnawave/view'
 import { getSubscriptionUrl } from '../secrets'
 import { createMasker, type Masker } from '../mask'
 import { SidecarManager } from '../core/SidecarManager'
+import { AdapterGate } from '../core/adapterGate'
 import { nodeAddressSet, toConnItems } from '../core/connections'
 import { AppUpdater } from '../updater/AppUpdater'
 import { electronUpdaterBackend } from '../updater/electronBackend'
@@ -335,6 +336,8 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
       : {}
   const knownIds = (): Set<string> =>
     new Set((remnawave.getCached()?.outbounds ?? []).map((o) => o.id))
+  // the TUN core and the LAN daemon create their wintun adapters one at a time
+  const adapterGate = new AdapterGate()
   const manager = new SidecarManager(
     (entry) => logBatcher.push({ ...entry, message: mask(entry.message) }),
     (state, message) => {
@@ -360,6 +363,7 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
     },
     {
       onNotice: notify,
+      adapterGate,
       // the store, not the snapshot a queued start / reload was built with
       routingMode: () => getSettings().routingMode,
       onRealityHeal: () => void sync.heal().finally(() => manager.realityHealDone()),
@@ -802,6 +806,7 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
   }
   const lan = createLanService({
     onBypassChange: syncLanBypass,
+    adapterGate,
     binDir: manager.binDir,
     runDir: manager.runDir,
     service: manager.tunService,

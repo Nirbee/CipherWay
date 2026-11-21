@@ -14,6 +14,10 @@ import { parseLanState, type LanBrokerError, type LanBrokerState } from './lanBr
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
+/** a broker is still at work: running its daemon or waiting to stop it (fresh state) */
+const busy = (st: LanBrokerState | null): boolean =>
+  !!st && (st.status === 'running' || st.status === 'stopping') && Date.now() - (st.ts ?? 0) < 5000
+
 export interface LanCtlFile {
   session: string
   pid: number
@@ -115,12 +119,13 @@ export class LanDaemon {
     }
     await mkdir(this.o.runDir, { recursive: true })
     await writeAtomic(this.ctlPath, JSON.stringify(this.ctl))
-    // a broker of an earlier session sees the new id and stops; give it a moment
-    if (prev?.status === 'running' && Date.now() - (prev.ts ?? 0) < 6000) {
-      const end = Date.now() + 6000
+    // a broker of an earlier session sees the new id and stops; give it a moment —
+    // more if its daemon is still creating the adapter (it is not killed then, the
+    // broker says «stopping» for up to 20 s; a /run meanwhile would be ignored)
+    if (busy(prev)) {
+      const end = Date.now() + 25_000
       while (Date.now() < end) {
-        const st = await this.state()
-        if (!st || st.status !== 'running' || Date.now() - (st.ts ?? 0) > 5000) break
+        if (!busy(await this.state())) break
         await sleep(200)
       }
     }
@@ -133,7 +138,8 @@ export class LanDaemon {
     }
     // one instance per task: a /run while the previous broker is exiting is ignored
     for (let i = 0; i < 2 && !(await this.waitState(() => true, 3000)); i++) await runTask()
-    const st = await this.waitState((x) => x.status !== 'starting', 20_000)
+    // may include an orphan finishing its adapter and the removal of a leftover one
+    const st = await this.waitState((x) => x.status !== 'starting', 40_000)
     if (!st) throw new LanStartError('timeout', 'Служба CipherWay не ответила')
     if (st.status !== 'running') {
       throw new LanStartError(st.error || 'failed', st.detail || st.status || 'ошибка', st.detail)

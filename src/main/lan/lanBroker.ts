@@ -1,4 +1,4 @@
-import { psQuote } from '../core/broker'
+import { psGuid, psQuote, WINTUN_DEVICE_PS } from '../core/broker'
 import { LAN_EXE, LAN_TUN_NAME, LAN_UDP_PORT, TAILSCALE_ADAPTER_GUID } from '../core/coreNames'
 import {
   BROKER_HELPERS_PS,
@@ -45,6 +45,11 @@ export { lanTaskName }
 //    list in HKLM\SOFTWARE\Tailscale IPN). While the «Tailscale» service runs,
 //    a tailscaled.exe is alive or an adapter with that GUID exists, the broker
 //    refuses to start — and stops ours as soon as one of them appears.
+//  * its wintun adapter (0.5.1): the device a killed daemon left behind is
+//    removed before the start (a re-used one often fails after 15 s), and the
+//    daemon is never killed while it is creating its adapter — that left Windows
+//    unable to start any wintun adapter, the TUN one included, for minutes.
+//    Both only for the GUID compiled into the daemon (WINTUN_DEVICE_PS).
 // Talking to the app (files, the broker polls every 500 ms):
 //   <userRun>\lan-ctl.json   app → broker
 //   <home>\lan-state.json    broker → app {session,status,error,detail,pid,exitCode,uptimeMs,stopReason,ts}
@@ -150,9 +155,12 @@ $Hashes = @{ ${psQuote(LAN_EXE)} = ${psQuote(p.hashes[LAN_EXE])}; 'wintun.dll' =
 $OtherService = ${psQuote(other.service)}
 $OtherProcess = ${psQuote(other.process)}
 $OtherGuid = ${psQuote(other.adapterGuid)}
+# the same binary: our daemon's wintun adapter has this GUID too
+$OwnGuid = ${psGuid(other.adapterGuid)}
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
 $State = @{ session = ''; status = 'starting'; error = ''; detail = ''; pid = 0; exitCode = $null; uptimeMs = $null; stopReason = ''; brokerPid = $PID; ts = 0 }
 ${BROKER_HELPERS_PS}
+${WINTUN_DEVICE_PS}
 # the only command line the daemon ever gets (quoted tokens, no trailing backslash)
 function Daemon-Args {
   return ('"--statedir=' + $LanDir + '" "--socket=' + $Pipe + '" "--tun=' + $TunName + '" --port=' + $Port + ' --no-logs-no-support "--syspolicy-file=' + $PolicyF + '"')
@@ -189,6 +197,24 @@ function Is-OurDaemon($o) {
     return $cl.IndexOf('"--statedir=' + $LanDir + '"', [StringComparison]::OrdinalIgnoreCase) -ge 0
   } catch { return $false }
 }
+# never in the middle of creating its wintun adapter (see the header): an attempt
+# takes up to ~16 s (wintun waits 15 s for the device), the next one starts at once
+# $report: the app sees «stopping» meanwhile (and waits before the next start)
+function Kill-Daemon($p, [bool]$report) {
+  if ($p.HasExited) { return }
+  if (Wintun-Creating $OwnGuid $TunName) {
+    Note 'LAN ещё создаёт сетевой адаптер — ждём, прежде чем остановить'
+    $was = $State.status
+    if ($report) { $State.status = 'stopping' }
+    $end = (Now-Ms) + 20000
+    while ((Now-Ms) -lt $end -and -not $p.HasExited -and (Wintun-Creating $OwnGuid $TunName)) {
+      if ($report) { try { Save-State } catch {} }
+      Start-Sleep -Milliseconds 300
+    }
+    $State.status = $was
+  }
+  if (-not $p.HasExited) { $p.Kill(); $null = $p.WaitForExit(5000) }
+}
 # a daemon of an earlier session that outlived its broker (only that pid)
 function Stop-Orphan {
   try {
@@ -197,8 +223,7 @@ function Stop-Orphan {
     if ([int]$prev.pid -le 0) { return }
     $o = [Diagnostics.Process]::GetProcessById([int]$prev.pid)
     if (Is-OurDaemon $o) {
-      $o.Kill()
-      $null = $o.WaitForExit(5000)
+      Kill-Daemon $o $false
       Note ('остановлен LAN прошлого запуска, pid ' + $prev.pid)
     }
   } catch {}
@@ -225,8 +250,10 @@ function Start-Daemon {
   }
   if ((Is-Reparse $PolicyF)) { throw 'файл политики LAN подменён' }
   Write-Atomic $PolicyF $Policy
-  # the adapter of the previous run normally goes with its process
+  # the adapter of the previous run normally goes with its process; the device it
+  # leaves behind is removed (nobody else uses the GUID: Other-Tailscale said so)
   for ($i = 0; $i -lt 20 -and (Own-Adapter); $i++) { Start-Sleep -Milliseconds 250 }
+  Remove-WintunGhost $OwnGuid
   Rotate $LogF
   Rotate $OutF
   # its log state (tailscaled.log.conf) next to its node state, not in ProgramData\\Tailscale;
@@ -247,7 +274,7 @@ function Start-Daemon {
 }
 function Stop-Daemon($d) {
   if ($null -eq $d) { return }
-  try { if (-not $d.HasExited) { $d.Kill(); $null = $d.WaitForExit(5000) } } catch {}
+  try { Kill-Daemon $d $true } catch {}
 }
 
 $daemon = $null
@@ -259,9 +286,10 @@ try {
     $State.error = 'no_request'
     exit 0
   }
-  Stop-Orphan
   # the app waits for this session id: it knows the task really started
+  # (before Stop-Orphan: that one may wait for an adapter being created)
   Save-State
+  Stop-Orphan
   $busy = Other-Tailscale $true
   if ($busy) {
     $State.status = 'refused'
@@ -331,7 +359,8 @@ try {
 /** What lan-state.json holds (written by the broker above). */
 export interface LanBrokerState {
   session?: string
-  status?: 'starting' | 'running' | 'stopped' | 'refused' | 'error'
+  /** stopping: waits for the daemon to finish creating its adapter (≤ 20 s) */
+  status?: 'starting' | 'running' | 'stopping' | 'stopped' | 'refused' | 'error'
   error?: LanBrokerError
   detail?: string
   pid?: number
@@ -351,7 +380,7 @@ export function parseLanState(text: string): LanBrokerState | null {
     const status = str(o.status)
     return {
       session: str(o.session),
-      status: (['starting', 'running', 'stopped', 'refused', 'error'] as const).find(
+      status: (['starting', 'running', 'stopping', 'stopped', 'refused', 'error'] as const).find(
         (s) => s === status
       ),
       error: (

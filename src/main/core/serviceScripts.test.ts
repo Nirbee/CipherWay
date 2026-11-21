@@ -94,6 +94,8 @@ describe('«Служба TUN» scripts (0.4.2)', () => {
     expect(broker).toMatch(/Stop-Core \$core\s+\$core = \$null\s+Clear-StaleAdapter\s+Prepare/)
     // only our adapter; only a process running our protected file
     expect(broker).toContain("$TunName = 'CipherWay'")
+    expect(broker).toContain("$TunGuid = '{3D56CD02-D8B1-21DE-B21B-2D7CFA71C8E3}'")
+    expect(broker).toContain('Remove-WintunGhost $TunGuid')
     expect(broker).toContain('$o.MainModule.FileName -ieq $Exe')
     expect(broker).toContain("'/remove-device' $id")
   })

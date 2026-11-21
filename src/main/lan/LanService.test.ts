@@ -5,6 +5,7 @@ import type { DaemonStatus, UpParams } from './lanCtl'
 import type { LanBrokerState } from './lanBroker'
 import { LanStartError } from './LanDaemon'
 import { LanService, type LanServiceDeps } from './LanService'
+import { AdapterGate } from '../core/adapterGate'
 
 const KEY = 'hskey-auth-SECRET_never_logged_123'
 
@@ -276,6 +277,61 @@ describe('LanService: switching LAN on', () => {
     await t.svc.setEnabled(true)
     await t.svc.setEnabled(false)
     expect(order).toEqual(['bypass', 'start', 'stop', 'bypass'])
+  })
+
+  it('the daemon creates its adapter while the VPN does not (the bypass reload stays outside)', async () => {
+    const gate = new AdapterGate()
+    const seen: Array<string | null> = []
+    const t = setup(
+      {
+        adapterGate: gate,
+        onBypassChange: async () => {
+          // a VPN reload here creates the TUN adapter itself: LAN must not hold the gate
+          seen.push(`bypass:${gate.busy}`)
+        }
+      },
+      { backend: ['Starting', 'Running'] }
+    )
+    t.daemon.start.mockImplementationOnce(async () => {
+      seen.push(`start:${gate.busy}`)
+    })
+    t.ctl.status.mockImplementationOnce(async () => {
+      seen.push(`status:${gate.busy}`)
+      return {
+        backendState: 'Starting',
+        selfIp: null,
+        selfName: null,
+        peers: [],
+        health: [],
+        allIps: []
+      }
+    })
+    // the VPN is creating its adapter right now: LAN waits for it
+    let vpnDone!: () => void
+    const vpn = gate.run('VPN', () => new Promise<void>((r) => (vpnDone = r)))
+    const on = t.svc.setEnabled(true)
+    await vi.waitFor(() =>
+      expect(t.views.at(-1)?.message).toBe('Ждём, пока VPN создаст свой сетевой адаптер…')
+    )
+    expect(t.daemon.start).not.toHaveBeenCalled()
+    vpnDone()
+    await vpn
+    expect((await on).phase).toBe('on')
+    // the bypass ran before LAN took the gate (the VPN held it here, never LAN)
+    expect(seen).toEqual(['bypass:VPN', 'start:LAN', 'status:LAN'])
+    expect(gate.busy).toBeNull()
+    await t.svc.shutdown()
+  })
+
+  it('a daemon that never answers is stopped only after the wait — and the gate is free again', async () => {
+    const gate = new AdapterGate()
+    const t = setup({ adapterGate: gate, waitMs: 300 })
+    t.ctl.status.mockRejectedValue(new Error('pipe not listening'))
+    const v = await t.svc.setEnabled(true)
+    expect(v.error?.kind).toBe('daemon')
+    expect(t.logs).toContain('LAN: демон не отвечает на запросы')
+    expect(t.daemon.stop).toHaveBeenCalledTimes(1)
+    expect(gate.busy).toBeNull()
   })
 
   it('self-update of the daemon is switched off on every start', async () => {

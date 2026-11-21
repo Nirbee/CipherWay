@@ -12,6 +12,16 @@ export interface ChangelogEntry {
 
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '0.5.1',
+    items: [
+      'VPN в режиме TUN и LAN снова запускаются вместе — раньше после включения компьютера туннель мог не подняться.',
+      'Первое подключение после включения компьютера больше не ждёт 15 секунд и не повторяется.',
+      'LAN дольше ждёт, пока Windows создаст его сетевой адаптер, и не прерывает это на полпути.',
+      'Карточка «Что нового» не пропадает непрочитанной: она закрывается сама, только пока окно перед вами.',
+      'Список изменений всегда можно открыть: «Настройки» → «Что нового» рядом с версией.'
+    ]
+  },
+  {
     version: '0.5.0',
     items: [
       'Новая вкладка «LAN»: своя локальная сеть с друзьями через интернет — для Minecraft и других игр.',
@@ -79,7 +89,8 @@ export interface WhatsNewDecision {
  *  - an update from a version that didn't remember this (≤ 0.4.6): only the
  *    current version's entry — where the user came from is unknown;
  *  - otherwise: everything newer than the last seen version.
- * Remembered only once shown (the window may start hidden in the tray).
+ * Remembered only once the user closed the card (× or «Подробнее»): one that hid
+ * by itself comes back on the next start.
  */
 export function whatsNew(
   lastSeen: string | null,

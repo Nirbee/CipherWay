@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react'
 import { DEFAULT_API_BASE, type AppSettings, type TunServiceInfo } from '@shared/types'
 import { buildDiagnostics } from '@shared/diagnostics'
+import { CHANGELOG } from '@shared/changelog'
 import { PageHeader } from '../components/PageHeader'
 import { Button, Card, Input, Toggle } from '../components/ui'
 import { CopyIcon } from '../components/icons'
 import { UpdateButton } from '../components/UpdateButton'
+import { ChangelogModal } from '../components/WhatsNew'
 import { useSettings } from '../store/settingsStore'
 import { useLogs } from '../store/logsStore'
 import { useUpdater } from '../store/updaterStore'
@@ -22,6 +24,7 @@ export function SettingsPage() {
   const [version, setVersion] = useState('')
   const [support, setSupport] = useState('')
   const [apiBase, setApiBase] = useState('')
+  const [changelog, setChangelog] = useState(false)
 
   useEffect(() => {
     void load()
@@ -150,11 +153,24 @@ export function SettingsPage() {
             label="Версия приложения"
             hint="Проверяется сама при запуске и каждые 3 часа; новая версия скачивается в фоне"
           >
-            <span className="font-mono text-sm text-text-secondary">
-              {version ? `v${version}` : '—'}
-            </span>
+            <div className="flex shrink-0 items-center gap-3">
+              <button
+                className="text-[12px] font-medium text-accent-green hover:underline"
+                onClick={() => setChangelog(true)}
+              >
+                Что нового
+              </button>
+              <span className="font-mono text-sm text-text-secondary">
+                {version ? `v${version}` : '—'}
+              </span>
+            </div>
           </Row>
           <UpdaterRow />
+          <ChangelogModal
+            open={changelog}
+            entries={CHANGELOG}
+            onClose={() => setChangelog(false)}
+          />
         </Section>
 
         <Section title="Диагностика" hint="Пригодится, если пишете в поддержку.">

@@ -16,6 +16,7 @@ import {
 } from './lanCtl'
 import type { LanBrokerState } from './lanBroker'
 import { LanStartError } from './LanDaemon'
+import type { AdapterGateLike } from '../core/adapterGate'
 
 // ---------------------------------------------------------------------------
 // «LAN» — the whole feature on the app side:
@@ -99,6 +100,8 @@ export interface LanServiceDeps {
   daemonLog: (lines: string[]) => void
   /** the switch changed: the running VPN gets / loses the LAN bypass rules */
   onBypassChange?: () => Promise<void>
+  /** the daemon and the TUN core never create their wintun adapters at once */
+  adapterGate?: AdapterGateLike
   /** ms; tests make them short */
   pollActiveMs?: number
   pollIdleMs?: number
@@ -280,32 +283,15 @@ export class LanService {
 
     this.set({ message: 'Запускаем LAN…' })
     // the running VPN lets the daemon through before it dials anything
+    // (before the adapter gate: a VPN reload creates the TUN adapter itself)
     await this.d.onBypassChange?.().catch(() => undefined)
     this.check(gen)
     const daemon = await this.d.daemon()
-    try {
-      await daemon.start()
-    } catch (err) {
-      this.check(gen)
-      if (err instanceof LanStartError) {
-        if (err.code === 'tailscale_running') {
-          this.d.log('warn', `LAN не запущен: работает Tailscale (${err.detail ?? ''})`)
-          return this.fail('tailscale_running')
-        }
-        if (err.code === 'lan_busy') return this.fail('lan_busy')
-      }
-      this.d.log('error', `LAN не запустился: ${err instanceof Error ? err.message : String(err)}`)
-      return this.fail('daemon')
-    }
-    this.check(gen)
-    this.d.log('info', 'LAN запущен')
-
-    let status: DaemonStatus | null
-    try {
-      status = await this.waitCtl(gen)
-    } catch (err) {
-      if (err instanceof Cancelled) throw err
-      this.d.log('error', `LAN: ${err instanceof Error ? err.message : String(err)}`)
+    // the daemon answers once its engine — with the wintun adapter — is up
+    const started = await this.withGate(gen, () => this.startDaemon(gen, daemon))
+    if (started === 'failed') return
+    const status = started
+    if (status === 'in_use') {
       await daemon.stop().catch(() => undefined)
       return this.fail('in_use')
     }
@@ -362,12 +348,74 @@ export class LanService {
     return true
   }
 
-  /** `status` answers once the daemon's pipe is up. */
+  /** Runs `fn` while no TUN adapter is being created (no gate: at once). */
+  private withGate<T>(gen: number, fn: () => Promise<T>): Promise<T> {
+    const gate = this.d.adapterGate
+    if (!gate) return fn()
+    return gate.run('LAN', fn, {
+      onWait: () => {
+        if (gen === this.gen) this.set({ message: 'Ждём, пока VPN создаст свой сетевой адаптер…' })
+      }
+    })
+  }
+
+  /**
+   * The daemon through the service, then its first answer. 'failed' = the error is
+   * shown already; 'in_use' = the pipe belongs to another Windows user.
+   */
+  private async startDaemon(
+    gen: number,
+    daemon: LanDaemonLike
+  ): Promise<DaemonStatus | null | 'failed' | 'in_use'> {
+    this.check(gen)
+    this.set({ message: 'Запускаем LAN…' })
+    try {
+      await daemon.start()
+    } catch (err) {
+      this.check(gen)
+      if (err instanceof LanStartError) {
+        if (err.code === 'tailscale_running') {
+          this.d.log('warn', `LAN не запущен: работает Tailscale (${err.detail ?? ''})`)
+          this.fail('tailscale_running')
+          return 'failed'
+        }
+        if (err.code === 'lan_busy') {
+          this.fail('lan_busy')
+          return 'failed'
+        }
+      }
+      this.d.log('error', `LAN не запустился: ${err instanceof Error ? err.message : String(err)}`)
+      this.fail('daemon')
+      return 'failed'
+    }
+    this.check(gen)
+    this.d.log('info', 'LAN запущен')
+    try {
+      return await this.waitCtl(gen)
+    } catch (err) {
+      if (err instanceof Cancelled) throw err
+      this.d.log('error', `LAN: ${err instanceof Error ? err.message : String(err)}`)
+      return 'in_use'
+    }
+  }
+
+  /**
+   * `status` answers once the daemon's pipe is up and its engine is created —
+   * with its wintun adapter. Right after Windows starts that may take a while
+   * (the daemon retries by itself for minutes): stopping it early kills it in
+   * the middle of creating the adapter, so it gets a minute and a half.
+   */
   private async waitCtl(gen: number): Promise<DaemonStatus | null> {
     const ctl = await this.d.ctl()
-    const end = Date.now() + (this.d.waitMs ?? 20_000)
+    const since = Date.now()
+    const end = since + (this.d.waitMs ?? 90_000)
+    let slow = false
     while (Date.now() < end) {
       this.check(gen)
+      if (!slow && Date.now() - since > 10_000) {
+        slow = true
+        this.set({ message: 'Windows создаёт сетевой адаптер LAN — это может занять до минуты…' })
+      }
       try {
         const s = await ctl.status()
         if (s.backendState !== 'NoState' && s.backendState !== 'Starting') return s

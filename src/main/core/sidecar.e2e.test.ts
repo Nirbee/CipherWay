@@ -1506,6 +1506,50 @@ describe.skipIf(!enabled)('SidecarManager with real cores', () => {
       )
     }, 60_000)
 
+    it('the LAN daemon is creating its adapter: the TUN core is launched only after it (0.5.1)', async () => {
+      const { SidecarManager } = await import('./SidecarManager')
+      const { AdapterGate } = await import('./adapterGate')
+      const gate = new AdapterGate()
+      let lanDone = false
+      let launchedAfterLan: boolean | null = null
+      const launcher = {
+        kind: 'service' as const,
+        coreRuleDir: join(tmp, 'run', 'rules'),
+        coreLogPath: join(tmp, 'fake-core-gate.log'),
+        launch: async () => {
+          launchedAfterLan = lanDone
+          expect(gate.busy).toBe('VPN')
+        },
+        restartCore: async () => undefined,
+        syncRules: async () => undefined,
+        exited: async () => true,
+        exitInfo: async () => ({ code: 1, uptimeMs: 100, stderr: '' }),
+        failure: () => null,
+        stop: async () => undefined
+      }
+      const states: [StatusUpdate['state'], string | undefined][] = []
+      const m = new SidecarManager(
+        () => undefined,
+        (s, msg) => states.push([s, msg]),
+        () => undefined,
+        undefined,
+        undefined,
+        undefined,
+        { launcherFactory: async () => launcher, adapterGate: gate }
+      )
+      const lan = gate.run('LAN', async () => {
+        await new Promise((r) => setTimeout(r, 500))
+        lanDone = true
+      })
+      await expect(m.start(tunParams)).rejects.toThrow(/не запустилось/)
+      await lan
+      expect(launchedAfterLan).toBe(true)
+      expect(states.some(([, msg]) => msg === 'Ждём, пока LAN создаст свой сетевой адаптер…')).toBe(
+        true
+      )
+      expect(gate.busy).toBeNull()
+    }, 60_000)
+
     it('IPv6 off in Windows: «set ipv6 address» → at once an IPv4-only restart, kept for the next connect (0.4.6)', async () => {
       const { SidecarManager } = await import('./SidecarManager')
       const logFile = join(tmp, 'fake-core-v6.log')

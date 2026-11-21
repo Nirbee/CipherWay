@@ -91,6 +91,44 @@ describe('LAN broker allow-list (security)', () => {
     expect(script).toContain('if (Is-OurDaemon $o) {')
   })
 
+  it('the adapter: a leftover device of its GUID goes before the start, only after the Tailscale check', () => {
+    expect(script).toContain("$OwnGuid = '{37217669-42DA-4657-A55B-0D995D328250}'")
+    expect(script).toMatch(
+      /Own-Adapter\); \$i\+\+\) \{ Start-Sleep -Milliseconds 250 \}\s+Remove-WintunGhost \$OwnGuid\s+Rotate \$LogF/
+    )
+    expect(script.indexOf('$busy = Other-Tailscale $true')).toBeLessThan(
+      script.indexOf('$daemon = Start-Daemon')
+    )
+    // the it-test's fake «other Tailscale» GUID is used for its own daemon too
+    const fake = lanBrokerScript({
+      sid,
+      userRunDir: 'C:\r',
+      hashes: H,
+      other: { service: 'x', process: 'y', adapterGuid: '{00000000-0000-0000-0000-000000000001}' }
+    })
+    expect(fake).toContain("$OwnGuid = '{00000000-0000-0000-0000-000000000001}'")
+    expect(fake).not.toContain('37217669')
+  })
+
+  it('the daemon is never killed while it is creating its adapter (≤ 20 s, «stopping»)', () => {
+    const kill = /function Kill-Daemon\(\$p, \[bool\]\$report\) \{([\s\S]*?)\n\}/.exec(
+      script.replace(/\r\n/g, '\n')
+    )?.[1]
+    expect(kill).toBeTruthy()
+    expect(kill).toContain('if (Wintun-Creating $OwnGuid $TunName) {')
+    expect(kill).toContain('$end = (Now-Ms) + 20000')
+    expect(kill).toContain("if ($report) { $State.status = 'stopping' }")
+    expect(kill).toMatch(
+      /\$State\.status = \$was\s+\}\s+if \(-not \$p\.HasExited\) \{ \$p\.Kill\(\)/
+    )
+    // every kill of the daemon goes through it
+    expect(script.match(/\.Kill\(\)/g)).toHaveLength(1)
+    expect(script).toContain('try { Kill-Daemon $d $true } catch {}')
+    expect(script).toContain('Kill-Daemon $o $false')
+    // the session is reported before an orphan (maybe creating its adapter) is waited for
+    expect(script).toMatch(/Save-State\s+Stop-Orphan\s+\$busy = Other-Tailscale \$true/)
+  })
+
   it('«LAN busy» counts only processes of our exact file, not anything called cipherway-lan', () => {
     expect(script).toContain('| Where-Object { $_.Path -ieq $Exe }).Count -gt 0) {')
   })
@@ -224,5 +262,6 @@ describe('parseLanState', () => {
       error: undefined
     })
     expect(parseLanState('nope')).toBeNull()
+    expect(parseLanState('{"status":"stopping"}')?.status).toBe('stopping')
   })
 })

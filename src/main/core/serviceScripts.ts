@@ -1,4 +1,11 @@
-import { CORE_PROCESS_PS, psQuote, STALE_ADAPTER_PS } from './broker'
+import {
+  CORE_PROCESS_PS,
+  psGuid,
+  psQuote,
+  STALE_ADAPTER_PS,
+  WINTUN_DEVICE_PS,
+  wintunGuid
+} from './broker'
 import { CORE_EXE, LAN_EXE, LEGACY_EXES, TUN_INTERFACE } from './coreNames'
 
 // ---------------------------------------------------------------------------
@@ -148,6 +155,7 @@ $Exe = Join-Path $Bin ${psQuote(CORE_EXE)}
 $CoreExe = $Exe
 $CoreDir = $Bin
 $TunName = ${psQuote(p.tunName ?? TUN_INTERFACE)}
+$TunGuid = ${psGuid(wintunGuid(p.tunName ?? TUN_INTERFACE))}
 $RulesOut = Join-Path $Dir 'rules'
 $CfgOut = Join-Path $Dir 'config.json'
 $CoreArgs = 'run -c "' + $CfgOut + '"'
@@ -242,6 +250,7 @@ function Prepare {
   Sync-Rules
 }
 ${CORE_PROCESS_PS}
+${WINTUN_DEVICE_PS}
 ${STALE_ADAPTER_PS}
 function Start-Core {
   $p = Start-CoreProcess

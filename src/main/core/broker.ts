@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { TUN_INTERFACE } from './coreNames'
 
 // ---------------------------------------------------------------------------
@@ -87,10 +88,93 @@ function Core-Output {
 `.trim()
 
 /**
+ * The GUID wintun gets for an adapter of this name — what sing-tun does
+ * (tun_windows.go generateGUIDByDeviceName: md5("wintun" + name) read as a
+ * Windows GUID). Its device is `SWD\Wintun\<GUID>`: «CipherWay» →
+ * {3D56CD02-D8B1-21DE-B21B-2D7CFA71C8E3}, the same on every PC and every run.
+ */
+export function wintunGuid(name: string): string {
+  const b = createHash('md5').update('wintun').update(name, 'utf8').digest()
+  const hex = (from: number, to: number, le: boolean): string => {
+    const part = [...b.subarray(from, to)]
+    return (le ? part.reverse() : part).map((x) => x.toString(16).padStart(2, '0')).join('')
+  }
+  return `{${hex(0, 4, true)}-${hex(4, 6, true)}-${hex(6, 8, true)}-${hex(8, 10, false)}-${hex(10, 16, false)}}`.toUpperCase()
+}
+
+const GUID_RE = /^\{[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}\}$/i
+
+/** A GUID for a broker script (checked: it goes into a pnputil command line). */
+export function psGuid(guid: string): string {
+  if (!GUID_RE.test(guid)) throw new Error('bad guid')
+  return psQuote(guid.toUpperCase())
+}
+
+/**
+ * PowerShell: the wintun device of one of OUR adapters, `SWD\Wintun\<GUID>`
+ * (the GUID is fixed per adapter: wintunGuid() for the core, the one compiled
+ * into tailscaled for LAN). Expects a Note function. Why (0.5.1, seen in the
+ * Kernel-PnP log of a PC where TUN never came up with LAN on):
+ *  * a core / daemon that is killed never closes its adapter: the device stays
+ *    behind «not present». The next create with the same GUID re-uses it, and
+ *    Windows often fails that one (problem 0x1F, STATUS_OBJECT_NAME_COLLISION)
+ *    only after wintun's 15 s wait — the «first start of the day fails» of
+ *    0.4.x. A brand-new device comes up in a second: the leftover is removed
+ *    before the start (Remove-WintunGhost);
+ *  * a process killed in the middle of creating its adapter left Windows unable
+ *    to start any wintun adapter (ours, other VPN apps') for minutes
+ *    (problem 0x1F, STATUS_OBJECTID_NOT_FOUND): Wintun-Creating tells when not
+ *    to kill.
+ */
+export const WINTUN_DEVICE_PS = `
+function Wintun-Id([string]$guid) { return ('SWD\\Wintun\\' + $guid) }
+# the device is there (being created, failing, or up) — a leftover is not
+function Wintun-Present([string]$guid) {
+  try {
+    $f = "DeviceID='" + (Wintun-Id $guid).Replace('\\', '\\\\') + "'"
+    return $null -ne (Get-CimInstance -ClassName Win32_PnPEntity -Filter $f -ErrorAction Stop)
+  } catch { return $false }
+}
+function Wintun-Known([string]$guid) {
+  try {
+    $k = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SYSTEM\\CurrentControlSet\\Enum\\' + (Wintun-Id $guid))
+    if ($null -eq $k) { return $false }
+    $k.Close()
+    return $true
+  } catch { return $false }
+}
+# wintun is creating it right now: the device is there, the network interface not yet
+function Wintun-Creating([string]$guid, [string]$name) {
+  try {
+    foreach ($n in [Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces()) {
+      if ($n.Name -eq $name) { return $false }
+    }
+  } catch {}
+  return (Wintun-Present $guid)
+}
+function Remove-WintunGhost([string]$guid) {
+  try {
+    if (-not (Wintun-Known $guid)) { return }
+    # the device of a run that has just ended goes away by itself first
+    for ($i = 0; $i -lt 20 -and (Wintun-Present $guid); $i++) { Start-Sleep -Milliseconds 250 }
+    if (Wintun-Present $guid) { return }
+    $id = Wintun-Id $guid
+    Note ('удаляем адаптер, оставшийся от прошлого запуска: ' + $id)
+    $null = & (Join-Path ([Environment]::GetFolderPath('System')) 'pnputil.exe') '/remove-device' $id
+    for ($i = 0; $i -lt 12 -and (Wintun-Known $guid); $i++) { Start-Sleep -Milliseconds 250 }
+    if (Wintun-Known $guid) { Note 'старый адаптер не удалился'; return }
+    # Windows finishes with a removed device in the background: not the same GUID at once
+    Start-Sleep -Milliseconds 1000
+  } catch { Note ('не удалось удалить старый адаптер: ' + [string]$_.Exception.Message) }
+}
+`.trim()
+
+/**
  * PowerShell: the wintun adapter of the previous run must be gone before a new
  * one is created. It normally disappears within seconds of the core's exit; one
- * that stays is removed (the elevated broker may do that). Only our adapter name.
- * Expects $TunName and a Note function.
+ * that stays is removed (the elevated broker may do that), and so is the device
+ * it leaves behind (WINTUN_DEVICE_PS). Only our adapter name / GUID.
+ * Expects $TunName, $TunGuid, WINTUN_DEVICE_PS and a Note function.
  */
 export const STALE_ADAPTER_PS = `
 function Tun-Present {
@@ -101,7 +185,7 @@ function Tun-Present {
   } catch {}
   return $false
 }
-function Clear-StaleAdapter {
+function Clear-StaleNamed {
   if (-not (Tun-Present)) { return }
   for ($i = 0; $i -lt 20; $i++) {
     Start-Sleep -Milliseconds 250
@@ -118,6 +202,10 @@ function Clear-StaleAdapter {
   }
   Note 'адаптер прошлого запуска остался'
 }
+function Clear-StaleAdapter {
+  Clear-StaleNamed
+  Remove-WintunGhost $TunGuid
+}
 `.trim()
 
 export function brokerScript(p: BrokerParams): string {
@@ -132,9 +220,11 @@ $restart = ${psQuote(p.restartFile)}
 $exitf = ${psQuote(p.exitFile)}
 $parent = ${Math.trunc(p.parentPid)}
 $TunName = ${psQuote(p.tunName ?? TUN_INTERFACE)}
+$TunGuid = ${psGuid(wintunGuid(p.tunName ?? TUN_INTERFACE))}
 function Now-Ms { [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
 function Note([string]$m) {}
 ${CORE_PROCESS_PS}
+${WINTUN_DEVICE_PS}
 ${STALE_ADAPTER_PS}
 function Write-Exit($c) {
   $o = @{ code = $c.ExitCode; uptimeMs = ((Now-Ms) - $script:CoreStarted); stderr = (Core-Output) } | ConvertTo-Json -Compress

@@ -381,7 +381,7 @@ the Headscale ACL). Code: `src/main/lan/`, UI: `src/renderer/src/pages/LanPage.t
   entries) shows every entry newer than `whatsNewSeenVersion` in the store. A fresh
   install only records its version; an update from ≤ 0.4.6 (nothing recorded, but
   data of an earlier version present) shows the current version only. Counted as
-  seen once the window was actually visible.
+  seen once the window was actually visible (0.5.1: only after × / «Подробнее»).
 - **Phase 2 (TODO)**: Minecraft announces an open world by UDP multicast
   224.0.2.60:4445, which does not cross the Tailscale adapter. Plan: a small relay in
   the app listens on 224.0.2.60:4445 on the physical interfaces, forwards each
@@ -390,3 +390,51 @@ the Headscale ACL). Code: `src/main/lan/`, UI: `src/renderer/src/pages/LanPage.t
   loopback and, since the game connects to the announcement's source address, forwards
   TCP 127.0.0.1:<port> → <peer LAN IP>:<port> while the world is announced — then the
   world appears in «Сетевая игра» by itself.
+
+## 0.5.1: TUN and LAN together; «Что нового» stays until read
+
+- **Bug**: with LAN on, TUN never came up after a reboot («create adapter: Cannot
+  create a file when that file already exists», then «configure tun interface: The
+  system cannot find the file specified» on every retry). From the Kernel-PnP log
+  (`Microsoft-Windows-Kernel-PnP/Configuration`, events 400/410/411/420 for
+  `SWD\Wintun\{GUID}`):
+  1. Both brokers stop their process with `Kill()`, so neither sing-box nor tailscaled
+     ever closes its wintun adapter: the device stays behind «not present». The next
+     create with the same GUID (fixed per adapter: sing-tun derives it from the name,
+     md5("wintun" + "CipherWay") = `{3D56CD02-D8B1-21DE-B21B-2D7CFA71C8E3}`;
+     tailscaled has `{37217669-42DA-4657-A55B-0D995D328250}` compiled in) re-uses that
+     device, and Windows often fails it (problem 0x1F, `STATUS_OBJECT_NAME_COLLISION`)
+     only after wintun's 15 s wait; wintun then removes it and the next create gets a
+     fresh device that comes up at once. That was the «first TUN start of the day
+     fails once» of 0.4.x (in broker.log on most days).
+  2. wintun.dll creates adapters one at a time machine-wide (a mutex in its private
+     namespace, held through the 15 s wait), for every process and every copy of the
+     dll. After a reboot LAN (started first) and TUN each spent 15 s on a leftover
+     device, one behind the other; the LAN start gave up after 20 s and the broker
+     killed tailscaled in the middle of creating its adapter. After that Windows
+     failed every new wintun adapter — ours and another VPN app's — with problem 0x1F,
+     `STATUS_OBJECTID_NOT_FOUND`, for ~7 minutes.
+- **Fix**:
+  - both brokers remove the leftover device of their own GUID before a start
+    (`Remove-WintunGhost`, `broker.ts WINTUN_DEVICE_PS`: only when the device is
+    registered but not present; `pnputil /remove-device SWD\Wintun\<GUID>`, then a
+    second's pause). The LAN broker does it only after its «another Tailscale?» check;
+  - the LAN broker never kills tailscaled while its wintun device exists but the
+    «CipherWay LAN» interface does not yet (= wintun is creating it): it waits up to
+    20 s, reporting `status: stopping`; the next LAN start waits for such a broker
+    (≤ 25 s) instead of having its `/run` ignored;
+  - the app creates one adapter at a time (`core/adapterGate.ts`): a TUN connect
+    waits (≤ 45 s, «Ждём, пока LAN создаст свой сетевой адаптер…») while the LAN
+    daemon is being started, and the LAN start waits (≤ 60 s) while the TUN core is
+    creating its adapter;
+  - LAN gives its daemon 90 s (was 20 s) to answer: tailscaled itself retries the
+    adapter for up to 5 minutes; after 10 s the UI says Windows is creating the
+    adapter.
+  - Not changed: the adapter names / GUIDs, sing-box `interface_name`, strict_route,
+    tailscaled's flags. tailscaled has no adapter clean-up of its own at start
+    (`cmd/tailscaled`: `uninstallWinTun` only on an explicit service command);
+    wintun 0.14 has no pools any more.
+- **«Что нового»**: only × or «Подробнее» count as seen; a card that hid by itself
+  comes back on the next start. The 15 s count only runs while the window is visible
+  *and* focused (and the mouse is not over the card). «Настройки» → «Обновления» has a
+  permanent «Что нового» link next to the version (the whole bundled list).

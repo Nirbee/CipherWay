@@ -114,7 +114,7 @@ export const IPC = {
   // «Что нового» after an update (src/shared/changelog.ts)
   /** the entries to show now ([] = nothing) */
   whatsNewGet: 'whatsNew:get',
-  /** the user has seen them: remember the current version */
+  /** the user closed the card with × or «Подробнее»: remember the current version */
   whatsNewSeen: 'whatsNew:seen',
 
   // updater (state: src/shared/updater.ts)

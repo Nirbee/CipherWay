@@ -43,6 +43,7 @@ import { findFreePort } from '../system/ports'
 import { disableSystemProxy, enableSystemProxy } from '../system/proxy'
 import { allIps, resolveServers, toExcludeCidrs, type ServerIps } from '../system/resolve'
 import { detectIpv6, shouldRetryIpv4Only, type Ipv6Status } from '../system/ipv6'
+import type { AdapterGateLike } from './adapterGate'
 
 type LogFn = (entry: LogEntry) => void
 type StateFn = (state: ConnectionState, message?: string) => void
@@ -82,6 +83,8 @@ export interface ManagerHooks {
   launcherFactory?: (paths: LauncherPaths, cancelled: () => boolean) => Promise<TunLauncher>
   /** tests: instead of reading the registry / the adapters (system/ipv6.ts) */
   ipv6Probe?: () => Promise<Ipv6Status>
+  /** TUN: the LAN daemon and the core never create their wintun adapters at once */
+  adapterGate?: AdapterGateLike
 }
 
 /** a core that died is restarted up to this many times, after these pauses */
@@ -635,22 +638,26 @@ export class SidecarManager {
             )
           : 0
       this.startLogTail(logFile, skip)
-      if (this.launcher) {
-        // after a reload the old adapter may take a moment to disappear
-        // (one that stays is removed by the broker, it has the rights)
-        this.staleAdapter = !(await this.adapterGone())
-        if (this.staleAdapter)
-          this.log('warn', 'app', 'Сетевой адаптер CipherWay остался от прошлого запуска')
-        this.onState('connecting', 'Создаём сетевой адаптер…')
-        await this.launcher.launch()
-        const why = this.launcher.failure()
-        if (why)
-          throw this.launcher.kind === 'service' ? new ServiceUnavailable(why) : new Error(why)
+      const launcher = this.launcher
+      if (launcher) {
+        // the LAN daemon may be creating its own wintun adapter right now
+        await this.withAdapterGate(cancelled, async () => {
+          // after a reload the old adapter may take a moment to disappear
+          // (one that stays is removed by the broker, it has the rights)
+          this.staleAdapter = !(await this.adapterGone())
+          if (this.staleAdapter)
+            this.log('warn', 'app', 'Сетевой адаптер CipherWay остался от прошлого запуска')
+          this.onState('connecting', 'Создаём сетевой адаптер…')
+          await launcher.launch()
+          const why = launcher.failure()
+          if (why) throw launcher.kind === 'service' ? new ServiceUnavailable(why) : new Error(why)
+          await this.waitCoreReady(cancelled)
+          if (tun) await this.waitTunReady(cancelled)
+        })
       } else {
         this.startChild()
+        await this.waitCoreReady(cancelled)
       }
-      await this.waitCoreReady(cancelled)
-      if (tun) await this.waitTunReady(cancelled)
 
       await this.applyRuntimeChoices(p)
 
@@ -890,6 +897,33 @@ export class SidecarManager {
       .at(-1)
     const reason = fatal ?? error
     return reason ? `: ${reason.replace(/^.*?(FATAL|ERROR)(\[\d+\])?\s*/, '')}` : ''
+  }
+
+  /**
+   * TUN: creates the adapter while the LAN daemon is not creating its own (see
+   * adapterGate.ts); waits at most 45 s for it, then goes ahead anyway.
+   */
+  private async withAdapterGate<T>(cancelled: () => boolean, fn: () => Promise<T>): Promise<T> {
+    const gate = this.hooks.adapterGate
+    if (!gate) return fn()
+    return gate.run(
+      'VPN',
+      async () => {
+        if (cancelled()) throw new Error('Подключение отменено')
+        return fn()
+      },
+      {
+        maxWaitMs: 45_000,
+        onWait: () => {
+          this.log(
+            'info',
+            'app',
+            'LAN создаёт свой сетевой адаптер — ждём его, потом создаём адаптер VPN'
+          )
+          this.onState('connecting', 'Ждём, пока LAN создаст свой сетевой адаптер…')
+        }
+      }
+    )
   }
 
   /** Waits for the adapter of the previous run to disappear; false = it stayed. */
@@ -1172,13 +1206,16 @@ export class SidecarManager {
       this.tunRetries = 0
       if (l) {
         await this.noteCoreExit(l)
-        this.onState('connecting', 'Перезапуск ядра…')
-        await l.restartCore()
+        await this.withAdapterGate(cancelled, async () => {
+          this.onState('connecting', 'Перезапуск ядра…')
+          await l.restartCore()
+          await this.waitCoreReady(cancelled, CORE_READY_TIMEOUT_TUN_MS)
+          await this.waitTunReady(cancelled)
+        })
       } else {
         this.startChild()
+        await this.waitCoreReady(cancelled, CORE_READY_TIMEOUT_MS)
       }
-      await this.waitCoreReady(cancelled, l ? CORE_READY_TIMEOUT_TUN_MS : CORE_READY_TIMEOUT_MS)
-      if (l) await this.waitTunReady(cancelled)
       if (this.lastParams) await this.applyRuntimeChoices(this.lastParams)
       if (l) this.onState('connected')
     }

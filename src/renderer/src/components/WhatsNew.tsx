@@ -4,14 +4,19 @@ import { Button, Modal } from './ui'
 import { CloseIcon } from './icons'
 
 const AUTO_HIDE_MS = 15_000
+const TICK_MS = 500
 const CARD_ITEMS = 3
+
+/** the user can actually see the card: the window is shown and in front */
+const windowWatched = (): boolean => document.visibilityState === 'visible' && document.hasFocus()
 
 /**
  * «Что нового» after an update: a small card in the top-right corner (below the
- * title bar, away from the toasts) with the first bullets; it hides by itself
- * after 15 s (not while the mouse is over it), × closes it, «Подробнее» opens the
- * whole list. Shown only once the window is actually visible — the app may start
- * hidden in the tray — and then counted as seen.
+ * title bar, away from the toasts) with the first bullets. × or «Подробнее»
+ * (the whole list) count it as seen. Otherwise it hides by itself after 15 s of
+ * the window being visible AND in focus (not while the mouse is over it) — and
+ * comes back on the next start, it may have gone unread. Shown only once the
+ * window is visible — the app may start hidden in the tray.
  */
 export function WhatsNew() {
   const [entries, setEntries] = useState<ChangelogEntry[]>([])
@@ -21,34 +26,38 @@ export function WhatsNew() {
 
   useEffect(() => {
     let cancelled = false
+    let onVisible: (() => void) | null = null
     const show = (list: ChangelogEntry[]): void => {
       if (cancelled || list.length === 0) return
       setEntries(list)
       setCard(true)
-      window.api.whatsNew.seen()
     }
     void window.api.whatsNew.get().then((list) => {
+      if (cancelled) return
       if (document.visibilityState === 'visible') return show(list)
-      const onVisible = (): void => {
+      onVisible = (): void => {
         if (document.visibilityState !== 'visible') return
-        document.removeEventListener('visibilitychange', onVisible)
+        if (onVisible) document.removeEventListener('visibilitychange', onVisible)
+        onVisible = null
         show(list)
       }
       document.addEventListener('visibilitychange', onVisible)
     })
     return () => {
       cancelled = true
+      if (onVisible) document.removeEventListener('visibilitychange', onVisible)
     }
   }, [])
 
   useEffect(() => {
     if (!card) return
+    // counts only while the user can see it (shown, focused, the mouse elsewhere)
     let left = AUTO_HIDE_MS
     const t = setInterval(() => {
-      if (hover.current) return
-      left -= 500
+      if (hover.current || !windowWatched()) return
+      left -= TICK_MS
       if (left <= 0) setCard(false)
-    }, 500)
+    }, TICK_MS)
     return () => clearInterval(t)
   }, [card])
 
@@ -56,6 +65,7 @@ export function WhatsNew() {
   const newest = entries[0]
   const shown = newest.items.slice(0, CARD_ITEMS)
   const more = entries.reduce((n, e) => n + e.items.length, 0) - shown.length
+  const seen = (): void => window.api.whatsNew.seen()
 
   return (
     <>
@@ -71,7 +81,10 @@ export function WhatsNew() {
               Что нового в версии {newest.version}
             </div>
             <button
-              onClick={() => setCard(false)}
+              onClick={() => {
+                setCard(false)
+                seen()
+              }}
               title="Закрыть"
               className="no-drag -mr-1 -mt-1 flex h-6 w-6 shrink-0 items-center justify-center rounded-lg text-text-muted hover:bg-bg-panel hover:text-text-primary"
             >
@@ -88,36 +101,52 @@ export function WhatsNew() {
             onClick={() => {
               setCard(false)
               setFull(true)
+              seen()
             }}
           >
             Подробнее{more > 0 ? ` (ещё ${more})` : ''}
           </button>
         </div>
       )}
-      <Modal
-        open={full}
-        onClose={() => setFull(false)}
-        title="Что нового"
-        width="max-w-md"
-        footer={
-          <Button size="sm" onClick={() => setFull(false)}>
-            Понятно
-          </Button>
-        }
-      >
-        <div className="space-y-4">
-          {entries.map((e) => (
-            <div key={e.version}>
-              <div className="text-[13px] font-semibold text-text-primary">Версия {e.version}</div>
-              <ul className="mt-1.5 list-disc space-y-1 pl-4 text-[12.5px] leading-relaxed text-text-muted">
-                {e.items.map((item) => (
-                  <li key={item}>{item}</li>
-                ))}
-              </ul>
-            </div>
-          ))}
-        </div>
-      </Modal>
+      <ChangelogModal open={full} entries={entries} onClose={() => setFull(false)} />
     </>
+  )
+}
+
+/** The list of versions and their bullets (after an update, and from «Настройки»). */
+export function ChangelogModal({
+  open,
+  entries,
+  onClose
+}: {
+  open: boolean
+  entries: ChangelogEntry[]
+  onClose: () => void
+}) {
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Что нового"
+      width="max-w-md"
+      footer={
+        <Button size="sm" onClick={onClose}>
+          Понятно
+        </Button>
+      }
+    >
+      <div className="space-y-4">
+        {entries.map((e) => (
+          <div key={e.version}>
+            <div className="text-[13px] font-semibold text-text-primary">Версия {e.version}</div>
+            <ul className="mt-1.5 list-disc space-y-1 pl-4 text-[12.5px] leading-relaxed text-text-muted">
+              {e.items.map((item) => (
+                <li key={item}>{item}</li>
+              ))}
+            </ul>
+          </div>
+        ))}
+      </div>
+    </Modal>
   )
 }

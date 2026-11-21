@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import type { LanView, TunServiceInfo } from '@shared/types'
 import { LAN_EXE, LAN_LOGIN_HOST, LANCTL_EXE } from '../core/coreNames'
 import type { TunService } from '../core/tunService'
+import type { AdapterGateLike } from '../core/adapterGate'
 import { LanApi } from './api'
 import { LanCtl } from './lanCtl'
 import { lanPipeName, lanTaskName } from './lanBroker'
@@ -31,6 +32,8 @@ export interface CreateLanOpts {
   publish: (v: LanView) => void
   /** LAN goes on / off: the VPN config must (not) let its daemon bypass */
   onBypassChange: () => Promise<void>
+  /** shared with the VPN: one wintun adapter created at a time */
+  adapterGate?: AdapterGateLike
   log: (level: 'info' | 'warn' | 'error', msg: string) => void
   daemonLog: (lines: string[]) => void
 }
@@ -78,6 +81,7 @@ export function createLanService(o: CreateLanOpts): LanService {
     publish: o.publish,
     log: o.log,
     daemonLog: o.daemonLog,
-    onBypassChange: o.onBypassChange
+    onBypassChange: o.onBypassChange,
+    adapterGate: o.adapterGate
   })
 }
