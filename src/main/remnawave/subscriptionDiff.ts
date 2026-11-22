@@ -7,7 +7,9 @@ import { AUTO_OUTBOUND_ID, type OutboundConfig } from '@shared/types'
 // Remnawave may hand out a different shortId / fingerprint on every request
 // (it picks from the inbound's list), so those are "soft": remembered for the
 // next start, but no reason to break the user's connections. The automatic
-// reaction to a REALITY error applies them too (see SubscriptionSync).
+// reaction to a REALITY error compares the fresh list with what the core is
+// RUNNING (runningChanges) and applies any difference of the failing server,
+// soft fields included (0.5.2, see SubscriptionSync).
 // ---------------------------------------------------------------------------
 
 const HARD_FIELDS: (keyof OutboundConfig)[] = [
@@ -79,6 +81,97 @@ export function diffOutbounds(prev: OutboundConfig[], next: OutboundConfig[]): O
     softOnly,
     restartNeeded: added.length > 0 || removed.length > 0 || modified.length > 0 || idsMoved
   }
+}
+
+/** Field names for the log («Финляндия: отпечаток qq → firefox»). */
+const FIELD_LABEL: Partial<Record<keyof OutboundConfig, string>> = {
+  protocol: 'протокол',
+  server: 'адрес',
+  port: 'порт',
+  uuid: 'UUID',
+  flow: 'flow',
+  encryption: 'шифрование',
+  security: 'защита',
+  publicKey: 'ключ REALITY',
+  shortId: 'shortId',
+  fingerprint: 'отпечаток',
+  spiderX: 'spiderX',
+  serverName: 'SNI',
+  network: 'транспорт',
+  path: 'путь',
+  host: 'host',
+  password: 'пароль',
+  sni: 'SNI',
+  obfs: 'obfs',
+  obfsPassword: 'пароль obfs',
+  insecure: 'insecure'
+}
+/** values that are neither credentials nor addresses — shown in the log as «было → стало» */
+const SHOWN_VALUES = new Set<keyof OutboundConfig>([
+  'protocol',
+  'port',
+  'flow',
+  'encryption',
+  'security',
+  'fingerprint',
+  'network',
+  'obfs',
+  'insecure'
+])
+
+export interface FieldChange {
+  field: keyof OutboundConfig
+  from: string
+  to: string
+}
+
+/** Every connection field (hard and soft) that differs between two copies of a server. */
+export function fieldChanges(a: OutboundConfig, b: OutboundConfig): FieldChange[] {
+  return [...HARD_FIELDS, ...SOFT_FIELDS]
+    .filter((f) => String(a[f] ?? '') !== String(b[f] ?? ''))
+    .map((f) => ({ field: f, from: String(a[f] ?? ''), to: String(b[f] ?? '') }))
+}
+
+/**
+ * «Финляндия: отпечаток qq → firefox, ключ REALITY» — keys, ids, passwords and
+ * addresses are named, never printed.
+ */
+export function describeFieldChanges(name: string, changes: FieldChange[]): string {
+  const parts = changes.map((c) => {
+    const label = FIELD_LABEL[c.field] ?? String(c.field)
+    return SHOWN_VALUES.has(c.field) ? `${label} ${c.from || '—'} → ${c.to || '—'}` : label
+  })
+  return `${name}: ${parts.join(', ')}`
+}
+
+export interface ServerChange {
+  /** id in the new list */
+  id: string
+  name: string
+  changes: FieldChange[]
+}
+
+/**
+ * The servers of `running` (what the core was started with) whose copy in the
+ * fresh subscription differs in ANY field, soft ones included. Matched by name
+ * like diffOutbounds; `only` = ids (of either list) to look at, empty = all.
+ */
+export function runningChanges(
+  running: OutboundConfig[],
+  next: OutboundConfig[],
+  only: string[] = []
+): ServerChange[] {
+  const before = byName(running)
+  const after = byName(next)
+  const out: ServerChange[] = []
+  for (const [name, b] of after) {
+    const a = before.get(name)
+    if (!a) continue
+    if (only.length && !only.includes(a.id) && !only.includes(b.id)) continue
+    const changes = fieldChanges(a, b)
+    if (changes.length) out.push({ id: b.id, name: b.name, changes })
+  }
+  return out
 }
 
 /** Readable summary for the log: names only, no addresses. */

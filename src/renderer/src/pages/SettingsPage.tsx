@@ -1,5 +1,12 @@
 import { useEffect, useState } from 'react'
-import { DEFAULT_API_BASE, type AppSettings, type TunServiceInfo } from '@shared/types'
+import {
+  DEFAULT_API_BASE,
+  PING_TIMEOUT_MAX_S,
+  PING_TIMEOUT_MIN_S,
+  type AppSettings,
+  type PingMode,
+  type TunServiceInfo
+} from '@shared/types'
 import { buildDiagnostics } from '@shared/diagnostics'
 import { CHANGELOG } from '@shared/changelog'
 import { PageHeader } from '../components/PageHeader'
@@ -12,6 +19,7 @@ import { useLogs } from '../store/logsStore'
 import { useUpdater } from '../store/updaterStore'
 import { useConnection } from '../store/connectionStore'
 import { useSubscription } from '../store/subscriptionStore'
+import { useServers } from '../store/serversStore'
 import { toast } from '../store/toastStore'
 import { errorText, formatAgo } from '../lib/format'
 import { cn } from '../lib/cn'
@@ -84,6 +92,8 @@ export function SettingsPage() {
           </div>
           {settings.proxyMode === 'tun' && <TunServiceControls enabled={settings.tunService} />}
         </Section>
+
+        <PingSection settings={settings} save={save} />
 
         <Section title="Запуск">
           <Row
@@ -187,6 +197,87 @@ export function SettingsPage() {
         </Section>
       </div>
     </div>
+  )
+}
+
+const PING_OPTIONS: { mode: PingMode; title: string; desc: string }[] = [
+  {
+    mode: 'keepalive',
+    title: 'Задержка',
+    desc: 'Два запроса к сайту через сервер по одному соединению, считается второй — чистое время пути через VPN, без установки соединения. Как «Keepalive» в Happ.'
+  },
+  {
+    mode: 'connect',
+    title: 'С подключением',
+    desc: 'Первый запрос целиком: вместе с установкой защищённого соединения. Цифры больше — так приложение считало до версии 0.5.2.'
+  },
+  {
+    mode: 'tcp',
+    title: 'До сервера (TCP)',
+    desc: 'Время TCP-соединения с адресом сервера напрямую, без проверки VPN: сервер может отвечать, а VPN через него — нет. Для Hysteria2 (работает по UDP) недоступно.'
+  }
+]
+
+/** Settings → «Пинг»: what the server list measures and how long a server gets. */
+function PingSection({
+  settings,
+  save
+}: {
+  settings: AppSettings
+  save: (patch: Partial<AppSettings>) => Promise<void>
+}) {
+  const [timeout, setTimeoutSec] = useState(settings.pingTimeoutSec)
+  useEffect(() => setTimeoutSec(settings.pingTimeoutSec), [settings.pingTimeoutSec])
+
+  // numbers of another mode would mix in the list: they are measured again
+  const forget = (): void => useServers.setState({ pings: {}, testedAt: null })
+  const pickMode = (mode: PingMode): void => {
+    if (mode === settings.pingMode) return
+    void save({ pingMode: mode }).then(forget)
+  }
+  const commitTimeout = (): void => {
+    if (timeout !== settings.pingTimeoutSec) void save({ pingTimeoutSec: timeout })
+  }
+
+  return (
+    <Section
+      title="Пинг"
+      hint="Как проверяется задержка в списке серверов. Каждый сервер проверяется сам по себе, а не через выбранный."
+    >
+      <div className="grid grid-cols-3 gap-3">
+        {PING_OPTIONS.map((o) => (
+          <ModeCard
+            key={o.mode}
+            active={settings.pingMode === o.mode}
+            onClick={() => pickMode(o.mode)}
+            title={o.title}
+            desc={o.desc}
+          />
+        ))}
+      </div>
+      <div>
+        <div className="mb-1.5 flex items-center justify-between">
+          <span className="text-sm text-text-primary">Время ожидания ответа</span>
+          <span className="font-mono text-sm tabular-nums text-text-secondary">{timeout} с</span>
+        </div>
+        <input
+          type="range"
+          aria-label="Время ожидания ответа, секунд"
+          min={PING_TIMEOUT_MIN_S}
+          max={PING_TIMEOUT_MAX_S}
+          step={1}
+          value={timeout}
+          onChange={(e) => setTimeoutSec(Number(e.target.value))}
+          onPointerUp={commitTimeout}
+          onKeyUp={commitTimeout}
+          onBlur={commitTimeout}
+          className="w-full accent-accent-green"
+        />
+        <div className="text-[11px] text-text-faint">
+          Не ответил за это время — в списке «нет ответа».
+        </div>
+      </div>
+    </Section>
   )
 }
 

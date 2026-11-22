@@ -3,8 +3,11 @@ import type { OutboundConfig, SubscriptionData } from '@shared/types'
 import { parseOutbounds } from './parsers'
 import {
   describeDiff,
+  describeFieldChanges,
   diffOutbounds,
+  fieldChanges,
   reconcileActive,
+  runningChanges,
   refreshIntervalMs,
   remapLatencies
 } from './subscriptionDiff'
@@ -326,5 +329,81 @@ describe('SubscriptionSync', () => {
     sync.migrateActive()
     expect(state.active).toBe('auto')
     expect(state.changedTo).toEqual(['auto'])
+  })
+})
+
+describe('REALITY heal compares with what the core RUNS (0.5.2, «Финляндия» qq → firefox)', () => {
+  const qq = list(vless('Финляндия', { fp: 'qq' }), vless('Германия'))
+  const ff = list(vless('Финляндия', { fp: 'firefox' }), vless('Германия'))
+
+  it('field changes are named; keys / ids / addresses are never printed', () => {
+    expect(describeFieldChanges('Финляндия', fieldChanges(qq[0], ff[0]))).toBe(
+      'Финляндия: отпечаток qq → firefox'
+    )
+    const moved = list(vless('Финляндия', { pbk: 'SECRETKEY', sid: 'ef' }, 'b.example.com'))[0]
+    const text = describeFieldChanges('Финляндия', fieldChanges(qq[0], moved))
+    expect(text).toContain('ключ REALITY')
+    expect(text).toContain('адрес')
+    expect(text).not.toContain('SECRETKEY')
+    expect(text).not.toContain('b.example.com')
+    expect(text).not.toMatch(/\bef\b/)
+  })
+
+  it('runningChanges: soft fields count, only the failing servers when known', () => {
+    const next = list(vless('Финляндия', { fp: 'firefox' }), vless('Германия', { sid: 'zz' }))
+    expect(runningChanges(qq, next).map((c) => c.name)).toEqual(['Финляндия', 'Германия'])
+    expect(runningChanges(qq, next, [qq[0].id]).map((c) => c.name)).toEqual(['Финляндия'])
+    expect(runningChanges(qq, qq)).toEqual([])
+  })
+
+  it('the soft change stored earlier still reaches the core on a REALITY error', async () => {
+    const { sync, state, answer } = setup({ running: () => qq })
+    state.cached = data(qq)
+    state.active = qq[0].id
+    answer(ff)
+    // 1) the background refresh: fingerprint is soft — stored, no restart, logged
+    expect((await sync.refresh()).changed).toBe(false)
+    expect(state.apply).not.toHaveBeenCalled()
+    expect(state.logs).toContain(
+      'Финляндия: отпечаток qq → firefox — применится при следующем подключении'
+    )
+    // 2) REALITY fails on «Финляндия»: the cache already says firefox, the core runs qq
+    await sync.heal([qq[0].id])
+    expect(state.apply).toHaveBeenCalledTimes(1)
+    expect(state.logs).toContain('Финляндия: отпечаток qq → firefox')
+    expect(state.logs.join('\n')).not.toContain('нет новых ключей')
+  })
+
+  it('the core already runs the fresh parameters: nothing to restart', async () => {
+    const { sync, state, answer } = setup({ running: () => ff })
+    state.cached = data(ff)
+    answer(ff)
+    await sync.heal([ff[0].id])
+    expect(state.apply).not.toHaveBeenCalled()
+    expect(state.logs.at(-1)).toContain('нет новых ключей')
+  })
+
+  it("another server's soft change is no reason to cut connections", async () => {
+    const { sync, state, answer } = setup({ running: () => qq })
+    state.cached = data(qq)
+    answer(list(vless('Финляндия', { fp: 'qq' }), vless('Германия', { sid: 'zz' })))
+    await sync.heal([qq[0].id])
+    expect(state.apply).not.toHaveBeenCalled()
+  })
+
+  it('an unattributed error: every running server is compared', async () => {
+    const { sync, state, answer } = setup({ running: () => qq })
+    state.cached = data(qq)
+    answer(list(vless('Финляндия', { fp: 'qq' }), vless('Германия', { sid: 'zz' })))
+    await sync.heal([])
+    expect(state.apply).toHaveBeenCalledTimes(1)
+  })
+
+  it('«auto» selected: soft changes are stored silently', async () => {
+    const { sync, state, answer } = setup({ running: () => qq })
+    state.cached = data(qq)
+    answer(ff)
+    await sync.refresh()
+    expect(state.logs.join('\n')).not.toContain('применится')
   })
 })

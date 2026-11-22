@@ -4,6 +4,7 @@ import { parseServerName } from '@shared/flags'
 import { useSubscription } from '../store/subscriptionStore'
 import { useServers } from '../store/serversStore'
 import { useConnection } from '../store/connectionStore'
+import { useSettings } from '../store/settingsStore'
 
 export interface ServerEntry {
   id: string
@@ -39,6 +40,7 @@ export function useServerList(): {
   const autoChecking = useConnection((s) => s.autoChecking)
   const autoDead = useConnection((s) => s.autoDead)
   const serverHints = useConnection((s) => s.serverHints)
+  const pingMode = useSettings((s) => s.settings?.pingMode)
 
   return useMemo(() => {
     const list: ServerEntry[] = (servers ?? []).map((s) => {
@@ -52,9 +54,14 @@ export function useServerList(): {
         hint: serverHints[s.id]
       }
     })
-    // connected: the node the core uses right now, with *its* latency
+    // connected: the node the core uses right now, with *its* latency — the
+    // core's url-test number is «С подключением»; in the other «Пинг» modes the
+    // list's own measurement of that node is shown when there is one
     let autoPick = list.find((e) => e.id === autoSelectedId)
-    if (autoPick && autoDelayMs !== undefined) autoPick = { ...autoPick, latency: autoDelayMs }
+    const ownNumber = pingMode !== 'connect' && typeof autoPick?.latency === 'number'
+    if (autoPick && autoDelayMs !== undefined && !ownNumber) {
+      autoPick = { ...autoPick, latency: autoDelayMs }
+    }
     if (!autoPick && !autoChecking && !autoDead) {
       const measured = list.filter((e) => typeof e.latency === 'number')
       autoPick = measured.sort((a, b) => (a.latency as number) - (b.latency as number))[0]
@@ -80,5 +87,15 @@ export function useServerList(): {
     const entries = list.length ? [auto, ...list] : []
     const active = entries.find((e) => e.id === activeId) ?? (list.length ? auto : undefined)
     return { entries, active, autoPick: autoChecking || autoDead ? undefined : autoPick }
-  }, [servers, pings, activeId, autoSelectedId, autoDelayMs, autoChecking, autoDead, serverHints])
+  }, [
+    servers,
+    pings,
+    activeId,
+    autoSelectedId,
+    autoDelayMs,
+    autoChecking,
+    autoDead,
+    serverHints,
+    pingMode
+  ])
 }

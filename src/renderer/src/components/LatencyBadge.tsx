@@ -2,7 +2,7 @@ import { cn } from '../lib/cn'
 
 type Tone = 'green' | 'amber' | 'red' | 'none'
 
-/** ≤ 400 ms green, ≤ 900 amber, slower or no answer red (HTTPS round trip via the node). */
+/** ≤ 400 ms green, ≤ 900 amber, slower or no answer red (Settings → «Пинг» decides what is measured). */
 export function latencyTone(ms: number | null | undefined): Tone {
   if (ms === undefined) return 'none'
   if (ms === null) return 'red'
@@ -54,7 +54,7 @@ export function LatencyBadge({ ms, testing, className }: Props) {
         testing && 'animate-pulse',
         className
       )}
-      title={ms === null ? 'Сервер не ответил за 5 секунд' : undefined}
+      title={ms === null ? 'Сервер не ответил на проверку (Настройки → «Пинг»)' : undefined}
     >
       <span className={cn('h-1.5 w-1.5 rounded-full', DOT[tone])} />
       {ms === undefined ? '—' : ms === null ? 'нет ответа' : `${ms} мс`}

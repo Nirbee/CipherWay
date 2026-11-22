@@ -70,4 +70,15 @@ describe('RealityWatch', () => {
     expect(w.prune(GRACE + TTL)).toBe(true)
     expect(w.hints()).toEqual({})
   })
+
+  it('failing(): the servers the error was seen on, for the heal (0.5.2)', () => {
+    const w = new RealityWatch()
+    w.note(undefined, 0)
+    expect(w.failing()).toEqual([])
+    w.note('b', 1)
+    w.note('a', 2)
+    expect(w.failing()).toEqual(['b', 'a'])
+    w.resetServers()
+    expect(w.failing()).toEqual([])
+  })
 })

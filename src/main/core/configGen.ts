@@ -397,16 +397,34 @@ export function generateSingboxConfig(p: GenParams): SbConfig {
 export interface ProbeParams {
   outbounds: OutboundConfig[]
   clashApiPort: number
+  /** clash_api.secret (random per probe) */
+  clashSecret?: string
   logFile: string
   xrayPorts: Record<string, number>
+  /**
+   * node id → loopback port of its own SOCKS5 test inbound (the keepalive ping,
+   * core/latency.ts) — for the nodes sing-box carries itself (Hysteria2, VMess);
+   * VLESS nodes are tested through their xray inbound
+   */
+  testPorts?: Record<string, number>
+  /** RFC 1929 user/password of the test inbounds (random per probe) */
+  testAuth?: { username: string; password: string }
 }
 
+export const PING_INBOUND_PREFIX = 'ping-'
+
 /**
- * Throw-away instance for the latency test while the VPN is off: no inbounds
- * (no TUN, no system proxy), only the nodes + the Clash API to call
- * `/proxies/<id>/delay` on. Nothing on the machine is routed through it.
+ * Throw-away instance for the latency test (while the VPN is off — and, for the
+ * keepalive ping of Hysteria2 / VMess nodes, also while it is on): no TUN, no
+ * system proxy. Only the nodes, the Clash API to call `/proxies/<id>/delay` on,
+ * and per node an optional SOCKS5 test inbound on 127.0.0.1 (random port, with a
+ * random password) routed to exactly that node. Nothing on the machine is
+ * routed through it; the user's own core and its config are not touched (the
+ * TUN service's allow-list — `inbound = tun only` — never sees this config).
  */
 export function generateProbeConfig(p: ProbeParams): SbConfig {
+  const ids = new Set(p.outbounds.map((o) => o.id))
+  const tests = Object.entries(p.testPorts ?? {}).filter(([id]) => ids.has(id))
   return {
     log: { level: 'warn', output: p.logFile, timestamp: true },
     dns: {
@@ -415,15 +433,29 @@ export function generateProbeConfig(p: ProbeParams): SbConfig {
       strategy: 'ipv4_only'
     },
     experimental: {
-      clash_api: { external_controller: `127.0.0.1:${p.clashApiPort}` }
+      clash_api: {
+        external_controller: `127.0.0.1:${p.clashApiPort}`,
+        ...(p.clashSecret ? { secret: p.clashSecret } : {})
+      }
     },
-    inbounds: [],
+    inbounds: tests.map(([id, port]) => ({
+      type: 'socks',
+      tag: `${PING_INBOUND_PREFIX}${id}`,
+      listen: '127.0.0.1',
+      listen_port: port,
+      ...(p.testAuth ? { users: [p.testAuth] } : {})
+    })),
     outbounds: [
       ...p.outbounds.map((o) => buildOutbound(o, p.xrayPorts[o.id])),
       { type: 'direct', tag: TAG_DIRECT }
     ],
     route: {
-      rules: [],
+      // one rule per test inbound: it reaches its own node and nothing else
+      rules: tests.map(([id]) => ({
+        inbound: [`${PING_INBOUND_PREFIX}${id}`],
+        action: 'route' as const,
+        outbound: id
+      })),
       final: TAG_DIRECT,
       auto_detect_interface: true,
       default_domain_resolver: { server: 'local' }

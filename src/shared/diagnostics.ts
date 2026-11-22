@@ -35,6 +35,8 @@ export function buildDiagnostics(d: DiagnosticsInput, maxChars = Infinity, maxLi
         autoConnect: s.autoConnect,
         verboseLog: s.verboseLog,
         tunService: s.tunService,
+        pingMode: s.pingMode,
+        pingTimeoutSec: s.pingTimeoutSec,
         supportUrl: s.supportUrl ? 'задана' : ''
       }
     : null

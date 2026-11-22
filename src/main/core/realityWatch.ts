@@ -83,6 +83,11 @@ export class RealityWatch {
     return changed
   }
 
+  /** Servers the error was seen on since the last new config (newest last). */
+  failing(): string[] {
+    return [...this.lastSeen.entries()].sort((a, b) => a[1] - b[1]).map(([id]) => id)
+  }
+
   hints(): Record<string, string> {
     return Object.fromEntries([...this.hinted].map((id) => [id, REALITY_HINT]))
   }

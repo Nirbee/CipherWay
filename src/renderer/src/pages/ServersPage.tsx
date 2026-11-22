@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { AUTO_OUTBOUND_ID } from '@shared/types'
+import { AUTO_OUTBOUND_ID, type PingMode } from '@shared/types'
 import { PageHeader } from '../components/PageHeader'
 import { EmptyState } from '../components/EmptyState'
 import { Flag } from '../components/Flag'
@@ -10,17 +10,28 @@ import { useSubscription } from '../store/subscriptionStore'
 import { useServers } from '../store/serversStore'
 import { useConnection } from '../store/connectionStore'
 import { useNav } from '../store/navStore'
+import { useSettings } from '../store/settingsStore'
 import { useServerList, type ServerEntry } from '../hooks/useServerList'
 import { formatAgo, PROTOCOL_LABEL } from '../lib/format'
 import { cn } from '../lib/cn'
 
 type Sort = 'list' | 'latency'
 
+/** what the numbers mean, per Settings → «Пинг» */
+const PING_NOTE: Record<PingMode, string> = {
+  keepalive:
+    'Задержка — время ответа сайта через сервер по уже открытому соединению (как «Keepalive» в Happ). «Нет ответа» — сервер сейчас не пропускает трафик.',
+  connect:
+    'Задержка — время первого запроса к сайту через сервер вместе с установкой соединения (как url-test в Clash). «Нет ответа» — сервер сейчас не пропускает трафик.',
+  tcp: 'Время TCP-соединения с адресом сервера напрямую, без проверки VPN. Hysteria2 так не проверить — у него «нет ответа».'
+}
+
 export function ServersPage() {
   const { load } = useSubscription()
   const { testing, testedAt, test, select, loadActive, activeId } = useServers()
   const connected = useConnection((s) => s.state === 'connected')
   const setPage = useNav((s) => s.setPage)
+  const pingMode = useSettings((s) => s.settings?.pingMode)
   const { entries, autoPick } = useServerList()
   const [sort, setSort] = useState<Sort>('list')
 
@@ -123,8 +134,7 @@ export function ServersPage() {
               />
             ))}
             <p className="mt-3 px-1 text-[11px] leading-relaxed text-text-faint">
-              Задержка — время настоящего запроса к сайту через сервер (как в Clash url-test), а
-              не пинг до адреса. «Нет ответа» — сервер сейчас не пропускает трафик.
+              {PING_NOTE[pingMode ?? 'keepalive']} Способ проверки — в «Настройки» → «Пинг».
             </p>
           </div>
         )}

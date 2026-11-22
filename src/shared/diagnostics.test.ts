@@ -14,7 +14,9 @@ const settings: AppSettings = {
   subscriptionRefreshHours: 12,
   verboseLog: false,
   apiBase: 'https://cabinet.example.com',
-  tunService: true
+  tunService: true,
+  pingMode: 'keepalive',
+  pingTimeoutSec: 7
 }
 const logs: LogEntry[] = Array.from({ length: 500 }, (_, i) => ({
   ts: Date.UTC(2026, 10, 4, 12, 0, i % 60),

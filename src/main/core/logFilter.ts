@@ -43,7 +43,13 @@ const COLLAPSE: CollapseRule[] = [
 /** connection errors that repeat endlessly when a node or the direct route is dead */
 const CONN_KINDS: { re: RegExp; label: string }[] = [
   { re: /i\/o timeout|timed out|did not properly respond/i, label: 'нет ответа (timeout)' },
-  { re: /no recent network activity/i, label: 'нет активности (no recent network activity)' }
+  { re: /no recent network activity/i, label: 'нет активности (no recent network activity)' },
+  // a burst the moment Windows reconfigures an adapter (0.5.2: Teredo going down
+  // while sing-box still binds UDP for an address in its prefix to it)
+  {
+    re: /listen udp .*invalid argument/i,
+    label: 'UDP не открылся: сеть Windows перестраивается (invalid argument)'
+  }
 ]
 const OUTBOUND_RE = /\b(outbound\/[\w-]+\[[^\]]*\])/
 

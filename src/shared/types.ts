@@ -162,7 +162,28 @@ export interface AppSettings {
    * false = the user removed it: a UAC prompt on every TUN connect.
    */
   tunService: boolean
+  /** «Пинг» → what the server list measures (0.5.2) */
+  pingMode: PingMode
+  /** «Пинг» → seconds a server gets to answer (PING_TIMEOUT_MIN_S…MAX_S) */
+  pingTimeoutSec: number
 }
+
+/**
+ * How the server list measures latency (Settings → «Пинг», 0.5.2):
+ *  - keepalive: two HTTPS requests to the test page through the server over ONE
+ *    connection; the second one counts — the pure round trip through the tunnel
+ *    (no TCP / TLS / REALITY handshake). What Happ calls «via Proxy, Keepalive».
+ *  - connect: the whole first request, handshakes included (sing-box url-test —
+ *    what the app showed up to 0.5.1).
+ *  - tcp: TCP connect straight to the server's address, outside the VPN — says
+ *    nothing about whether the VPN works there.
+ */
+export type PingMode = 'keepalive' | 'connect' | 'tcp'
+export const PING_MODES: readonly PingMode[] = ['keepalive', 'connect', 'tcp']
+export const DEFAULT_PING_MODE: PingMode = 'keepalive'
+export const PING_TIMEOUT_MIN_S = 5
+export const PING_TIMEOUT_MAX_S = 15
+export const DEFAULT_PING_TIMEOUT_S = 7
 
 /** «Служба TUN» (Task Scheduler) as seen by the app. */
 export interface TunServiceInfo {

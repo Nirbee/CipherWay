@@ -438,3 +438,57 @@ the Headscale ACL). Code: `src/main/lan/`, UI: `src/renderer/src/pages/LanPage.t
   comes back on the next start. The 15 s count only runs while the window is visible
   *and* focused (and the mouse is not over the card). «Настройки» → «Обновления» has a
   permanent «Что нового» link next to the version (the whole bundled list).
+
+## 0.5.2: ping like Happ; REALITY heal compares with the running core; quieter LAN log
+
+- **Ping modes** (Settings → «Пинг», `AppSettings.pingMode` / `pingTimeoutSec`, 5–15 s,
+  default 7). Up to 0.5.1 the list showed Clash API `/proxies/<id>/delay` = sing-box
+  url-test: one HEAD of `https://www.gstatic.com/generate_204` through the node, TCP +
+  TLS (+ REALITY) handshakes included, 5 s timeout; while disconnected through
+  throw-away cores (xray + sing-box without inbounds). Now:
+  - **«Задержка» (`keepalive`, default)** — `core/latency.ts`: our own SOCKS5 client
+    opens the node's loopback entry, does TLS to gstatic (certificate checked) and two
+    `GET /generate_204` over ONE connection; the second one is the result (Happ's
+    «via Proxy (GET), Keepalive»). Entries: VLESS — xray's per-node SOCKS inbound (the
+    running xray while connected, a throw-away one otherwise); Hysteria2 / VMess — a
+    throw-away sing-box (`generateProbeConfig` with `testPorts`): one `socks` inbound per
+    node on `127.0.0.1:<random>` with a random user/password, route rule
+    `inbound → that node` only. It runs non-elevated next to the user's core, also in
+    TUN mode; the user's config is not touched, so the TUN service allow-list
+    (`inbound = tun only`) is unchanged.
+  - **«С подключением» (`connect`)** — exactly the old behaviour (Clash API delay), now
+    with the chosen timeout. The urltest group's own startup check fills the list only
+    in this mode.
+  - **«До сервера (TCP)» (`tcp`)** — TCP connect to the node address straight from the
+    app (name resolved first, not counted), outside the VPN. Hysteria2 (UDP) → «нет
+    ответа». Not saved into `latencyCache` (must not order «Лучший сервер»).
+- **REALITY heal** (`SubscriptionSync.heal(nodeIds)`): the fresh subscription is
+  compared with the outbounds the core is RUNNING (`SidecarManager.runningOutbounds`),
+  not with the stored copy; any difference of the failing node(s) (`RealityWatch.failing()`,
+  all running nodes if the error could not be attributed) — soft fields included —
+  restarts the core (still at most once per 10 min). The bug: «Финляндия» fp `qq` →
+  `firefox` was stored by a background refresh (soft field, no restart), the heal then
+  found no difference to the cache and the core kept `qq` until a manual reconnect.
+  Soft changes of the selected server are logged («Финляндия: отпечаток qq → firefox —
+  применится при следующем подключении») and applied with the next start; keys, ids,
+  passwords and addresses are named in the log, never printed.
+- **LAN log** (`lan/logLines.ts LanLogFolder`): «magicsock: endpoints changed», «control:
+  NetInfo», «LinkChange: major, rebinding» (shortened to its `diff:`) — the first line
+  stays, the rest become «… ещё строк: N за 5 мин» per kind; `[RATELIMIT]` dropped.
+  Errors, ipn state, login, router, peers untouched; «Подробный журнал» shows all.
+- **Checked, not changed**:
+  - tailscaled 1.104.7 advertises every up interface's address as a local endpoint
+    (`net/netmon/state.go LocalAddresses`), ours (`CipherWay`, 172.19.0.1) included.
+    The only exclusions are hard-coded (`isProblematicInterface`: names `zt*`, `wt0`,
+    `*ZeroTier*` on Windows; Tailscale's own IPs). No flag / env / syspolicy for it;
+    `TS_DEBUG_OMIT_LOCAL_ADDRS` drops ALL local endpoints (no direct LAN between
+    players on one network). Harmless: a peer's probe to 172.19.0.1 never gets a pong.
+  - «listen udp :0: An invalid argument was supplied» ×24 at a Teredo flap: sing-box
+    (1.13.21 / sing-tun 0.8.15) picks the default interface from the IPv4 `0.0.0.0/0`
+    routes only, skipping wintun (PropVirtual) and loopback, lowest route+interface
+    metric — Ethernet (25) over Radmin VPN (9256+1); Teredo has no IPv4 default route.
+    The burst comes from the per-destination bind (`NetworkManager.AutoDetectInterfaceFunc`:
+    `interfaceFinder.ByAddr(dest)` binds to the interface whose prefix holds the
+    destination — the Teredo /64 for peers' Teredo endpoints) while the interface is
+    being torn down. Only that burst is folded in the log (`logFilter.ts`); possible
+    config change (not made): `2001::/32` into `route_exclude_address`.

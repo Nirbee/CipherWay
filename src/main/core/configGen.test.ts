@@ -392,6 +392,49 @@ describe('generateProbeConfig (latency test while disconnected)', () => {
   })
 })
 
+describe('generateProbeConfig: keepalive test inbounds (0.5.2)', () => {
+  const hy2 = outbounds.find((o) => o.protocol === 'hysteria2')!
+  const auth = { username: 'cw', password: 'p4ss' }
+  const cfg = generateProbeConfig({
+    outbounds: [hy2],
+    clashApiPort: 19092,
+    clashSecret: 's3cret',
+    logFile: 'probe.log',
+    xrayPorts: {},
+    testPorts: { [hy2.id]: 20555, ob_unknown: 20556 },
+    testAuth: auth
+  })
+
+  it('one SOCKS inbound per node: loopback only, its own random port, password', () => {
+    expect(cfg.inbounds).toEqual([
+      {
+        type: 'socks',
+        tag: `ping-${hy2.id}`,
+        listen: '127.0.0.1',
+        listen_port: 20555,
+        users: [auth]
+      }
+    ])
+    // never 0.0.0.0 / :: — unreachable from the LAN
+    for (const i of cfg.inbounds) expect(i.listen).toBe('127.0.0.1')
+    expect(cfg.experimental?.clash_api?.secret).toBe('s3cret')
+  })
+
+  it('each test inbound reaches exactly its own node', () => {
+    expect(cfg.route.rules).toEqual([
+      { inbound: [`ping-${hy2.id}`], action: 'route', outbound: hy2.id }
+    ])
+    expect(cfg.outbounds.map((o) => o.tag)).toEqual([hy2.id, 'direct'])
+  })
+
+  it('the user’s own config never gets test inbounds (TUN service: inbound = tun only)', () => {
+    const tun = singbox({ proxyMode: 'tun' })
+    expect(tun.inbounds.map((i) => i.type)).toEqual(['tun'])
+    const sys = singbox({ proxyMode: 'system' })
+    expect(sys.inbounds.map((i) => i.type)).toEqual(['mixed'])
+  })
+})
+
 describe('TUN: node traffic of xray bypasses the TUN (0.4.1)', () => {
   type Tun = { route_exclude_address?: string[]; auto_route?: boolean }
 
@@ -688,6 +731,26 @@ describe('real core validation', () => {
       })
     }
   }
+
+  it.skipIf(!existsSync(SINGBOX))(
+    'sing-box check accepts the probe with test inbounds (0.5.2)',
+    () => {
+      const file = join(tmp, 'sing-box-probe.json')
+      const native = outbounds.filter((o) => o.protocol !== 'vless')
+      const cfg = generateProbeConfig({
+        outbounds,
+        clashApiPort: 19093,
+        clashSecret: 'x',
+        logFile: join(tmp, 'probe.log'),
+        xrayPorts,
+        testPorts: Object.fromEntries(native.map((o, i) => [o.id, 20600 + i])),
+        testAuth: { username: 'cw', password: 'p' }
+      })
+      expect(cfg.inbounds.length).toBe(native.length)
+      writeFileSync(file, JSON.stringify(cfg, null, 2))
+      check(SINGBOX, ['check', '-c', file])
+    }
+  )
 
   it.skipIf(!existsSync(SINGBOX))('sing-box check accepts the IPv4-only TUN config (0.4.6)', () => {
     const file = join(tmp, 'sing-box-tun-ipv4.json')

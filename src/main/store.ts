@@ -1,6 +1,8 @@
 import Store from 'electron-store'
 import {
   DEFAULT_API_BASE,
+  DEFAULT_PING_MODE,
+  DEFAULT_PING_TIMEOUT_S,
   type AppSettings,
   type RulesConfig,
   type SubscriptionData
@@ -47,7 +49,9 @@ export const DEFAULT_SETTINGS: AppSettings = {
   subscriptionRefreshHours: 12,
   verboseLog: false,
   apiBase: DEFAULT_API_BASE,
-  tunService: true
+  tunService: true,
+  pingMode: DEFAULT_PING_MODE,
+  pingTimeoutSec: DEFAULT_PING_TIMEOUT_S
 }
 
 export const DEFAULT_RULES: RulesConfig = {

@@ -33,7 +33,9 @@ export const TEST_SETTINGS: AppSettings = {
   subscriptionRefreshHours: 12,
   verboseLog: false,
   apiBase: 'https://cabinet.example.com',
-  tunService: true
+  tunService: true,
+  pingMode: 'keepalive',
+  pingTimeoutSec: 7
 }
 
 export const TEST_RULES: RulesConfig = {

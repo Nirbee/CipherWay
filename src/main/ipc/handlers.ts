@@ -3,6 +3,7 @@ import { isAbsolute, join } from 'node:path'
 import { app, BrowserWindow, ipcMain, dialog, shell, Notification, powerMonitor } from 'electron'
 import { z } from 'zod'
 import { IPC } from '@shared/ipc'
+import { PING_TIMEOUT_MAX_S, PING_TIMEOUT_MIN_S } from '@shared/types'
 import type {
   AppNotice,
   AppSettings,
@@ -52,7 +53,7 @@ import {
 import { SupportService } from '../support/SupportService'
 import { createLanService } from '../lan'
 import type { LanService } from '../lan/LanService'
-import { lanLogEntries } from '../lan/logLines'
+import { LanLogFolder } from '../lan/logLines'
 import { whatsNew, type ChangelogEntry } from '@shared/changelog'
 
 /** Set once handlers are registered; used for graceful shutdown / startup. */
@@ -141,7 +142,9 @@ const settingsPatchSchema = z
     httpPort: z.number().int().min(1).max(65535),
     subscriptionRefreshHours: z.number().int().min(1).max(168),
     verboseLog: z.boolean(),
-    apiBase: apiBaseSchema
+    apiBase: apiBaseSchema,
+    pingMode: z.enum(['keepalive', 'connect', 'tcp']),
+    pingTimeoutSec: z.number().int().min(PING_TIMEOUT_MIN_S).max(PING_TIMEOUT_MAX_S)
   })
   .partial()
 
@@ -366,7 +369,8 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
       adapterGate,
       // the store, not the snapshot a queued start / reload was built with
       routingMode: () => getSettings().routingMode,
-      onRealityHeal: () => void sync.heal().finally(() => manager.realityHealDone()),
+      pingMode: () => getSettings().pingMode,
+      onRealityHeal: (ids) => void sync.heal(ids).finally(() => manager.realityHealDone()),
       onServerHints: (hints) => {
         serverHints = hints
         publish(status)
@@ -383,6 +387,7 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
     getLatencies: () => store.get('latencyCache') ?? {},
     setLatencies: (v) => store.set('latencyCache', v),
     settingHours: () => getSettings().subscriptionRefreshHours,
+    running: () => manager.runningOutbounds,
     applyToCore: async () => {
       if (manager.reloadNeedsPrompt) {
         // TUN without the service: a restart would ask for admin rights out of the blue
@@ -502,9 +507,16 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
   // ---- servers -----------------------------------------------------------
   ipcMain.handle(IPC.serversPing, async (): Promise<ServerPing[]> => {
     const outbounds = remnawave.getCached()?.outbounds ?? []
-    const res = await manager.testLatency(outbounds)
-    // a «nothing answered» probe (e.g. offline) must not reorder the group
-    if (res.some((r) => r.latencyMs !== null)) saveLatencies(res, knownIds())
+    const { pingMode, pingTimeoutSec } = getSettings()
+    const res = await manager.testLatency(outbounds, {
+      mode: pingMode,
+      timeoutMs: pingTimeoutSec * 1000
+    })
+    // a «nothing answered» probe (e.g. offline) must not reorder the group; a TCP
+    // ping says nothing about the tunnel — it never orders «Лучший сервер»
+    if (pingMode !== 'tcp' && res.some((r) => r.latencyMs !== null)) {
+      saveLatencies(res, knownIds())
+    }
     return res
   })
 
@@ -804,6 +816,12 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
     }
     await manager.reload(buildStartParams()).catch(() => undefined)
   }
+  // the daemon's chatter on network changes is folded (lan/logLines.ts)
+  const lanFolder = new LanLogFolder()
+  const pushLan = (entries: LogEntry[]): void => {
+    for (const e of entries) logBatcher.push({ ...e, message: mask(e.message) })
+  }
+  setInterval(() => pushLan(lanFolder.tick()), 30_000).unref()
   const lan = createLanService({
     onBypassChange: syncLanBypass,
     adapterGate,
@@ -832,11 +850,7 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
     },
     publish: (v: LanView) => send(IPC.evtLan, v),
     log: lanLog,
-    daemonLog: (lines) => {
-      for (const e of lanLogEntries(lines, getSettings().verboseLog)) {
-        logBatcher.push({ ...e, message: mask(e.message) })
-      }
-    }
+    daemonLog: (lines) => pushLan(lanFolder.push(lines, getSettings().verboseLog))
   })
   lanService = lan
   lan.init()

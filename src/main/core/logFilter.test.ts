@@ -122,3 +122,19 @@ describe('LogFilter: connection errors that flood the log (0.4.5)', () => {
     expect(out).toHaveLength(2)
   })
 })
+
+describe('LogFilter: UDP burst while Windows reconfigures an adapter (0.5.2)', () => {
+  // a real sing-box.log: 24 of these within 6 ms (Teredo flapping)
+  const BURST = (n: number) =>
+    `ERROR [${n} 0ms] connection: listen packet connection using  using outbound/direct[direct]: listen udp :0: An invalid argument was supplied.`
+
+  it('the first line stays, the other 23 become one summary', () => {
+    const { f, out } = setup(1000)
+    for (let i = 0; i < 24; i++) f.push(line(BURST(i), i), false)
+    expect(out.map((e) => e.message)).toEqual([BURST(0)])
+    f.tick(1000)
+    expect(out[1].message).toBe(
+      '… ещё строк: 23 за 1 с (UDP не открылся: сеть Windows перестраивается (invalid argument), outbound/direct[direct])'
+    )
+  })
+})

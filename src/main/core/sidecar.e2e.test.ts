@@ -174,6 +174,99 @@ describe.skipIf(!enabled)('SidecarManager with real cores', () => {
     expect(existsSync(join(tmp, 'run', 'probe'))).toBe(false) // creds cleaned up
   }, 30_000)
 
+  it('ping modes (0.5.2): keepalive through xray / a sing-box test inbound, TCP, connect', async () => {
+    // a local VMess server (sing-box): the node type sing-box carries itself
+    const VMESS_PORT = 27_433
+    const vcfg = join(tmp, 'vmess-server.json')
+    writeFileSync(
+      vcfg,
+      JSON.stringify({
+        log: { level: 'warn' },
+        // DoH: plain DNS from a non-TUN sing-box hangs while a TUN with strict_route
+        // is up on the machine (Windows firewall rules against DNS leaks)
+        dns: { servers: [{ type: 'https', tag: 'doh', server: '77.88.8.8' }] },
+        route: { default_domain_resolver: { server: 'doh' } },
+        inbounds: [
+          {
+            type: 'vmess',
+            listen: '127.0.0.1',
+            listen_port: VMESS_PORT,
+            users: [{ uuid: UUID, alterId: 0 }]
+          }
+        ],
+        outbounds: [{ type: 'direct' }]
+      })
+    )
+    const vmessServer = spawn(SINGBOX, ['run', '-c', vcfg], { windowsHide: true })
+    const vmess: OutboundConfig = {
+      id: 'ob_vmess',
+      name: 'VMess',
+      protocol: 'vmess',
+      server: '127.0.0.1',
+      port: VMESS_PORT,
+      uuid: UUID
+    }
+    try {
+      await sleep(2000) // a cold start of the exe (antivirus scan) takes a while
+      const { SidecarManager } = await import('./SidecarManager')
+      const m = new SidecarManager(
+        () => undefined,
+        () => undefined,
+        () => undefined
+      )
+      const by = (res: ServerPing[]) =>
+        Object.fromEntries(res.map((r) => [r.outboundId, r.latencyMs]))
+
+      const keep = by(
+        await m.testLatency([live, vmess, dead], { mode: 'keepalive', timeoutMs: 7000 })
+      )
+      expect(typeof keep.ob_live).toBe('number')
+      expect(typeof keep.ob_vmess).toBe('number')
+      expect(keep.ob_dead).toBeNull()
+
+      const conn = by(
+        await m.testLatency([live, vmess, dead], { mode: 'connect', timeoutMs: 7000 })
+      )
+      expect(typeof conn.ob_live).toBe('number')
+      expect(typeof conn.ob_vmess).toBe('number')
+      expect(conn.ob_dead).toBeNull()
+
+      const tcp = by(await m.testLatency([live, vmess, dead], { mode: 'tcp', timeoutMs: 3000 }))
+      expect(typeof tcp.ob_live).toBe('number')
+      expect(typeof tcp.ob_vmess).toBe('number')
+      expect(tcp.ob_dead).toBeNull()
+
+      expect(m.isRunning).toBe(false)
+      expect(existsSync(join(tmp, 'run', 'probe'))).toBe(false) // creds cleaned up
+
+      // connected: VLESS through the running xray, VMess through a throw-away core
+      // next to the running one — whose config gets no test inbounds
+      await m.start({
+        outbounds: [live, vmess, dead],
+        activeOutboundId: 'ob_dead',
+        rules: TEST_RULES,
+        settings: { ...TEST_SETTINGS, httpPort: HTTP_PORT + 2 }
+      })
+      try {
+        const running = JSON.parse(readFileSync(join(tmp, 'run', 'config.json'), 'utf8'))
+        expect(running.inbounds.map((i: { type: string }) => i.type)).toEqual(['mixed'])
+        const on = by(
+          await m.testLatency([live, vmess, dead], { mode: 'keepalive', timeoutMs: 7000 })
+        )
+        // each node on its own: the selected (dead) one does not drag the others down
+        expect(typeof on.ob_live).toBe('number')
+        expect(typeof on.ob_vmess).toBe('number')
+        expect(on.ob_dead).toBeNull()
+        expect(m.isRunning).toBe(true)
+      } finally {
+        await m.stop()
+      }
+      expect(existsSync(join(tmp, 'run', 'probe'))).toBe(false)
+    } finally {
+      vmessServer.kill()
+    }
+  }, 90_000)
+
   it('connect → hot mode/server switch → connections → disconnect', async () => {
     const { SidecarManager } = await import('./SidecarManager')
     const { toConnItems } = await import('./connections')

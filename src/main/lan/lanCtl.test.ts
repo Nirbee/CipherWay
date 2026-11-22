@@ -10,7 +10,7 @@ import {
   pingArgs,
   upArgs
 } from './lanCtl'
-import { lanLogEntries } from './logLines'
+import { LAN_FOLD_WINDOW_MS, LanLogFolder, lanLogEntries } from './logLines'
 import { redactLan } from './redact'
 
 describe('cipherway-lanctl command lines (flags of tailscale 1.104.7)', () => {
@@ -244,5 +244,63 @@ describe('redaction of the LAN log', () => {
       ['warn', 'lan', 'control: login failed: 403 --auth-key=[скрыто]']
     ])
     expect(lanLogEntries(lines, true, 1)).toHaveLength(3)
+  })
+})
+
+describe('LAN log: chatter on network changes is folded (0.5.2)', () => {
+  const LINK =
+    'LinkChange: major, rebinding: old: interfaces.State{defaultRoute=Ethernet} new: interfaces.State{} diff: if Teredo Tunneling Pseudo-Interface: removed'
+  const chatter = [
+    `2026/11/21 16:50:46 ${LINK}`,
+    'magicsock: endpoints changed: 203.0.113.9:41642 (stun), 192.168.5.10:41642 (local)',
+    'control: NetInfo: NetInfo{varies=false ipv6=false udp=true}',
+    '[RATELIMIT] format("%s: staying on profile %q (%s)") (34 dropped)'
+  ]
+
+  it('first line of each kind stays, repeats become one count per 5 min, RATELIMIT is dropped', () => {
+    const f = new LanLogFolder()
+    const first = f.push(chatter, false, 0)
+    expect(first.map((e) => e.message.slice(0, 20))).toEqual([
+      'LinkChange: major, r',
+      'magicsock: endpoints',
+      'control: NetInfo: Ne'
+    ])
+    // public addresses still hidden; of a LinkChange only what changed
+    expect(first[1].message).toContain('x.x.x.x:41642')
+    expect(first[0].message).toBe(
+      'LinkChange: major, rebinding — if Teredo Tunneling Pseudo-Interface: removed'
+    )
+    // 40 more network changes within the window: nothing new on screen
+    for (let i = 1; i <= 40; i++) expect(f.push(chatter, false, i * 5000)).toEqual([])
+    expect(f.tick(LAN_FOLD_WINDOW_MS - 1)).toEqual([])
+    const sum = f.tick(LAN_FOLD_WINDOW_MS)
+    expect(sum.map((e) => e.message)).toEqual([
+      '… ещё строк: 40 за 5 мин (magicsock: endpoints changed)',
+      '… ещё строк: 40 за 5 мин (control: NetInfo)',
+      '… ещё строк: 40 за 5 мин (LinkChange: major, rebinding)'
+    ])
+    expect(sum.every((e) => e.source === 'lan' && e.level === 'info')).toBe(true)
+    // a new window starts with a visible line again
+    expect(f.push([LINK], false, LAN_FOLD_WINDOW_MS + 1)).toHaveLength(1)
+  })
+
+  it('errors, state changes, login and peers are never folded', () => {
+    const f = new LanLogFolder()
+    const keep = [
+      'Switching ipn state Starting -> Running (WantRunning=true)',
+      'control: doLogin(regen=false, hasUrl=false)',
+      'magicsock: disco: node [nf796] d:1a2b now using 192.168.5.20:41642 mtu=1360',
+      'control: NetInfo: failed to send: error 502'
+    ]
+    for (let i = 0; i < 3; i++) {
+      const out = f.push(keep, false, i * 1000)
+      expect(out.map((e) => e.message)).toEqual(keep)
+    }
+  })
+
+  it('«Подробный журнал»: nothing folded or dropped', () => {
+    const f = new LanLogFolder()
+    expect(f.push(chatter, true, 0)).toHaveLength(4)
+    expect(f.push(chatter, true, 1)).toHaveLength(4)
   })
 })

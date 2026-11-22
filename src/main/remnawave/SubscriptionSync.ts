@@ -1,7 +1,15 @@
-import type { LogEntry, SubscriptionData } from '@shared/types'
+import {
+  AUTO_OUTBOUND_ID,
+  type LogEntry,
+  type OutboundConfig,
+  type SubscriptionData
+} from '@shared/types'
 import {
   describeDiff,
+  describeFieldChanges,
   diffOutbounds,
+  fieldChanges,
+  runningChanges,
   reconcileActive,
   refreshIntervalMs,
   remapLatencies,
@@ -43,6 +51,11 @@ export interface SyncDeps {
   settingHours: () => number
   /** the core must pick the new list up (through its queue; no-op while disconnected) */
   applyToCore: () => void | Promise<void>
+  /**
+   * the servers the running core was started with (null = disconnected) — a
+   * soft change is stored at once but reaches the core only with its next start
+   */
+  running?: () => OutboundConfig[] | null
   /** the selected server changed */
   activeChanged: (id: string) => void
   log: (level: LogEntry['level'], message: string) => void
@@ -60,6 +73,8 @@ export interface RefreshOutcome {
 export class SubscriptionSync {
   private inflight: Promise<RefreshOutcome> | null = null
   private forceApply = false
+  /** heal(): ids of the servers REALITY failed on ([] = unknown → all) */
+  private healIds: string[] = []
   private lastAttempt = Number.NEGATIVE_INFINITY
   private timer: NodeJS.Timeout | null = null
 
@@ -124,18 +139,57 @@ export class SubscriptionSync {
     const next = data.outbounds
     const diff = diffOutbounds(prev, next)
     const force = this.forceApply
+    const healIds = this.healIds
     this.forceApply = false
+    this.healIds = []
+    // after a REALITY error: what the core RUNS, not the stored copy — a soft
+    // change (fingerprint, shortId) stored by an earlier refresh never reached it
+    // (0.5.2: «Финляндия» stayed on fingerprint qq until a manual reconnect)
+    const running = force ? (this.d.running?.() ?? null) : null
+    const stale = running ? runningChanges(running, next, healIds) : []
 
     this.d.setLatencies(remapLatencies(this.d.getLatencies(), prev, next))
     this.applyChoice(prev, next)
+    if (!force) this.noteSelectedSoft(prev, next, diff.softOnly)
 
-    const restart = prev.length > 0 && (diff.restartNeeded || (force && diff.softOnly.length > 0))
+    const restart =
+      prev.length > 0 &&
+      (diff.restartNeeded || stale.length > 0 || (force && !running && diff.softOnly.length > 0))
     if (restart) {
       const what = describeDiff(diff) || `обновились параметры: ${diff.softOnly.join(', ')}`
-      this.d.log('info', `Подписка изменилась (${what})`)
+      if (stale.length) {
+        for (const c of stale) this.d.log('info', describeFieldChanges(c.name, c.changes))
+        this.d.log(
+          'info',
+          `Ядро работает со старыми параметрами (${stale.map((c) => c.name).join(', ')}) — перезапускаем`
+        )
+      }
+      if (diff.restartNeeded || !stale.length) this.d.log('info', `Подписка изменилась (${what})`)
       void Promise.resolve(this.d.applyToCore()).catch(() => undefined)
     }
-    return { data, changed: diff.restartNeeded, diff }
+    return { data, changed: diff.restartNeeded || stale.length > 0, diff }
+  }
+
+  /**
+   * Soft fields of the SELECTED server changed: stored, applied at the next
+   * start — not now (the panel varies shortId / fingerprint from one request to
+   * the next; a restart each time would cut every connection). Logged, so it is
+   * clear why the core still uses the old ones.
+   */
+  private noteSelectedSoft(
+    prev: OutboundConfig[],
+    next: OutboundConfig[],
+    softOnly: string[]
+  ): void {
+    const id = this.d.getActive()
+    if (!id || id === AUTO_OUTBOUND_ID || !softOnly.length) return
+    const b = next.find((o) => o.id === id)
+    const a = b && prev.find((o) => o.name === b.name)
+    if (!a || !b || !softOnly.includes(b.name)) return
+    this.d.log(
+      'info',
+      `${describeFieldChanges(b.name, fieldChanges(a, b))} — применится при следующем подключении`
+    )
   }
 
   /** Before a connect: never holds it up longer than the short timeout. */
@@ -160,13 +214,21 @@ export class SubscriptionSync {
     }
   }
 
-  /** Reaction to a REALITY error: everything that changed is applied. */
-  async heal(): Promise<void> {
+  /**
+   * Reaction to a REALITY error: the fresh subscription is compared with what
+   * the core runs; any difference of the failing server(s) — soft fields
+   * included — means a restart (the manager's REALITY cooldown limits how often).
+   * @param nodeIds servers the error was seen on ([] = not known: all of them)
+   */
+  async heal(nodeIds: string[] = []): Promise<void> {
     if (!this.d.url()) return
     this.d.log('info', 'Сервер ответил чужим сертификатом — проверяем подписку')
     try {
+      // a refresh already in flight was not asked to compare: wait, then ask
+      if (this.inflight) await this.inflight.catch(() => undefined)
+      this.healIds = [...nodeIds]
       const res = await this.refresh({ timeoutMs: HEAL_REFRESH_TIMEOUT_MS, force: true })
-      if (!res.changed && res.diff.softOnly.length === 0) {
+      if (!res.changed && (this.d.running?.() || res.diff.softOnly.length === 0)) {
         this.d.log('info', 'В подписке нет новых ключей для этого сервера')
       }
     } catch (err) {

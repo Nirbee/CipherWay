@@ -8,12 +8,15 @@ import { join } from 'node:path'
 import { app } from 'electron'
 import {
   AUTO_OUTBOUND_ID,
+  DEFAULT_PING_MODE,
+  DEFAULT_PING_TIMEOUT_S,
   type AppNotice,
   type AppSettings,
   type AutoInfo,
   type ConnectionState,
   type LogEntry,
   type OutboundConfig,
+  type PingMode,
   type RoutingMode,
   type RulesConfig,
   type ServerPing,
@@ -30,7 +33,8 @@ import {
 import { generateXrayConfig, isXrayHandled, type XrayBridge } from './xrayGen'
 import { CORE_EXE, XRAY_EXE } from './coreNames'
 import { ClashApi } from './clashApi'
-import { CLASH_MODE, LATENCY_TIMEOUT_MS, TAG_AUTO, TAG_PROXY_GROUP } from './sbTypes'
+import { CLASH_MODE, LATENCY_TIMEOUT_MS, LATENCY_URL, TAG_AUTO, TAG_PROXY_GROUP } from './sbTypes'
+import { keepaliveMs, tcpPing, type SocksTarget } from './latency'
 import { hasTunAdapter, type CoreExit } from './broker'
 import { LegacyLauncher, TunService, type LauncherPaths, type TunLauncher } from './tunService'
 import { writeAtomic } from './atomicFile'
@@ -69,8 +73,11 @@ export interface StartParams {
 export interface ManagerHooks {
   /** a toast for the user */
   onNotice?: (n: AppNotice) => void
-  /** REALITY errors: the subscription should be fetched (call realityHealDone() after) */
-  onRealityHeal?: () => void
+  /**
+   * REALITY errors: the subscription should be fetched (call realityHealDone()
+   * after); `nodeIds` = the servers the error was seen on ([] = not known)
+   */
+  onRealityHeal?: (nodeIds: string[]) => void
   /** node id → hint for the server list */
   onServerHints?: (hints: Record<string, string>) => void
   /**
@@ -85,6 +92,18 @@ export interface ManagerHooks {
   ipv6Probe?: () => Promise<Ipv6Status>
   /** TUN: the LAN daemon and the core never create their wintun adapters at once */
   adapterGate?: AdapterGateLike
+  /** Settings → «Пинг» as chosen now: the core's own check fills the list only in «connect» */
+  pingMode?: () => PingMode
+}
+
+/** How the server list is measured (Settings → «Пинг», see PingMode). */
+export interface PingOptions {
+  mode: PingMode
+  timeoutMs: number
+}
+export const DEFAULT_PING: PingOptions = {
+  mode: DEFAULT_PING_MODE,
+  timeoutMs: DEFAULT_PING_TIMEOUT_S * 1000
 }
 
 /** a core that died is restarted up to this many times, after these pauses */
@@ -401,6 +420,10 @@ export class SidecarManager {
   /** tests: pid of xray */
   get xrayPid(): number | undefined {
     return this.xray?.pid
+  }
+  /** the servers the running core was started with (null = disconnected) */
+  get runningOutbounds(): OutboundConfig[] | null {
+    return this.running ? (this.coreGen?.outbounds ?? null) : null
   }
   /** the running core lets the LAN daemon bypass the VPN (configGen lanRules) */
   get lanBypass(): boolean {
@@ -1092,7 +1115,7 @@ export class SidecarManager {
     const res = this.reality.note(nodeId)
     if (res.hintsChanged) this.publishHints()
     if (res.heal) {
-      if (this.hooks.onRealityHeal) this.hooks.onRealityHeal()
+      if (this.hooks.onRealityHeal) this.hooks.onRealityHeal(this.reality.failing())
       else this.reality.healDone()
     }
   }
@@ -1318,50 +1341,127 @@ export class SidecarManager {
   }
 
   /**
-   * Real latency of every node: an HTTP request to generate_204 through the
-   * node itself (Clash API `/delay`), in parallel, 5 s timeout. While
-   * disconnected a throw-away xray + sing-box pair (no inbounds) is started
-   * just for the test and stopped right after.
+   * Latency of every node for the server list, each node on its own (never
+   * through the selected one), in parallel (Settings → «Пинг», 0.5.2):
+   *  - keepalive: two GETs of generate_204 over one connection through the
+   *    node's loopback SOCKS entry, the second one counts (core/latency.ts).
+   *    VLESS: xray's per-node inbound (the running one, or a throw-away xray);
+   *    Hysteria2 / VMess: per-node test inbounds of a throw-away sing-box
+   *    (generateProbeConfig) — the user's core and its config stay untouched;
+   *  - connect: Clash API `/delay` (sing-box url-test: the whole first request,
+   *    handshakes included) — through the running core, or throw-away cores
+   *    while disconnected (what 0.4.0–0.5.1 did);
+   *  - tcp: TCP connect to the node's address, no core at all.
+   * Throw-away cores: no TUN, no system proxy, loopback only, stopped right after.
    */
-  async testLatency(outbounds: OutboundConfig[]): Promise<ServerPing[]> {
+  async testLatency(
+    outbounds: OutboundConfig[],
+    opts: PingOptions = DEFAULT_PING
+  ): Promise<ServerPing[]> {
+    if (opts.mode === 'tcp') return this.tcpPings(outbounds, opts.timeoutMs)
     const api = this.clash
-    if (api) return this.measure(api, outbounds)
+    if (api && opts.mode === 'connect') return this.measure(api, outbounds, opts.timeoutMs)
     if (this.starting) return outbounds.map((o) => ({ outboundId: o.id, latencyMs: null }))
-    this.probing ??= this.probe(outbounds).finally(() => {
+    this.probing ??= this.probe(outbounds, opts).finally(() => {
       this.probing = null
     })
     return this.probing
   }
 
-  private async measure(api: ClashApi, outbounds: OutboundConfig[]): Promise<ServerPing[]> {
+  private async measure(
+    api: ClashApi,
+    outbounds: OutboundConfig[],
+    timeoutMs = LATENCY_TIMEOUT_MS
+  ): Promise<ServerPing[]> {
     const res = await Promise.all(
-      outbounds.map(async (o) => ({ outboundId: o.id, latencyMs: await api.delay(o.id) }))
+      outbounds.map(async (o) => ({
+        outboundId: o.id,
+        latencyMs: await api.delay(o.id, timeoutMs)
+      }))
     )
     this.remember(res)
     return res
+  }
+
+  private async measureKeepalive(
+    outbounds: OutboundConfig[],
+    targets: Record<string, SocksTarget>,
+    timeoutMs: number
+  ): Promise<ServerPing[]> {
+    const res = await Promise.all(
+      outbounds.map(async (o) => ({
+        outboundId: o.id,
+        latencyMs: await keepaliveMs(targets[o.id], LATENCY_URL, timeoutMs)
+      }))
+    )
+    this.remember(res)
+    return res
+  }
+
+  /**
+   * «До сервера (TCP)»: straight to the node's address, outside the VPN. Not
+   * remembered — it says nothing about the tunnel, so it must not order «auto».
+   * Hysteria2 runs over UDP: no TCP port to knock on → «нет ответа».
+   */
+  private async tcpPings(outbounds: OutboundConfig[], timeoutMs: number): Promise<ServerPing[]> {
+    return Promise.all(
+      outbounds.map(async (o) => ({
+        outboundId: o.id,
+        latencyMs: o.protocol === 'hysteria2' ? null : await tcpPing(o.server, o.port, timeoutMs)
+      }))
+    )
   }
 
   private remember(pings: ServerPing[]): void {
     for (const p of pings) this.recentPings[p.outboundId] = p.latencyMs
   }
 
-  private async probe(outbounds: OutboundConfig[]): Promise<ServerPing[]> {
+  /** The ping mode chosen now (the store), else the one of the last start. */
+  private pingMode(): PingMode {
+    return this.hooks.pingMode?.() ?? this.lastParams?.settings.pingMode ?? DEFAULT_PING_MODE
+  }
+
+  private async probe(outbounds: OutboundConfig[], opts: PingOptions): Promise<ServerPing[]> {
     const none = outbounds.map((o) => ({ outboundId: o.id, latencyMs: null }))
     if (outbounds.length === 0 || !existsSync(this.exePath())) return none
+    const keepalive = opts.mode === 'keepalive'
+    // connected (keepalive only gets here then): VLESS through the running xray
+    const live = this.running && this.coreGen ? this.coreGen.xrayPorts : null
     const dir = join(this.runDir, 'probe')
     await mkdir(dir, { recursive: true })
     let xray: ChildProcess | null = null
     let core: ChildProcess | null = null
     try {
       const clashPort = await findFreePort(0)
-      const vless = outbounds.filter(isXrayHandled)
-      const bridges = existsSync(this.xrayExePath())
-        ? await allocBridges(vless, new Set([clashPort]))
-        : []
-      const usable = outbounds.filter(
-        (o) => !isXrayHandled(o) || bridges.some((b) => b.outbound.id === o.id)
-      )
+      const taken = new Set([clashPort, ...Object.values(live ?? {})])
+      const targets: Record<string, SocksTarget> = {}
+      let bridges: XrayBridge[] = []
+      let coreNodes: OutboundConfig[]
+      if (live) {
+        for (const o of outbounds.filter(isXrayHandled)) {
+          if (live[o.id]) targets[o.id] = { port: live[o.id] }
+        }
+        coreNodes = outbounds.filter((o) => !isXrayHandled(o))
+      } else {
+        const vless = outbounds.filter(isXrayHandled)
+        bridges = existsSync(this.xrayExePath()) ? await allocBridges(vless, taken) : []
+        for (const b of bridges) targets[b.outbound.id] = { port: b.port }
+        coreNodes = outbounds.filter(
+          (o) => !isXrayHandled(o) || bridges.some((b) => b.outbound.id === o.id)
+        )
+      }
       const xrayPorts = Object.fromEntries(bridges.map((b) => [b.outbound.id, b.port]))
+
+      // keepalive: a loopback SOCKS test inbound for each node sing-box carries itself
+      const auth = { username: 'cw', password: randomBytes(12).toString('hex') }
+      const testPorts: Record<string, number> = {}
+      if (keepalive) {
+        const native = coreNodes.filter((o) => !isXrayHandled(o))
+        for (const b of await allocBridges(native, taken)) {
+          testPorts[b.outbound.id] = b.port
+          targets[b.outbound.id] = { port: b.port, user: auth.username, pass: auth.password }
+        }
+      }
 
       if (bridges.length) {
         const xcfg = join(dir, 'xray.json')
@@ -1373,40 +1473,62 @@ export class SidecarManager {
         xray.stdout?.resume()
         xray.stderr?.resume()
       }
-      const cfgPath = join(dir, 'sing-box.json')
-      const cfg = generateProbeConfig({
-        outbounds: usable,
-        clashApiPort: clashPort,
-        logFile: join(dir, 'sing-box.log'),
-        xrayPorts
-      })
-      await writeFile(cfgPath, JSON.stringify(cfg), 'utf8')
-      core = spawn(this.exePath(), ['run', '-c', cfgPath], { cwd: this.binDir, windowsHide: true })
-      core.stdout?.resume()
-      core.stderr?.resume()
 
-      const api = new ClashApi(clashPort)
-      const deadline = Date.now() + PROBE_READY_TIMEOUT_MS
-      let up = false
-      while (Date.now() < deadline && core.exitCode === null) {
-        if (await api.ping()) {
-          up = true
-          break
+      // sing-box: for «connect» (its Clash API) and for the test inbounds
+      let api: ClashApi | null = null
+      const needCore = keepalive ? Object.keys(testPorts).length > 0 : coreNodes.length > 0
+      if (needCore) {
+        const secret = randomBytes(16).toString('hex')
+        const cfgPath = join(dir, 'sing-box.json')
+        const cfg = generateProbeConfig({
+          outbounds: coreNodes,
+          clashApiPort: clashPort,
+          clashSecret: secret,
+          logFile: join(dir, 'sing-box.log'),
+          xrayPorts,
+          ...(keepalive ? { testPorts, testAuth: auth } : {})
+        })
+        await writeFile(cfgPath, JSON.stringify(cfg), 'utf8')
+        const proc = spawn(this.exePath(), ['run', '-c', cfgPath], {
+          cwd: this.binDir,
+          windowsHide: true
+        })
+        core = proc
+        proc.stdout?.resume()
+        proc.stderr?.resume()
+        const probeApi = new ClashApi(clashPort, secret)
+        const deadline = Date.now() + PROBE_READY_TIMEOUT_MS
+        let up = false
+        while (Date.now() < deadline && proc.exitCode === null) {
+          if (await probeApi.ping()) {
+            up = true
+            break
+          }
+          await sleep(150)
         }
-        await sleep(150)
-      }
-      if (!up) {
-        this.log('warn', 'app', 'Проверка задержки: временное ядро не запустилось')
-        return none
+        if (up) {
+          api = probeApi
+          await this.waitPorts(Object.values(testPorts), () => proc.exitCode === null)
+        } else {
+          this.log('warn', 'app', 'Проверка задержки: временное ядро не запустилось')
+          if (!keepalive) return none
+          // keepalive: the VLESS nodes can still be measured
+          for (const id of Object.keys(testPorts)) delete targets[id]
+        }
       }
       // xray needs a moment to bind its inbounds too
-      if (bridges.length) {
-        const xd = Date.now() + XRAY_READY_TIMEOUT_MS
-        while (Date.now() < xd && xray?.exitCode === null && !(await probePort(bridges[0].port))) {
-          await sleep(100)
-        }
+      const x = xray
+      if (x && bridges.length) {
+        await this.waitPorts(
+          bridges.map((b) => b.port),
+          () => x.exitCode === null
+        )
       }
-      const measured = await this.measure(api, usable)
+
+      let measured: ServerPing[]
+      if (keepalive) measured = await this.measureKeepalive(outbounds, targets, opts.timeoutMs)
+      else if (api) measured = await this.measure(api, coreNodes, opts.timeoutMs)
+      else return none
       const byId = new Map(measured.map((m) => [m.outboundId, m.latencyMs]))
       return outbounds.map((o) => ({ outboundId: o.id, latencyMs: byId.get(o.id) ?? null }))
     } catch (err) {
@@ -1421,6 +1543,19 @@ export class SidecarManager {
       await killProc(xray)
       // configs hold node credentials — don't leave them around
       await rm(dir, { recursive: true, force: true }).catch(() => undefined)
+    }
+  }
+
+  /** Until every port accepts connections (≤ XRAY_READY_TIMEOUT_MS) or `alive()` turns false. */
+  private async waitPorts(ports: number[], alive: () => boolean): Promise<void> {
+    const pending = new Set(ports)
+    const deadline = Date.now() + XRAY_READY_TIMEOUT_MS
+    while (pending.size && Date.now() < deadline && alive()) {
+      const res = await Promise.all(
+        [...pending].map(async (pt) => [pt, await probePort(pt)] as const)
+      )
+      for (const [pt, ok] of res) if (ok) pending.delete(pt)
+      if (pending.size) await sleep(100)
     }
   }
 
@@ -1559,7 +1694,9 @@ export class SidecarManager {
         }))
         anyAlive = pings.some((x) => x.latencyMs !== null)
         this.remember(pings)
-        this.onPings(pings)
+        // url-test numbers are «С подключением»: the list shows them only in that
+        // mode — otherwise they would overwrite the keepalive / TCP values
+        if (this.pingMode() === 'connect') this.onPings(pings)
       }
       const dead = (!st?.now || st.delay === undefined) && !anyAlive
       if (!dead) {
