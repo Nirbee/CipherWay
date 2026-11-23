@@ -55,12 +55,17 @@ import { createLanService } from '../lan'
 import type { LanService } from '../lan/LanService'
 import { LanLogFolder } from '../lan/logLines'
 import { whatsNew, type ChangelogEntry } from '@shared/changelog'
+import { DEV_STATUS_OFF } from '@shared/devversion'
+import { devAcceptSchema, devProcessSchema } from '../devversion/consent'
+import { DevVersionService } from '../devversion/DevVersionService'
+import { TelemetryApi } from '../devversion/api'
 
 /** Set once handlers are registered; used for graceful shutdown / startup. */
 export let activeManager: SidecarManager | null = null
 export let appUpdater: AppUpdater | null = null
 export let supportService: SupportService | null = null
 export let lanService: LanService | null = null
+export let devService: DevVersionService | null = null
 
 type GetWindow = () => BrowserWindow | null
 
@@ -206,8 +211,9 @@ function buildStartParams() {
     rules: store.get('rules'),
     settings: getSettings(),
     latencies: store.get('latencyCache') ?? {},
-    // its refresh must work while the tunnel is broken (a stale REALITY key)
-    directHosts: subscriptionHosts(),
+    // its refresh must work while the tunnel is broken (a stale REALITY key);
+    // DevVersion: the bot's host too — the server tells the provider by the IP
+    directHosts: [...new Set([...subscriptionHosts(), ...devApiHosts()])],
     // LAN on: its daemon (the service's copy) and its login server bypass the VPN
     ...(lanWanted() ? { lan: { exePath: lanExePath, loginHost: lanLoginHost() } } : {})
   }
@@ -241,6 +247,13 @@ function subscriptionHosts(): string[] {
   } catch {
     return []
   }
+}
+
+/** DevVersion on: the bot API's host (its reports must not go through the VPN). */
+function devApiHosts(): string[] {
+  if (store.get('devVersion')?.enabled !== true) return []
+  const host = TelemetryApi.host(getSettings().apiBase)
+  return host ? [host] : []
 }
 
 /** Remembers latencies across runs (orders «Лучший сервер (авто)» next time). */
@@ -282,6 +295,7 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
   status = { state: 'disconnected', activeOutboundId: store.get('activeOutboundId') ?? undefined }
   let serverHints: Record<string, string> = {}
   const publish = (next: StatusUpdate): void => {
+    devService?.onVpnStatus(next.state)
     status = { ...next, serverHints }
     send(IPC.evtStatus, status)
     for (const cb of statusListeners) cb(status)
@@ -374,7 +388,10 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
       onServerHints: (hints) => {
         serverHints = hints
         publish(status)
-      }
+      },
+      // DevVersion: the snapshots / log lines the manager sees anyway
+      onConnections: (raw) => devService?.onConnections(raw),
+      onCoreLine: (source, line, nodeId) => devService?.onCoreLine(source, line, nodeId)
     }
   )
 
@@ -706,7 +723,10 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
     if (parsed.proxyMode && parsed.proxyMode !== prev.proxyMode && manager.isRunning) {
       void manager.reload(buildStartParams()).catch(() => undefined)
     }
-    if (parsed.apiBase && parsed.apiBase !== prev.apiBase) support.reset()
+    if (parsed.apiBase && parsed.apiBase !== prev.apiBase) {
+      support.reset()
+      void syncDirectHosts()
+    }
     return next
   })
 
@@ -878,6 +898,84 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
   ipcMain.handle(IPC.lanDeleteDevice, async (_e, nodeId: unknown) =>
     lan.deleteDevice(lanIdSchema.parse(nodeId))
   )
+
+  // ---- «DevVersion» ---------------------------------------------------------
+  /** the running core's direct hosts = what buildStartParams wants (the bot's host) */
+  const syncDirectHosts = async (): Promise<void> => {
+    if (!manager.isRunning) return
+    const want = [...(buildStartParams().directHosts ?? [])].sort().join(' ')
+    const have = [...manager.directHosts].sort().join(' ')
+    if (want === have) return
+    if (manager.proxyMode !== 'tun') return // Node's own requests skip the system proxy anyway
+    if (manager.reloadNeedsPrompt) {
+      notify({
+        text: 'DevVersion: переподключите VPN, чтобы отчёты уходили напрямую, мимо VPN',
+        tone: 'info'
+      })
+      return
+    }
+    await manager.reload(buildStartParams()).catch(() => undefined)
+  }
+  const dev = new DevVersionService({
+    dir: join(app.getPath('userData'), 'devversion'),
+    appVersion: app.getVersion(),
+    getConsent: () => store.get('devVersion') ?? null,
+    setConsent: (c) => store.set('devVersion', c),
+    getLastUpload: () => store.get('devVersionLastUpload') ?? null,
+    setLastUpload: (u) => store.set('devVersionLastUpload', u),
+    api: new TelemetryApi(async () => ({
+      apiBase: getSettings().apiBase,
+      subscriptionUrl: getSubscriptionUrl(),
+      deviceHeaders: await remnawave.deviceHeaders()
+    })),
+    apiHost: () => TelemetryApi.host(getSettings().apiBase),
+    manager,
+    outbounds: () => remnawave.getCached()?.outbounds ?? [],
+    hidden: () =>
+      new Set([
+        ...nodeAddressSet(remnawave.getCached()?.outbounds ?? []),
+        ...serverIps.map((ip) => ip.toLowerCase())
+      ]),
+    mask: () => mask,
+    proxyMode: () => getSettings().proxyMode,
+    coreExe: join(manager.binDir, CORE_EXE),
+    xrayExe: join(manager.binDir, XRAY_EXE),
+    log: (level, msg) => appLog(level, msg),
+    onDirectHostsChange: syncDirectHosts
+  })
+  devService = dev
+  dev.init()
+
+  ipcMain.handle(IPC.devGet, async () => dev.status())
+  ipcMain.handle(IPC.devStats, async () => dev.stats())
+  ipcMain.handle(IPC.devEnable, async (_e, accept: unknown) => {
+    const a = devAcceptSchema.parse(accept)
+    return dev.enable(a.consentVersion)
+  })
+  ipcMain.handle(IPC.devDisable, async (_e, deleteRemote: unknown) => {
+    const res = await dev.disable(z.boolean().parse(deleteRemote))
+    return { status: { ...DEV_STATUS_OFF }, ...res }
+  })
+  ipcMain.handle(IPC.devDeleteRemote, async () => dev.deleteRemote())
+  ipcMain.handle(IPC.devSendNow, async () => dev.sendNow())
+  ipcMain.handle(IPC.devSaveReport, async (): Promise<string | null> => {
+    const text = await dev.reportText()
+    const win = getWindow()
+    const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')
+    const { canceled, filePath } = await dialog.showSaveDialog(win ?? undefined!, {
+      title: 'Сохранить отчёт DevVersion',
+      defaultPath: `cipherway-devversion-${stamp}.json`,
+      filters: [{ name: 'JSON', extensions: ['json'] }]
+    })
+    if (canceled || !filePath) return null
+    await writeFile(filePath, text, 'utf8')
+    return filePath
+  })
+  ipcMain.handle(IPC.devGameCandidates, async () => dev.gameCandidates())
+  ipcMain.handle(IPC.devGameStart, async (_e, name: unknown) =>
+    dev.gameStart(devProcessSchema.parse(name))
+  )
+  ipcMain.handle(IPC.devGameStop, async () => dev.gameStop())
 
   // ---- «Что нового» -------------------------------------------------------
   // decided once per start; a fresh install only records its version

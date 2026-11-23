@@ -16,6 +16,7 @@ import {
   activeManager,
   appUpdater,
   connectVpn,
+  devService,
   disconnectVpn,
   getVpnStatus,
   lanService,
@@ -335,7 +336,12 @@ if (!app.requestSingleInstanceLock()) {
     e.preventDefault()
     cleanupDone = true
     // LAN stops with the app (the switch is remembered for the next start)
-    void Promise.all([disconnectVpn(), lanService?.shutdown().catch(() => undefined)])
+    void Promise.all([
+      disconnectVpn(),
+      lanService?.shutdown().catch(() => undefined),
+      // DevVersion: the period so far goes to disk (sent after the next start)
+      devService?.shutdown().catch(() => undefined)
+    ])
       .then(async () => {
         // a downloaded update is installed on quit: its installer needs the cores gone
         // («Перезапустить и обновить» = phase 'installing' has waited already)

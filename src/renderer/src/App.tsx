@@ -9,6 +9,8 @@ import { useSettings } from './store/settingsStore'
 import { useSubscription } from './store/subscriptionStore'
 import { useServers } from './store/serversStore'
 import { useSupport } from './store/supportStore'
+import { useDev } from './store/devStore'
+import { applyEdition } from './lib/edition'
 import { toast } from './store/toastStore'
 import { PAGE_KEYS, type PageKey } from './store/navStore'
 import { ConnectionsPage } from './pages/ConnectionsPage'
@@ -21,6 +23,7 @@ import { SubscriptionPage } from './pages/SubscriptionPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { SupportPage } from './pages/SupportPage'
 import { LanPage } from './pages/LanPage'
+import { StatsPage } from './pages/StatsPage'
 import { ImportSubscriptionDialog } from './components/ImportSubscriptionDialog'
 import { WhatsNew } from './components/WhatsNew'
 import { cn } from './lib/cn'
@@ -39,6 +42,17 @@ export default function App() {
   const setSubscription = useSubscription((s) => s.set)
   const setActiveLocal = useServers((s) => s.setActiveLocal)
   const [maximized, setMaximized] = useState(false)
+  const devOn = useDev((s) => s.status.enabled)
+  const loadDev = useDev((s) => s.load)
+
+  // DevVersion: the silver accent + «Статистика»
+  useEffect(() => {
+    void loadDev().catch(() => undefined)
+  }, [loadDev])
+  useEffect(() => {
+    applyEdition(document.documentElement, devOn)
+    if (!devOn && useNav.getState().page === 'stats') setPage('settings')
+  }, [devOn, setPage])
 
   // wire main-process push events into the stores once
   useEffect(() => {
@@ -138,6 +152,8 @@ function PageView({ page }: { page: string }) {
       return <LogsPage />
     case 'settings':
       return <SettingsPage />
+    case 'stats':
+      return <StatsPage />
     default:
       return null
   }

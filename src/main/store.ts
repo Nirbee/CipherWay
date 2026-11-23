@@ -7,6 +7,7 @@ import {
   type RulesConfig,
   type SubscriptionData
 } from '@shared/types'
+import type { DevLastUpload, DevVersionConsent } from '@shared/devversion'
 
 interface Schema {
   settings: AppSettings
@@ -35,6 +36,10 @@ interface Schema {
   lanHostname: string | null
   /** «Что нового»: the app version whose changes the user has seen (null = never) */
   whatsNewSeenVersion: string | null
+  /** «DevVersion»: the accepted consent while the mode is on (null = off) */
+  devVersion: DevVersionConsent | null
+  /** «DevVersion»: the result of the last upload (shown on «Статистика») */
+  devVersionLastUpload: DevLastUpload | null
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -90,7 +95,9 @@ export const store = new Store<Schema>({
     lanEnabled: false,
     lanLoginServer: null,
     lanHostname: null,
-    whatsNewSeenVersion: null
+    whatsNewSeenVersion: null,
+    devVersion: null,
+    devVersionLastUpload: null
   }
 })
 

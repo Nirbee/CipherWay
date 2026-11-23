@@ -38,7 +38,7 @@ import { keepaliveMs, tcpPing, type SocksTarget } from './latency'
 import { hasTunAdapter, type CoreExit } from './broker'
 import { LegacyLauncher, TunService, type LauncherPaths, type TunLauncher } from './tunService'
 import { writeAtomic } from './atomicFile'
-import { DirectFailures } from './connections'
+import { DirectFailures, type RawConnections } from './connections'
 import { LogFilter } from './logFilter'
 import { REALITY_ERROR_RE, RealityWatch } from './realityWatch'
 import { groupsFor, layoutRules, planRules, type RuleLayout } from '../rules/compile'
@@ -94,6 +94,13 @@ export interface ManagerHooks {
   adapterGate?: AdapterGateLike
   /** Settings → «Пинг» as chosen now: the core's own check fills the list only in «connect» */
   pingMode?: () => PingMode
+  /**
+   * DevVersion: every `/connections` snapshot the traffic poll already takes
+   * (once a second) — no extra request to the core. Errors are swallowed.
+   */
+  onConnections?: (raw: RawConnections) => void
+  /** DevVersion: core / xray log lines (xray: the server of a REALITY error, if known) */
+  onCoreLine?: (source: 'singbox' | 'xray', line: string, nodeId?: string) => void
 }
 
 /** How the server list is measured (Settings → «Пинг», see PingMode). */
@@ -429,6 +436,23 @@ export class SidecarManager {
   get lanBypass(): boolean {
     return this.running && !!this.coreGen?.lan
   }
+  /** hosts the running core sends direct in every mode (configGen directHosts) */
+  get directHosts(): string[] {
+    return this.running ? (this.coreGen?.directHosts ?? []) : []
+  }
+  /** loopback SOCKS entry of one server in the running xray (VLESS only) */
+  socksFor(nodeId: string): SocksTarget | undefined {
+    const port = this.running ? this.coreGen?.xrayPorts[nodeId] : undefined
+    return port ? { port } : undefined
+  }
+  /** the server traffic goes through now («auto» resolved); null = unknown */
+  async activeNodeId(): Promise<string | null> {
+    const api = this.clash
+    if (!api) return null
+    const now = await api.groupNow(TAG_PROXY_GROUP)
+    if (now === TAG_AUTO) return (await api.groupNow(TAG_AUTO)) || null
+    return now || null
+  }
   /** Restarting a legacy (non-service) TUN core would mean a UAC prompt. */
   get reloadNeedsPrompt(): boolean {
     return this.launcher?.kind === 'legacy'
@@ -456,7 +480,18 @@ export class SidecarManager {
     if (!line) return
     this.coreTail = [...this.coreTail.slice(-6), line]
     this.failures.noteLog(line)
+    this.tap(() => this.hooks.onCoreLine?.('singbox', line))
     this.log(singboxLevel(line), 'singbox', line)
+  }
+
+  /** A DevVersion hook: whatever it does, the VPN carries on. */
+  private tap(fn: () => void): void {
+    if (!this.hooks.onConnections && !this.hooks.onCoreLine) return
+    try {
+      fn()
+    } catch {
+      /* the collector's problem, never the connection's */
+    }
   }
 
   /** Runs `fn` after every operation queued before it. */
@@ -1101,8 +1136,11 @@ export class SidecarManager {
     }
     const quiet = XRAY_TAGGED_QUIET_RE.test(line)
     if (REALITY_ERROR_RE.test(line)) {
-      this.noteReality(session ? this.xraySessions.get(session) : undefined)
+      const nodeId = session ? this.xraySessions.get(session) : undefined
+      this.noteReality(nodeId)
+      this.tap(() => this.hooks.onCoreLine?.('xray', line, nodeId))
     } else if (!quiet) {
+      this.tap(() => this.hooks.onCoreLine?.('xray', line))
       this.xrayTail = [...this.xrayTail.slice(-4), line]
     }
     const level = xrayLevel(line)
@@ -1791,6 +1829,7 @@ export class SidecarManager {
     }
     const json = await api.connections()
     if (!json) return
+    this.tap(() => this.hooks.onConnections?.(json))
     const down = json.downloadTotal ?? 0
     const up = json.uploadTotal ?? 0
     if (this.prevTotals) {

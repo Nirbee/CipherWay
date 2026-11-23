@@ -23,6 +23,13 @@ import type {
 } from './types'
 import type { UpdaterState } from './updater'
 import type { ChangelogEntry } from './changelog'
+import type {
+  DevConsentAccept,
+  DevDisableResult,
+  DevGameCandidate,
+  DevStatsView,
+  DevStatus
+} from './devversion'
 
 export const IPC = {
   // app
@@ -116,6 +123,23 @@ export const IPC = {
   whatsNewGet: 'whatsNew:get',
   /** the user closed the card with × or «Подробнее»: remember the current version */
   whatsNewSeen: 'whatsNew:seen',
+
+  // «DevVersion» (src/shared/devversion.ts; collector + upload in main/devversion)
+  /** cheap status (Settings, sidebar, theme) */
+  devGet: 'dev:get',
+  /** status + summaries — polled by «Статистика» only while it is on screen */
+  devStats: 'dev:stats',
+  /** {accepted: true, consentVersion} from the consent dialog */
+  devEnable: 'dev:enable',
+  /** deleteRemote: boolean — also DELETE the reports on the server */
+  devDisable: 'dev:disable',
+  devDeleteRemote: 'dev:deleteRemote',
+  devSendNow: 'dev:sendNow',
+  /** save dialog → the current report (masked) as JSON */
+  devSaveReport: 'dev:saveReport',
+  devGameCandidates: 'dev:gameCandidates',
+  devGameStart: 'dev:gameStart',
+  devGameStop: 'dev:gameStop',
 
   // updater (state: src/shared/updater.ts)
   updaterGetState: 'updater:getState',
@@ -235,6 +259,20 @@ export interface ExposedApi {
   whatsNew: {
     get: () => Promise<ChangelogEntry[]>
     seen: () => void
+  }
+  dev: {
+    get: () => Promise<DevStatus>
+    stats: () => Promise<DevStatsView>
+    enable: (accept: DevConsentAccept) => Promise<DevStatus>
+    disable: (deleteRemote: boolean) => Promise<DevDisableResult>
+    /** reports deleted on the server */
+    deleteRemote: () => Promise<number>
+    sendNow: () => Promise<DevStatus>
+    /** the saved file's path, null = cancelled */
+    saveReport: () => Promise<string | null>
+    gameCandidates: () => Promise<DevGameCandidate[]>
+    gameStart: (process: string) => Promise<DevStatsView>
+    gameStop: () => Promise<DevStatsView>
   }
   updater: {
     getState: () => Promise<UpdaterState>

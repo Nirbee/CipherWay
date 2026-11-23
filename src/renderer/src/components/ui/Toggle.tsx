@@ -29,7 +29,9 @@ export function Toggle({ checked, onChange, disabled, label, size = 'md' }: Togg
     >
       <span
         className={cn(
-          'inline-block transform rounded-full bg-white shadow transition-transform',
+          'inline-block transform rounded-full shadow transition-transform',
+          // on the accent track: white (dark on the DevVersion silver)
+          checked ? 'bg-on-accent' : 'bg-white',
           dims.knob,
           'translate-x-1',
           checked && dims.on

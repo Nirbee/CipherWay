@@ -297,7 +297,7 @@ function OnlineDot({ online }: { online: boolean }) {
       title={online ? 'в сети' : 'не в сети'}
       className={cn(
         'h-2 w-2 shrink-0 rounded-full',
-        online ? 'bg-accent-green shadow-[0_0_6px] shadow-accent-green/60' : 'bg-text-faint/50'
+        online ? 'bg-status-ok shadow-[0_0_6px] shadow-status-ok/60' : 'bg-text-faint/50'
       )}
     />
   )

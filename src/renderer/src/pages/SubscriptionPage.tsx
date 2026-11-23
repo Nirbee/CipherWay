@@ -70,7 +70,7 @@ export function SubscriptionPage() {
                     ? 'bg-accent-red/15 text-accent-red'
                     : days !== null && days <= 3
                       ? 'bg-accent-amber/15 text-accent-amber'
-                      : 'bg-accent-green/15 text-accent-green'
+                      : 'bg-status-ok/15 text-status-ok'
                 )}
               >
                 {expired ? 'истекла' : days !== null ? `активна · ещё ${formatDays(days)}` : 'активна'}
@@ -88,7 +88,7 @@ export function SubscriptionPage() {
             {total > 0 && (
               <div className="mt-3 h-1.5 overflow-hidden rounded-pill bg-bg-elevated">
                 <div
-                  className="h-full rounded-pill bg-accent-green transition-all"
+                  className="h-full rounded-pill bg-status-ok transition-all"
                   style={{ width: `${Math.min(100, (used / total) * 100)}%` }}
                 />
               </div>

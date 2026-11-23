@@ -1,5 +1,13 @@
 import type { Config } from 'tailwindcss'
 
+/**
+ * Accent colours come from CSS variables (src/renderer/src/styles/index.css):
+ * «DevVersion» swaps them for graphite / silver with one attribute on <html>
+ * (data-edition="dev") instead of touching every component. `<alpha-value>`
+ * keeps `bg-accent-green/10` and friends working.
+ */
+const v = (name: string): string => `rgb(var(--c-${name}) / <alpha-value>)`
+
 export default {
   content: ['./src/renderer/index.html', './src/renderer/src/**/*.{ts,tsx}'],
   theme: {
@@ -14,14 +22,18 @@ export default {
           input: '#1a2540'
         },
         accent: {
-          blue: '#4d7cfe',
-          'blue-light': '#5b86ff',
-          'blue-bright': '#9bb5ff',
-          'blue-dark': '#3d63e0',
-          'blue-deep': '#2c4ba0',
-          green: '#34d399',
+          blue: v('accent-blue'),
+          'blue-light': v('accent-blue-light'),
+          'blue-bright': v('accent-blue-bright'),
+          'blue-dark': v('accent-blue-dark'),
+          'blue-deep': v('accent-blue-deep'),
+          green: v('accent-green'),
           amber: '#f5b942',
           red: '#f56565'
+        },
+        /** status «ok / connected / online» — stays green in DevVersion too */
+        status: {
+          ok: v('status-ok')
         },
         text: {
           primary: '#eef2fa',
@@ -35,8 +47,10 @@ export default {
         // (used across the app) resolve correctly. A nested { DEFAULT } would
         // only produce `border-border`, leaving `-default` to fall back to
         // Tailwind's near-white preflight color.
-        'border-default': 'rgba(52,211,153,0.22)',
-        'border-subtle': 'rgba(52,211,153,0.12)'
+        'border-default': 'rgb(var(--c-accent-green) / 0.22)',
+        'border-subtle': 'rgb(var(--c-accent-green) / 0.12)',
+        /** text / knobs on an accent background (white; dark on DevVersion silver) */
+        'on-accent': v('on-accent')
       },
       fontFamily: {
         sans: ['"IBM Plex Sans"', 'system-ui', 'sans-serif'],
@@ -44,7 +58,7 @@ export default {
       },
       // default border color for bare `border` (overrides Tailwind's near-white)
       borderColor: {
-        DEFAULT: 'rgba(52,211,153,0.22)'
+        DEFAULT: 'rgb(var(--c-accent-green) / 0.22)'
       },
       borderRadius: {
         card: '20px',

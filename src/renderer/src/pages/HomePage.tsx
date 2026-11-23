@@ -224,7 +224,7 @@ function StatusPill({
           'bg-accent-amber/15 text-accent-amber',
           days === 0 ? 'истекает сегодня' : `ещё ${formatDays(days ?? 0)}`
         ]
-      : ['bg-accent-green/15 text-accent-green', 'активна']
+      : ['bg-status-ok/15 text-status-ok', 'активна']
   return (
     <span className={cn('shrink-0 rounded-pill px-2 py-0.5 text-[11px] font-medium', tone)}>
       {text}
@@ -262,7 +262,7 @@ function Tile({
       {progress !== undefined && (
         <div className="mt-2 h-1 overflow-hidden rounded-pill bg-bg-elevated">
           <div
-            className={cn('h-full rounded-pill', warn ? 'bg-accent-amber' : 'bg-accent-green')}
+            className={cn('h-full rounded-pill', warn ? 'bg-accent-amber' : 'bg-status-ok')}
             style={{ width: `${Math.max(2, Math.min(100, progress * 100))}%` }}
           />
         </div>
@@ -307,8 +307,9 @@ function ConnectHero({ hasServers }: { hasServers: boolean }) {
         <svg viewBox="0 0 196 196" className="absolute inset-0 h-full w-full">
           <defs>
             <linearGradient id="cw-ring" x1="0" y1="0" x2="1" y2="1">
-              <stop offset="0%" stopColor="#4d7cfe" />
-              <stop offset="100%" stopColor="#34d399" />
+              {/* accent variables: silver in DevVersion */}
+              <stop offset="0%" style={{ stopColor: 'rgb(var(--c-accent-blue))' }} />
+              <stop offset="100%" style={{ stopColor: 'rgb(var(--c-status-ok))' }} />
             </linearGradient>
           </defs>
           <circle
@@ -331,7 +332,7 @@ function ConnectHero({ hasServers }: { hasServers: boolean }) {
                   ? '#f5b942'
                   : error
                     ? '#f56565'
-                    : 'rgba(52,211,153,0.22)'
+                    : 'rgb(var(--c-accent-green) / 0.22)'
             }
             strokeWidth="5"
             strokeLinecap="round"
@@ -347,7 +348,7 @@ function ConnectHero({ hasServers }: { hasServers: boolean }) {
           className={cn(
             'flex h-[152px] w-[152px] flex-col items-center justify-center rounded-full border transition-all duration-300',
             connected
-              ? 'border-accent-green/30 bg-accent-green/10'
+              ? 'border-status-ok/30 bg-status-ok/10'
               : error
                 ? 'border-accent-red/30 bg-accent-red/5'
                 : 'border-border-subtle bg-bg-panel group-hover:bg-bg-elevated'
@@ -359,7 +360,7 @@ function ConnectHero({ hasServers }: { hasServers: boolean }) {
             className={cn(
               'transition-colors duration-300',
               connected
-                ? 'text-accent-green'
+                ? 'text-status-ok'
                 : connecting
                   ? 'text-accent-amber'
                   : error
@@ -377,7 +378,7 @@ function ConnectHero({ hasServers }: { hasServers: boolean }) {
         <div
           className={cn(
             'text-lg font-semibold',
-            connected ? 'text-accent-green' : error ? 'text-accent-red' : 'text-text-primary'
+            connected ? 'text-status-ok' : error ? 'text-accent-red' : 'text-text-primary'
           )}
         >
           {connected

@@ -275,7 +275,7 @@ export function SupportPage() {
         <div className="mx-7 mb-2 flex items-center gap-2 text-[11.5px] text-text-muted">
           {thread?.ticketId && <span>Обращение №{thread.ticketId}</span>}
           {status && (
-            <span className="rounded-pill bg-accent-green/15 px-2 py-0.5 text-[11px] font-medium text-accent-green">
+            <span className="rounded-pill bg-status-ok/15 px-2 py-0.5 text-[11px] font-medium text-status-ok">
               {status}
             </span>
           )}
@@ -417,7 +417,7 @@ function Bubble({ m }: { m: SupportMessage }) {
         className={cn(
           'max-w-[78%] rounded-2xl px-3.5 py-2.5 text-[13px] leading-relaxed',
           mine
-            ? 'rounded-br-md bg-accent-blue/90 text-white'
+            ? 'rounded-br-md bg-accent-blue/90 text-on-accent'
             : 'rounded-bl-md border border-border-subtle bg-bg-elevated text-text-secondary'
         )}
       >
@@ -452,7 +452,7 @@ function Bubble({ m }: { m: SupportMessage }) {
         <div
           className={cn(
             'mt-1 text-right text-[10.5px]',
-            mine ? 'text-white/65' : 'text-text-faint'
+            mine ? 'text-on-accent/65' : 'text-text-faint'
           )}
         >
           {formatTime(m.at)}

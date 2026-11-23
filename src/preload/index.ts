@@ -88,6 +88,18 @@ const api: ExposedApi = {
     get: () => ipcRenderer.invoke(IPC.whatsNewGet),
     seen: () => ipcRenderer.send(IPC.whatsNewSeen)
   },
+  dev: {
+    get: () => ipcRenderer.invoke(IPC.devGet),
+    stats: () => ipcRenderer.invoke(IPC.devStats),
+    enable: (accept) => ipcRenderer.invoke(IPC.devEnable, accept),
+    disable: (deleteRemote) => ipcRenderer.invoke(IPC.devDisable, deleteRemote),
+    deleteRemote: () => ipcRenderer.invoke(IPC.devDeleteRemote),
+    sendNow: () => ipcRenderer.invoke(IPC.devSendNow),
+    saveReport: () => ipcRenderer.invoke(IPC.devSaveReport),
+    gameCandidates: () => ipcRenderer.invoke(IPC.devGameCandidates),
+    gameStart: (process) => ipcRenderer.invoke(IPC.devGameStart, process),
+    gameStop: () => ipcRenderer.invoke(IPC.devGameStop)
+  },
   updater: {
     getState: () => ipcRenderer.invoke(IPC.updaterGetState),
     check: () => ipcRenderer.invoke(IPC.updaterCheck),

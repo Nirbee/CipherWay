@@ -241,7 +241,7 @@ export function ConnectionsPage() {
               </div>
               <div className="flex items-center gap-3 border-t border-border-subtle px-4 py-2 text-[10px] text-text-faint">
                 <span className="flex items-center gap-1.5">
-                  <span className="h-1.5 w-1.5 rounded-full bg-accent-green" />
+                  <span className="h-1.5 w-1.5 rounded-full bg-status-ok" />
                   через VPN
                 </span>
                 <span className="flex items-center gap-1.5">
@@ -388,7 +388,7 @@ function GroupRow({ g, by, active, onClick }: { g: Group; by: GroupBy; active: b
         <div className="mt-1 flex items-center gap-2">
           {/* share of connections: VPN (mint) / direct (blue) / blocked */}
           <div className="flex h-1 flex-1 overflow-hidden rounded-pill bg-bg-elevated">
-            <span className="h-full bg-accent-green" style={{ width: `${vpnShare}%` }} />
+            <span className="h-full bg-status-ok" style={{ width: `${vpnShare}%` }} />
             <span className="h-full bg-accent-blue" style={{ width: `${directShare}%` }} />
           </div>
           <span className="shrink-0 font-mono text-[10px] tabular-nums text-text-faint">
@@ -408,7 +408,7 @@ function RouteBadge({ c }: { c: ConnItem }) {
     return <span className="rounded-pill bg-accent-blue/15 px-2 py-0.5 text-[10px] font-medium text-accent-blue-bright">Напрямую</span>
   }
   return (
-    <span className="max-w-[160px] truncate rounded-pill bg-accent-green/15 px-2 py-0.5 text-[10px] font-medium text-accent-green">
+    <span className="max-w-[160px] truncate rounded-pill bg-status-ok/15 px-2 py-0.5 text-[10px] font-medium text-status-ok">
       VPN{c.serverName ? ` · ${c.serverName}` : ''}
     </span>
   )

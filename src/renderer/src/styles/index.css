@@ -8,6 +8,16 @@
  */
 
 :root {
+  /* accent colours as «r g b» (tailwind.config.ts reads them with alpha) */
+  --c-accent-blue: 77 124 254;
+  --c-accent-blue-light: 91 134 255;
+  --c-accent-blue-bright: 155 181 255;
+  --c-accent-blue-dark: 61 99 224;
+  --c-accent-blue-deep: 44 75 160;
+  --c-accent-green: 52 211 153;
+  --c-on-accent: 255 255 255;
+  /* status «ok / connected / online»: NOT part of the accent, DevVersion keeps it green */
+  --c-status-ok: 52 211 153;
   --bg-app: #0a0f1c;
   --bg-panel: #0c1322;
   --bg-panel-alt: #0d1526;
@@ -20,7 +30,32 @@
   --accent-red: #f56565;
   --text-primary: #eef2fa;
   --text-muted: #8593ad;
-  --border-default: rgba(52, 211, 153, 0.22);
+  --border-default: rgb(var(--c-accent-green) / 0.22);
+}
+
+/*
+ * «DevVersion» (0.6.0): the accent turns light silver — the test build is told
+ * apart at a glance; text on accent backgrounds turns dark so it stays
+ * readable. Status colours (--c-status-ok green, amber, red) stay as they are.
+ */
+[data-edition='dev'] {
+  --c-accent-blue: 184 190 200;
+  --c-accent-blue-light: 206 211 219;
+  --c-accent-blue-bright: 227 231 236;
+  --c-accent-blue-dark: 154 161 173;
+  --c-accent-blue-deep: 107 114 128;
+  --c-accent-green: 201 206 214;
+  --c-on-accent: 17 24 39;
+}
+/* a light theme (none yet — the app is dark only): graphite instead of silver */
+[data-edition='dev'][data-theme='light'] {
+  --c-accent-blue: 43 47 54;
+  --c-accent-blue-light: 63 68 77;
+  --c-accent-blue-bright: 31 34 40;
+  --c-accent-blue-dark: 24 26 31;
+  --c-accent-blue-deep: 17 18 22;
+  --c-accent-green: 55 60 68;
+  --c-on-accent: 255 255 255;
 }
 
 html,
@@ -44,7 +79,7 @@ body {
 .app-shell {
   height: 100vh;
   background: var(--bg-app);
-  border: 1px solid rgba(52, 211, 153, 0.22);
+  border: 1px solid rgb(var(--c-accent-green) / 0.22);
   border-radius: 16px;
   overflow: hidden;
   transition: border-radius 0.18s ease;
@@ -123,10 +158,10 @@ body {
 @keyframes glow-breathe {
   0%,
   100% {
-    box-shadow: 0 0 24px 2px rgba(52, 211, 153, 0.25);
+    box-shadow: 0 0 24px 2px rgb(var(--c-accent-green) / 0.25);
   }
   50% {
-    box-shadow: 0 0 40px 6px rgba(52, 211, 153, 0.45);
+    box-shadow: 0 0 40px 6px rgb(var(--c-accent-green) / 0.45);
   }
 }
 
@@ -146,10 +181,10 @@ body {
 @keyframes update-glow {
   0%,
   100% {
-    box-shadow: 0 0 10px -4px rgba(52, 211, 153, 0.35);
+    box-shadow: 0 0 10px -4px rgb(var(--c-accent-green) / 0.35);
   }
   50% {
-    box-shadow: 0 0 18px -1px rgba(52, 211, 153, 0.6);
+    box-shadow: 0 0 18px -1px rgb(var(--c-accent-green) / 0.6);
   }
 }
 .animate-update-glow {

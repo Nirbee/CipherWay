@@ -10,6 +10,8 @@ export type PageKey =
   | 'support'
   | 'logs'
   | 'settings'
+  /** «Статистика» — only while DevVersion is on */
+  | 'stats'
 
 export const PAGE_KEYS: readonly PageKey[] = [
   'home',
@@ -20,7 +22,8 @@ export const PAGE_KEYS: readonly PageKey[] = [
   'subscription',
   'support',
   'logs',
-  'settings'
+  'settings',
+  'stats'
 ]
 
 interface NavState {

@@ -15,7 +15,7 @@ export function Toaster() {
             t.tone === 'error'
               ? 'border-accent-red/40'
               : t.tone === 'success'
-                ? 'border-accent-green/40'
+                ? 'border-status-ok/40'
                 : 'border-border-default'
           )}
         >
@@ -25,7 +25,7 @@ export function Toaster() {
               t.tone === 'error'
                 ? 'text-accent-red'
                 : t.tone === 'success'
-                  ? 'text-accent-green'
+                  ? 'text-status-ok'
                   : 'text-accent-blue-bright'
             )}
           >

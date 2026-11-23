@@ -358,3 +358,10 @@ export const StethoscopeIcon = (p: P) => (
     <circle cx="20" cy="11" r="2" />
   </svg>
 )
+
+/** «Статистика» (DevVersion) */
+export const ChartIcon = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M4 20V10M10 20V4M16 20v-7M22 20H2" />
+  </svg>
+)

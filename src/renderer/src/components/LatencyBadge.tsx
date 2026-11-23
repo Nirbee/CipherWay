@@ -12,13 +12,13 @@ export function latencyTone(ms: number | null | undefined): Tone {
 }
 
 const TONE: Record<Tone, string> = {
-  green: 'text-accent-green',
+  green: 'text-status-ok',
   amber: 'text-accent-amber',
   red: 'text-accent-red',
   none: 'text-text-faint'
 }
 const DOT: Record<Tone, string> = {
-  green: 'bg-accent-green',
+  green: 'bg-status-ok',
   amber: 'bg-accent-amber',
   red: 'bg-accent-red',
   none: 'bg-text-faint/50'

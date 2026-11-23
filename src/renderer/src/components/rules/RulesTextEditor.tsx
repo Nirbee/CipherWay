@@ -127,7 +127,7 @@ export function RulesTextEditor({ onApplied }: { onApplied: () => void }) {
                   className={cn(
                     'pr-2',
                     errorLines.has(i + 1) && 'text-accent-red',
-                    okLines.has(i + 1) && 'text-accent-green/70'
+                    okLines.has(i + 1) && 'text-status-ok/70'
                   )}
                 >
                   {errorLines.has(i + 1) ? '●' : i + 1}
@@ -171,7 +171,7 @@ export function RulesTextEditor({ onApplied }: { onApplied: () => void }) {
         <div className="border-b border-border-subtle px-4 py-3">
           <div className="text-[11px] text-text-muted">Формат: {FORMAT_LABEL[parsed.format]}</div>
           <div className="mt-1 flex items-baseline gap-2">
-            <span className={cn('text-3xl font-bold tabular-nums', count ? 'text-accent-green' : 'text-text-faint')}>
+            <span className={cn('text-3xl font-bold tabular-nums', count ? 'text-status-ok' : 'text-text-faint')}>
               {count}
             </span>
             <span className="text-sm text-text-muted">{plural(count, 'правило', 'правила', 'правил')} будет добавлено</span>
@@ -212,7 +212,7 @@ export function RulesTextEditor({ onApplied }: { onApplied: () => void }) {
               ))}
             </>
           ) : count > 0 ? (
-            <div className="flex items-center gap-1.5 px-2 text-xs text-accent-green">
+            <div className="flex items-center gap-1.5 px-2 text-xs text-status-ok">
               <CheckIcon width={14} height={14} />
               Все строки распознаны
             </div>

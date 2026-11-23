@@ -1,10 +1,12 @@
 import { useNav, type PageKey } from '../store/navStore'
 import { useConnection } from '../store/connectionStore'
 import { useSupport } from '../store/supportStore'
+import { useDev } from '../store/devStore'
 import { cn } from '../lib/cn'
 import {
   ActivityIcon,
   CardIcon,
+  ChartIcon,
   HomeIcon,
   LanIcon,
   LogsIcon,
@@ -29,6 +31,9 @@ const NAV: { key: PageKey; label: string; Icon: typeof HomeIcon }[] = [
   { key: 'settings', label: 'Настройки', Icon: SettingsIcon }
 ]
 
+/** «Статистика»: shown only while DevVersion is on (after «Логи») */
+const STATS_ITEM: (typeof NAV)[number] = { key: 'stats', label: 'Статистика', Icon: ChartIcon }
+
 const STATE_TEXT = {
   connected: 'Защищено',
   connecting: 'Подключение…',
@@ -40,6 +45,8 @@ export function Sidebar() {
   const { page, setPage } = useNav()
   const state = useConnection((s) => s.state)
   const unread = useSupport((s) => s.view?.unread ?? 0)
+  const dev = useDev((s) => s.status.enabled)
+  const items = dev ? [...NAV.slice(0, -1), STATS_ITEM, NAV[NAV.length - 1]] : NAV
 
   return (
     <nav className="drag-region flex w-[216px] shrink-0 flex-col border-r border-border-subtle bg-bg-sidebar">
@@ -51,7 +58,7 @@ export function Sidebar() {
             className={cn(
               'absolute -bottom-0.5 -right-0.5 h-3 w-3 rounded-full border-2 border-bg-sidebar transition-colors',
               state === 'connected'
-                ? 'bg-accent-green'
+                ? 'bg-status-ok'
                 : state === 'connecting'
                   ? 'animate-pulse bg-accent-amber'
                   : state === 'error'
@@ -66,7 +73,7 @@ export function Sidebar() {
             className={cn(
               'text-[11px]',
               state === 'connected'
-                ? 'text-accent-green'
+                ? 'text-status-ok'
                 : state === 'error'
                   ? 'text-accent-red'
                   : 'text-text-muted'
@@ -79,7 +86,7 @@ export function Sidebar() {
 
       {/* nav */}
       <div className="no-drag flex flex-1 flex-col gap-0.5 overflow-y-auto px-3">
-        {NAV.map(({ key, label, Icon }) => {
+        {items.map(({ key, label, Icon }) => {
           const active = page === key
           return (
             <button

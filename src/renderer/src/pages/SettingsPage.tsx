@@ -20,6 +20,12 @@ import { useUpdater } from '../store/updaterStore'
 import { useConnection } from '../store/connectionStore'
 import { useSubscription } from '../store/subscriptionStore'
 import { useServers } from '../store/serversStore'
+import { useDev } from '../store/devStore'
+import {
+  DevConsentModal,
+  DevDeleteRemoteModal,
+  DevDisableModal
+} from '../components/DevVersionDialogs'
 import { toast } from '../store/toastStore'
 import { errorText, formatAgo } from '../lib/format'
 import { cn } from '../lib/cn'
@@ -195,8 +201,95 @@ export function SettingsPage() {
             Скопировать диагностику
           </Button>
         </Section>
+
+        <DevVersionSection />
       </div>
     </div>
+  )
+}
+
+/** «DevVersion»: the switch at the very bottom, consent / off dialogs, server deletion. */
+function DevVersionSection() {
+  const status = useDev((s) => s.status)
+  const setStatus = useDev((s) => s.set)
+  const [dialog, setDialog] = useState<'consent' | 'disable' | 'delete' | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  const run = async (fn: () => Promise<void>): Promise<void> => {
+    setBusy(true)
+    try {
+      await fn()
+      setDialog(null)
+    } catch (e) {
+      toast(errorText(e), 'error')
+    } finally {
+      setBusy(false)
+    }
+  }
+  const enable = (consentVersion: string): Promise<void> =>
+    run(async () => {
+      setStatus(await window.api.dev.enable({ accepted: true, consentVersion }))
+      toast('DevVersion включён — спасибо! Новая вкладка «Статистика» слева', 'success')
+    })
+  const disable = (deleteRemote: boolean): Promise<void> =>
+    run(async () => {
+      const res = await window.api.dev.disable(deleteRemote)
+      setStatus(res.status)
+      if (res.deleteError) toast(`DevVersion выключен. ${res.deleteError}`, 'error')
+      else if (deleteRemote) {
+        toast(`DevVersion выключен, отправленные отчёты удалены: ${res.deleted ?? 0}`, 'success')
+      } else toast('DevVersion выключен, данные на компьютере удалены', 'success')
+    })
+  const deleteRemote = (): Promise<void> =>
+    run(async () => {
+      const n = await window.api.dev.deleteRemote()
+      toast(`Отправленные отчёты удалены: ${n}`, 'success')
+    })
+
+  return (
+    <Section
+      title="DevVersion"
+      hint="Тестовая версия: приложение собирает и отправляет нам технические данные о работе сети, чтобы улучшать правила и качество соединения. Только с вашего согласия."
+    >
+      <Row
+        label="DevVersion"
+        hint={
+          status.enabled
+            ? `Включён${status.acceptedAt ? ` ${new Date(status.acceptedAt).toLocaleDateString('ru-RU')}` : ''}. Сбор и отправка — на вкладке «Статистика».`
+            : 'Выключен. При включении покажем, что именно собирается.'
+        }
+      >
+        <Toggle
+          checked={status.enabled}
+          disabled={busy}
+          label="DevVersion"
+          onChange={(v) => setDialog(v ? 'consent' : 'disable')}
+        />
+      </Row>
+      {status.enabled && (
+        <Button variant="secondary" size="sm" disabled={busy} onClick={() => setDialog('delete')}>
+          Удалить отправленные данные
+        </Button>
+      )}
+      <DevConsentModal
+        open={dialog === 'consent'}
+        busy={busy}
+        onCancel={() => setDialog(null)}
+        onAccept={(v) => void enable(v)}
+      />
+      <DevDisableModal
+        open={dialog === 'disable'}
+        busy={busy}
+        onCancel={() => setDialog(null)}
+        onConfirm={(r) => void disable(r)}
+      />
+      <DevDeleteRemoteModal
+        open={dialog === 'delete'}
+        busy={busy}
+        onCancel={() => setDialog(null)}
+        onConfirm={() => void deleteRemote()}
+      />
+    </Section>
   )
 }
 

@@ -11,7 +11,7 @@ interface PillProps extends HTMLAttributes<HTMLSpanElement> {
 const TONES: Record<Tone, string> = {
   neutral: 'bg-bg-elevated text-text-tertiary',
   blue: 'bg-accent-blue/15 text-accent-blue-bright',
-  green: 'bg-accent-green/15 text-accent-green',
+  green: 'bg-status-ok/15 text-status-ok',
   amber: 'bg-accent-amber/15 text-accent-amber',
   red: 'bg-accent-red/15 text-accent-red'
 }

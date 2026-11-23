@@ -1,8 +1,18 @@
 import { CloseIcon, MaximizeIcon, MinimizeIcon } from './icons'
+import { useDev } from '../store/devStore'
 
 export function TitleBar() {
+  const dev = useDev((s) => s.status.enabled)
   return (
-    <header className="drag-region flex h-10 items-center justify-end px-2">
+    <header className="drag-region flex h-10 items-center justify-end gap-2 px-2">
+      {dev && (
+        <span
+          className="mr-auto ml-5 rounded-md bg-accent-blue px-1.5 py-px font-mono text-[10px] font-bold tracking-wider text-on-accent"
+          title="Включён DevVersion — тестовая версия со сбором диагностики (Настройки)"
+        >
+          DEV
+        </span>
+      )}
       <div className="no-drag flex items-center">
         <WinButton onClick={() => window.api.window.minimize()} label="Свернуть">
           <MinimizeIcon />
