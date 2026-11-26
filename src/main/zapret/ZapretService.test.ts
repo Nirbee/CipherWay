@@ -6,7 +6,17 @@ import type { DirectPath, DohServer, NetworkInfo, TargetResult } from './checks'
 import { DpiStartError, type DpiDaemonLike, type DpiRequest } from './DpiDaemon'
 import type { DpiBrokerState } from './dpiBroker'
 import { STRATEGIES } from './strategies'
-import { dpiErrorText, ZapretService, type StrategyMemo, type ZapretDeps } from './ZapretService'
+import {
+  DNS_FAILS,
+  dpiErrorText,
+  LIVE_RECHECK_MS,
+  LIVE_REPEAT_MS,
+  LIVE_STALL_MS,
+  LIVE_STALLS,
+  ZapretService,
+  type StrategyMemo,
+  type ZapretDeps
+} from './ZapretService'
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 const [S0, S1, S2, S3] = STRATEGIES.map((s) => s.id)
@@ -26,6 +36,8 @@ function harness(o: {
   checkEveryMs?: number
   netPollMs?: number
   applyError?: DpiStartError
+  /** YouTube's video nodes the check finds (undefined = no video check) */
+  videoNodes?: string[]
 }) {
   let settings: ZapretSettings = { ...DEFAULT_ZAPRET, enabled: true, warned: true, ...o.settings }
   let memory: Record<string, StrategyMemo> = { ...(o.memory ?? {}) }
@@ -95,7 +107,8 @@ function harness(o: {
     log: (_l, m) => logs.push(m),
     settleMs: 0,
     checkEveryMs: o.checkEveryMs ?? 3_600_000,
-    netPollMs: o.netPollMs ?? 3_600_000
+    netPollMs: o.netPollMs ?? 3_600_000,
+    ...(o.videoNodes ? { videoNodes: async () => o.videoNodes ?? [] } : {})
   }
   const svc = new ZapretService(deps)
   return {
@@ -198,7 +211,7 @@ describe('ZapretService — the pick', () => {
   it('a remembered strategy of this network: no pick, just a check', async () => {
     const h = harness({
       world: (s) => s === S3,
-      memory: { 'net-home': { id: S3, at: Date.now() } }
+      memory: { 'net-home': { id: S3, at: Date.now(), v: 2 } }
     })
     h.setRunning(true)
     await h.svc.onVpn(true)
@@ -211,7 +224,7 @@ describe('ZapretService — the pick', () => {
   it('«Подобрать заново» runs a pick by hand', async () => {
     const h = harness({
       world: (s) => s === S0,
-      memory: { 'net-home': { id: S0, at: Date.now() } }
+      memory: { 'net-home': { id: S0, at: Date.now(), v: 2 } }
     })
     h.setRunning(true)
     await h.svc.onVpn(true)
@@ -229,7 +242,7 @@ describe('ZapretService — checks and the fallback', () => {
     const h = harness({
       // S0 works until the provider changes something; then only S2 does
       world: (s) => (broken ? s === S2 : s === S0),
-      memory: { 'net-home': { id: S0, at: Date.now() } },
+      memory: { 'net-home': { id: S0, at: Date.now(), v: 2 } },
       checkEveryMs: 60
     })
     h.setRunning(true)
@@ -256,7 +269,7 @@ describe('ZapretService — checks and the fallback', () => {
     const h = harness({
       world: () => true,
       doh: null,
-      memory: { 'net-home': { id: S0, at: Date.now() } }
+      memory: { 'net-home': { id: S0, at: Date.now(), v: 2 } }
     })
     h.setRunning(true)
     await h.svc.onVpn(true)
@@ -270,7 +283,7 @@ describe('ZapretService — checks and the fallback', () => {
     const h = harness({
       world: () => true,
       doh: 'fallback',
-      memory: { 'net-home': { id: S0, at: Date.now() } }
+      memory: { 'net-home': { id: S0, at: Date.now(), v: 2 } }
     })
     h.setRunning(true)
     await h.svc.onVpn(true)
@@ -283,7 +296,7 @@ describe('ZapretService — checks and the fallback', () => {
       world: (_s, host) =>
         host.includes('youtube') || host.includes('ytimg') || host.includes('googlevideo'),
       foreign: 'winws.exe',
-      memory: { 'net-home': { id: S0, at: Date.now() } }
+      memory: { 'net-home': { id: S0, at: Date.now(), v: 2 } }
     })
     h.setRunning(true)
     await h.svc.onVpn(true)
@@ -298,7 +311,7 @@ describe('ZapretService — checks and the fallback', () => {
     const h = harness({
       world: () => false,
       applyError: new DpiStartError('dpi_busy', 'busy'),
-      memory: { 'net-home': { id: S0, at: Date.now() } }
+      memory: { 'net-home': { id: S0, at: Date.now(), v: 2 } }
     })
     h.setRunning(true)
     await h.svc.onVpn(true)
@@ -321,7 +334,10 @@ describe('ZapretService — checks and the fallback', () => {
   })
 
   it('new servers in the subscription: winws restarted with their addresses excluded', async () => {
-    const h = harness({ world: () => true, memory: { 'net-home': { id: S0, at: Date.now() } } })
+    const h = harness({
+      world: () => true,
+      memory: { 'net-home': { id: S0, at: Date.now(), v: 2 } }
+    })
     h.setRunning(true)
     await h.svc.onVpn(true)
     await h.idle()
@@ -334,7 +350,7 @@ describe('ZapretService — checks and the fallback', () => {
   it('another network: its own strategy (a pick there), the home one kept', async () => {
     const h = harness({
       world: (s, host) => (s === S1 ? true : s === S0 && !host.includes('discord')),
-      memory: { 'net-home': { id: S0, at: Date.now() } },
+      memory: { 'net-home': { id: S0, at: Date.now(), v: 2 } },
       netPollMs: 30
     })
     h.setRunning(true)
@@ -351,7 +367,10 @@ describe('ZapretService — checks and the fallback', () => {
   })
 
   it('VPN off → winws stops and the sets are emptied; nothing runs without the VPN', async () => {
-    const h = harness({ world: () => true, memory: { 'net-home': { id: S0, at: Date.now() } } })
+    const h = harness({
+      world: () => true,
+      memory: { 'net-home': { id: S0, at: Date.now(), v: 2 } }
+    })
     h.setRunning(true)
     await h.svc.onVpn(true)
     await h.idle()
@@ -396,7 +415,7 @@ describe('ZapretService — switching on and the lists', () => {
   it('own domains: validated, the reserved ones refused; a new one is checked and routed', async () => {
     const h = harness({
       world: (s, host) => s === S0 && host !== 'blocked.example.com',
-      memory: { 'net-home': { id: S0, at: Date.now() } }
+      memory: { 'net-home': { id: S0, at: Date.now(), v: 2 } }
     })
     h.setRunning(true)
     await h.svc.onVpn(true)
@@ -419,7 +438,10 @@ describe('ZapretService — switching on and the lists', () => {
   })
 
   it('a service switched off leaves the sets', async () => {
-    const h = harness({ world: () => true, memory: { 'net-home': { id: S0, at: Date.now() } } })
+    const h = harness({
+      world: () => true,
+      memory: { 'net-home': { id: S0, at: Date.now(), v: 2 } }
+    })
     h.setRunning(true)
     await h.svc.onVpn(true)
     await h.idle()
@@ -440,5 +462,149 @@ describe('dpiErrorText', () => {
     expect(dpiErrorText(new DpiStartError('foreign_dpi', 'x', 'процесс winws.exe'))).toMatch(
       /winws\.exe/
     )
+  })
+})
+
+describe('ZapretService — the YouTube video node (0.7.1)', () => {
+  const NODE = 'rr2---sn-8ph2xajvh-n8vs.googlevideo.com'
+  // the pages open with any strategy (and without), the video node only with S2
+  const world: World = (s, host) => (host === NODE ? s === S2 : true)
+
+  it('a strategy that opens the pages but not the video is not counted; the pick goes on to one that does', async () => {
+    const h = harness({ world, videoNodes: [NODE], settings: { services: ['youtube'] } })
+    h.setRunning(true)
+    await h.svc.onVpn(true)
+    const v = await h.idle()
+    expect(h.applied.slice(0, 3)).toEqual([S0, S1, S2])
+    expect(v.strategy?.id).toBe(S2)
+    expect(v.items[0]).toMatchObject({ key: 'youtube', state: 'direct' })
+    expect(h.checked.some((c) => c.host === NODE)).toBe(true)
+    expect(h.memory['net-home']).toMatchObject({ id: S2, v: 2, ok: ['youtube'] })
+  })
+
+  it('no strategy opens the video → YouTube through the VPN, the reason says «видео»', async () => {
+    const h = harness({
+      world: (_s, host) => host !== NODE,
+      videoNodes: [NODE],
+      settings: { services: ['youtube'] }
+    })
+    h.setRunning(true)
+    await h.svc.onVpn(true)
+    const v = await h.idle()
+    expect(v.strategy).toBeNull()
+    expect(v.items[0].state).toBe('vpn')
+    expect(v.items[0].detail).toMatch(/видео не открывается напрямую/)
+    expect(directHosts(h.lastRoute())).toEqual([])
+  })
+
+  it('no video node found → YouTube is not «verified»: through the VPN', async () => {
+    const h = harness({
+      world: () => true,
+      videoNodes: [],
+      settings: { services: ['youtube'] },
+      memory: { 'net-home': { id: S0, at: Date.now(), v: 2 } }
+    })
+    h.setRunning(true)
+    await h.svc.onVpn(true)
+    const v = await h.idle()
+    expect(v.items[0].state).toBe('vpn')
+    expect(v.items[0].detail).toMatch(/не найден видеосервер/)
+  })
+
+  it('a strategy remembered by 0.7.0 (no video check then) is picked again', async () => {
+    const h = harness({
+      world,
+      videoNodes: [NODE],
+      settings: { services: ['youtube'] },
+      memory: { 'net-home': { id: S0, at: Date.now() } }
+    })
+    h.setRunning(true)
+    await h.svc.onVpn(true)
+    const v = await h.idle()
+    expect(v.strategy?.id).toBe(S2)
+    expect(h.memory['net-home'].v).toBe(2)
+  })
+})
+
+describe('ZapretService — back to the VPN by live traffic (0.7.1)', () => {
+  const conn = (id: string, host: string, ageMs: number, download = 0) => ({
+    id,
+    rule: 'rule_set=cw-z-d => route(direct)',
+    start: new Date(Date.now() - ageMs).toISOString(),
+    download,
+    metadata: { host, network: 'tcp' }
+  })
+
+  it('3 direct connections without an answer within a minute → VPN at once; others do nothing', async () => {
+    const h = harness({
+      world: () => true,
+      memory: { 'net-home': { id: S0, at: Date.now(), v: 2 } }
+    })
+    h.setRunning(true)
+    await h.svc.onVpn(true)
+    await h.idle()
+    const yt = (): ZapretView['items'][number] | undefined =>
+      h.svc.view().items.find((i) => i.key === 'youtube')
+    expect(yt()?.state).toBe('direct')
+    const routesBefore = h.routes.length
+    // answered, too young, another rule, UDP: none of them counts; two real ones
+    h.svc.onConnections({
+      connections: [
+        conn('a', 'rr1---sn-x.googlevideo.com', 20_000, 5000),
+        conn('b', 'rr1---sn-x.googlevideo.com', 1000),
+        { ...conn('c', 'rr1---sn-x.googlevideo.com', 20_000), rule: 'final' },
+        {
+          ...conn('d', 'rr1---sn-x.googlevideo.com', 20_000),
+          metadata: { host: 'rr1---sn-x.googlevideo.com', network: 'udp' }
+        },
+        conn('e', 'rr1---sn-x.googlevideo.com', LIVE_STALL_MS + 1000),
+        conn('f', 'rr2---sn-x.googlevideo.com', LIVE_STALL_MS + 1000)
+      ]
+    })
+    expect(yt()?.state).toBe('direct')
+    expect(h.routes.length).toBe(routesBefore)
+    // the third one
+    h.svc.onConnections({ connections: [conn('g', 'i.ytimg.com', LIVE_STALL_MS + 2000)] })
+    await sleep(20)
+    expect(yt()?.state).toBe('vpn')
+    expect(yt()?.detail).toMatch(/не получают ответа/)
+    expect(proxyHosts(h.lastRoute())).toContain('googlevideo.com')
+    expect(h.svc.view().items.find((i) => i.key === 'discord')?.state).toBe('direct')
+    // until the re-check time, a passing check does not bring it back (no flip-flop)
+    await h.svc.repick()
+    expect(yt()?.state).toBe('vpn')
+    await h.svc.onVpn(false)
+  })
+
+  it('the thresholds are sane', () => {
+    expect(LIVE_STALLS).toBeGreaterThanOrEqual(3)
+    expect(LIVE_STALL_MS).toBeGreaterThanOrEqual(4000)
+    expect(LIVE_RECHECK_MS).toBeLessThan(10 * 60_000)
+    expect(LIVE_REPEAT_MS).toBeGreaterThan(LIVE_RECHECK_MS)
+  })
+})
+
+describe('ZapretService — DNS failover (0.7.1)', () => {
+  it('the core reporting 8.8.8.8 failing → the zapret domains to 1.1.1.1 (and kept there)', async () => {
+    const h = harness({
+      world: () => true,
+      memory: { 'net-home': { id: S0, at: Date.now(), v: 2 } }
+    })
+    h.setRunning(true)
+    await h.svc.onVpn(true)
+    await h.idle()
+    expect(h.lastRoute().dns).toBe('primary')
+    const line = 'ERROR dns: exchange failed for www.youtube.com: dial tcp 8.8.8.8:443: i/o timeout'
+    h.svc.onCoreLine('INFO something else')
+    h.svc.onCoreLine(line)
+    expect(h.lastRoute().dns).toBe('primary')
+    for (let i = 1; i < DNS_FAILS; i++) h.svc.onCoreLine(line)
+    await sleep(10)
+    expect(h.lastRoute().dns).toBe('fallback')
+    expect(h.logs.join('\n')).toMatch(/DNS 8\.8\.8\.8 не отвечает/)
+    // the next check finds 8.8.8.8 fine again — still on 1.1.1.1 for a while
+    await h.svc.repick()
+    expect(h.lastRoute().dns).toBe('fallback')
+    await h.svc.onVpn(false)
   })
 })

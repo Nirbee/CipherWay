@@ -409,8 +409,16 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
         publish(status)
       },
       // DevVersion: the snapshots / log lines the manager sees anyway
-      onConnections: (raw) => devService?.onConnections(raw),
-      onCoreLine: (source, line, nodeId) => devService?.onCoreLine(source, line, nodeId)
+      onConnections: (raw) => {
+        devService?.onConnections(raw)
+        // «Ускорение без VPN»: live direct connections without an answer → back to the VPN
+        zapretService?.onConnections(raw)
+      },
+      onCoreLine: (source, line, nodeId) => {
+        devService?.onCoreLine(source, line, nodeId)
+        // the direct DoH of the zapret domains failing → the other one
+        if (source === 'singbox') zapretService?.onCoreLine(line)
+      }
     }
   )
 

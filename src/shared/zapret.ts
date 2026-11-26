@@ -310,3 +310,103 @@ export function zapretStateText(item: Pick<ZapretItem, 'state'>): string {
       return 'выключено'
   }
 }
+
+// ---------------------------------------------------------------------------
+// «Правила» (0.7.1): how each service / own site goes right now. The user's
+// rules are checked before the zapret sets (rules/compile.ts), so a rule that
+// matches the service's domains wins — shown as such.
+// ---------------------------------------------------------------------------
+
+/** domains a user rule is compared with, and the geosite sets that hold the service */
+const SERVICE_MATCH: Record<ZapretServiceId, { domains: string[]; geosite: string[] }> = {
+  youtube: {
+    domains: ['youtube.com', 'googlevideo.com', 'ytimg.com', 'youtu.be', 'ggpht.com'],
+    geosite: ['youtube', 'google']
+  },
+  discord: {
+    domains: ['discord.com', 'discord.gg', 'discordapp.com', 'discordapp.net', 'discord.media'],
+    geosite: ['discord']
+  }
+}
+
+/** the subset of a routing rule this needs (no import of the rules types into the renderer bundle twice) */
+export interface RuleLike {
+  enabled: boolean
+  conditionType: string
+  value: string
+  action: string
+}
+
+function ruleHits(r: RuleLike, domains: string[], geosite: string[]): boolean {
+  const v = r.value.trim().toLowerCase()
+  if (!v) return false
+  switch (r.conditionType) {
+    case 'Domain':
+      return domains.includes(v)
+    case 'DomainSuffix':
+      return domains.some((d) => d === v || d.endsWith(`.${v}`) || v.endsWith(`.${d}`))
+    case 'DomainKeyword':
+      return domains.some((d) => d.includes(v))
+    case 'DomainRegex':
+      try {
+        const re = new RegExp(r.value)
+        return domains.some((d) => re.test(d))
+      } catch {
+        return false
+      }
+    case 'GeoSite':
+      return geosite.includes(v)
+    default:
+      return false
+  }
+}
+
+/** The first enabled user rule that catches this item: its action, else null. */
+export function userRuleFor(key: string, rules: readonly RuleLike[]): string | null {
+  const domains = key.startsWith('d:')
+    ? [key.slice(2)]
+    : (SERVICE_MATCH[key as ZapretServiceId]?.domains ?? [])
+  const geosite = key.startsWith('d:') ? [] : (SERVICE_MATCH[key as ZapretServiceId]?.geosite ?? [])
+  for (const r of rules) {
+    if (r.enabled && ruleHits(r, domains, geosite)) return r.action
+  }
+  return null
+}
+
+export type ZapretRoute =
+  | 'direct'
+  | 'vpn_failed'
+  | 'vpn_off'
+  | 'user_vpn'
+  | 'user_direct'
+  | 'user_block'
+  | 'checking'
+  | 'waiting'
+
+/** How an item goes now: the user's rules first, then zapret's state. */
+export function zapretRoute(
+  item: Pick<ZapretItem, 'key' | 'state'>,
+  phase: ZapretPhase,
+  rules: readonly RuleLike[]
+): ZapretRoute {
+  const rule = userRuleFor(item.key, rules)
+  if (rule === 'DIRECT') return 'user_direct'
+  if (rule === 'REJECT' || rule === 'BLOCK') return 'user_block'
+  if (rule) return 'user_vpn'
+  if (phase === 'off') return 'vpn_off'
+  if (phase === 'idle') return 'waiting'
+  if (item.state === 'direct') return 'direct'
+  if (item.state === 'vpn') return 'vpn_failed'
+  return 'checking'
+}
+
+export const ZAPRET_ROUTE_TEXT: Record<ZapretRoute, string> = {
+  direct: 'Напрямую + zapret ✓',
+  vpn_failed: 'Через VPN — напрямую не открылся',
+  vpn_off: 'Через VPN — zapret выключен',
+  user_vpn: 'Ваше правило важнее: VPN',
+  user_direct: 'Ваше правило: напрямую',
+  user_block: 'Ваше правило: заблокировано',
+  checking: 'Проверяется…',
+  waiting: 'Включится вместе с VPN'
+}

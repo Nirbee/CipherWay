@@ -9,6 +9,7 @@ import { useSettings } from '../store/settingsStore'
 import { RuleCard } from '../components/rules/RuleCard'
 import { RuleEditor } from '../components/rules/RuleEditor'
 import { RulesTextEditor } from '../components/rules/RulesTextEditor'
+import { ZapretSection } from '../components/ZapretSection'
 import { actionLabel, CONDITION_META, DEFAULT_BEHAVIOR_LABEL } from '../lib/ruleMeta'
 import { cn } from '../lib/cn'
 
@@ -221,6 +222,8 @@ export function RulesPage() {
                 ))}
               </div>
             )}
+            {/* after the user's rules: they are checked first (rules/compile.ts) */}
+            <ZapretSection rules={rules} />
           </div>
 
           {/* default route for everything no rule matched */}

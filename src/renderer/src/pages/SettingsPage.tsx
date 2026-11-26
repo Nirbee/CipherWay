@@ -14,7 +14,6 @@ import { Button, Card, Input, Toggle } from '../components/ui'
 import { CopyIcon } from '../components/icons'
 import { UpdateButton } from '../components/UpdateButton'
 import { ChangelogModal } from '../components/WhatsNew'
-import { ZapretSection } from '../components/ZapretSection'
 import { useSettings } from '../store/settingsStore'
 import { useLogs } from '../store/logsStore'
 import { useUpdater } from '../store/updaterStore'
@@ -102,7 +101,6 @@ export function SettingsPage() {
 
         <PingSection settings={settings} save={save} />
 
-        <ZapretSection Section={Section} />
 
         <Section title="Запуск">
           <Row

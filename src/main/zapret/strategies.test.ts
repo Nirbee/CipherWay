@@ -8,9 +8,9 @@ import { STRATEGIES, strategyById, tokenProblems, winwsTokens } from './strategi
 import { SERVICE_DEFS } from './lists'
 
 describe('strategy table', () => {
-  it('8–10 different strategies with unique ids', () => {
+  it('8–14 different strategies with unique ids', () => {
     expect(STRATEGIES.length).toBeGreaterThanOrEqual(8)
-    expect(STRATEGIES.length).toBeLessThanOrEqual(10)
+    expect(STRATEGIES.length).toBeLessThanOrEqual(14)
     const ids = STRATEGIES.map((s) => s.id)
     expect(new Set(ids).size).toBe(ids.length)
     for (const id of ids) expect(id).toMatch(/^[a-z0-9-]{1,40}$/)

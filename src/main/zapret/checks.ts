@@ -172,8 +172,9 @@ export function probeTls(
       })
       sock?.once('end', () => finish(false, 'http:closed'))
       sock?.once('close', () => finish(false, 'http:closed'))
+      const req = t.path ? `GET ${t.path}` : 'HEAD /'
       sock?.write(
-        `HEAD / HTTP/1.1\r\nHost: ${t.host}\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nConnection: close\r\n\r\n`
+        `${req} HTTP/1.1\r\nHost: ${t.host}\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\nConnection: close\r\n\r\n`
       )
     })
   })

@@ -14,8 +14,12 @@ import type { ZapretServiceId } from '@shared/zapret'
 
 export interface CheckTarget {
   host: string
-  /** TLS handshake + `HEAD /` with a status line; false = the handshake only */
+  /** TLS handshake + an HTTP request with a status line; false = the handshake only */
   http: boolean
+  /** GET this path instead of `HEAD /` (a video node: /generate_204) */
+  path?: string
+  /** a YouTube video node (found at check time, videoNodes.ts) */
+  video?: boolean
 }
 
 export interface ServiceDef {

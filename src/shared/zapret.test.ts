@@ -3,6 +3,9 @@ import {
   addZapretDomain,
   normalizeZapretDomain,
   PUBLIC_SUFFIXES,
+  userRuleFor,
+  zapretRoute,
+  ZAPRET_ROUTE_TEXT,
   sanitizeZapretSettings,
   zapretStateText,
   ZAPRET_CUSTOM_MAX
@@ -150,5 +153,44 @@ describe('sanitizeZapretSettings', () => {
     expect(zapretStateText({ state: 'direct' })).toBe('напрямую ✓')
     expect(zapretStateText({ state: 'vpn' })).toBe('через VPN — напрямую не открылся')
     expect(zapretStateText({ state: 'checking' })).toBe('проверяется')
+  })
+})
+
+describe('«Правила»: how each item goes now (0.7.1)', () => {
+  const rule = (conditionType: string, value: string, action: string, enabled = true) => ({
+    conditionType,
+    value,
+    action,
+    enabled
+  })
+
+  it('the first enabled user rule that catches the service wins', () => {
+    expect(userRuleFor('youtube', [rule('DomainSuffix', 'googlevideo.com', 'PROXY')])).toBe('PROXY')
+    expect(userRuleFor('youtube', [rule('GeoSite', 'youtube', 'DIRECT')])).toBe('DIRECT')
+    expect(userRuleFor('youtube', [rule('DomainKeyword', 'youtube', 'Нидерланды')])).toBe(
+      'Нидерланды'
+    )
+    expect(userRuleFor('youtube', [rule('Domain', 'youtube.com', 'PROXY', false)])).toBeNull()
+    expect(userRuleFor('discord', [rule('ProcessName', 'Discord.exe', 'PROXY')])).toBeNull()
+    expect(userRuleFor('d:example.org', [rule('DomainSuffix', 'example.org', 'REJECT')])).toBe(
+      'REJECT'
+    )
+    expect(userRuleFor('d:example.org', [rule('DomainRegex', '([', 'PROXY')])).toBeNull()
+  })
+
+  it('the labels', () => {
+    const it = (state: 'direct' | 'vpn' | 'checking' | 'idle') => ({ key: 'youtube', state })
+    expect(ZAPRET_ROUTE_TEXT[zapretRoute(it('direct'), 'running', [])]).toBe('Напрямую + zapret ✓')
+    expect(ZAPRET_ROUTE_TEXT[zapretRoute(it('vpn'), 'running', [])]).toBe(
+      'Через VPN — напрямую не открылся'
+    )
+    expect(ZAPRET_ROUTE_TEXT[zapretRoute(it('idle'), 'off', [])]).toBe(
+      'Через VPN — zapret выключен'
+    )
+    expect(
+      ZAPRET_ROUTE_TEXT[zapretRoute(it('direct'), 'running', [rule('GeoSite', 'google', 'PROXY')])]
+    ).toBe('Ваше правило важнее: VPN')
+    expect(zapretRoute(it('checking'), 'starting', [])).toBe('checking')
+    expect(zapretRoute(it('idle'), 'idle', [])).toBe('waiting')
   })
 })

@@ -37,6 +37,64 @@ const QUIC6 = ['--dpi-desync=fake', '--dpi-desync-repeats=6', '--dpi-desync-fake
 const QUIC11 = ['--dpi-desync=fake', '--dpi-desync-repeats=11', '--dpi-desync-fake-quic=@%QUIC%']
 
 export const STRATEGIES: readonly DpiStrategy[] = [
+  // 0.7.1 — first: a FAKE ClientHello / fake SNI (www.google.com) in front of the
+  // real one. On Beeline the video nodes answer a ClientHello with SNI
+  // www.google.com and drop one with *.googlevideo.com: the DPI must see the
+  // fake first. From the YoutubeFix presets of zapret-discord-youtube.
+  {
+    id: 'yt-fake-autottl-md5sig',
+    name: 'YouTube: fake ClientHello (autottl, md5sig)',
+    from: 'YoutubeFix (для МГТС)',
+    tls: [
+      '--dpi-desync=fake',
+      '--dpi-desync-autottl=2',
+      '--dpi-desync-repeats=6',
+      '--dpi-desync-fooling=md5sig',
+      '--dpi-desync-fake-tls=@%TLS%'
+    ],
+    quic: QUIC6
+  },
+  {
+    id: 'yt-fake-split-badseq',
+    name: 'YouTube: fake + split (autottl, badseq)',
+    from: 'YoutubeFix, YoutubeFix_ALT',
+    tls: [
+      '--dpi-desync=fake,split',
+      '--dpi-desync-autottl=2',
+      '--dpi-desync-repeats=6',
+      '--dpi-desync-fooling=badseq',
+      '--dpi-desync-fake-tls=@%TLS%'
+    ],
+    quic: QUIC6
+  },
+  {
+    id: 'yt-fake-multisplit-sni',
+    name: 'YouTube: fake SNI www.google.com + multisplit',
+    from: 'general (FAKE TLS AUTO ALT3)',
+    tls: [
+      '--dpi-desync=fake,multisplit',
+      '--dpi-desync-split-seqovl=681',
+      '--dpi-desync-split-pos=1',
+      '--dpi-desync-fooling=ts',
+      '--dpi-desync-repeats=8',
+      '--dpi-desync-split-seqovl-pattern=@%TLS%',
+      '--dpi-desync-fake-tls-mod=rnd,dupsid,sni=www.google.com'
+    ],
+    quic: QUIC11
+  },
+  {
+    id: 'yt-fake-split2-ttl',
+    name: 'YouTube: fake + split2 (ttl 1)',
+    from: 'YoutubeFix (для ТТК)',
+    tls: [
+      '--dpi-desync=fake,split2',
+      '--dpi-desync-ttl=1',
+      '--dpi-desync-autottl=5',
+      '--dpi-desync-repeats=6',
+      '--dpi-desync-fake-tls=@%TLS%'
+    ],
+    quic: QUIC6
+  },
   {
     id: 'fake-fakedsplit-ts',
     name: 'Fake + fakedsplit (ts)',

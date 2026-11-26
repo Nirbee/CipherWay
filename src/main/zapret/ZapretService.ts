@@ -35,7 +35,16 @@ export interface StrategyMemo {
   /** null = nothing worked on this network */
   id: string | null
   at: number
+  /**
+   * 2 = picked with the check of a real YouTube video node (0.7.1); a memo of
+   * 0.7.0 (no `v`) is picked again — its «2 из 2» never saw the video
+   */
+  v?: number
+  /** the items this strategy opened when it was picked */
+  ok?: string[]
 }
+
+const MEMO_VERSION = 2
 
 export interface ZapretDeps {
   /** this build ships cipherway-dpi.exe and its files */
@@ -53,7 +62,17 @@ export interface ZapretDeps {
   daemon: () => Promise<DpiDaemonLike>
   network: () => Promise<NetworkInfo | null>
   pickDoh: (path: DirectPath) => Promise<DohServer | null>
-  checkTarget: (t: CheckTarget, doh: DohServer, path: DirectPath) => Promise<TargetResult>
+  checkTarget: (
+    t: CheckTarget,
+    doh: DohServer,
+    path: DirectPath,
+    timeoutMs?: number
+  ) => Promise<TargetResult>
+  /**
+   * YouTube's video nodes for this client (videoNodes.ts findVideoNodes).
+   * Absent (tests) = no video check; [] = none found → YouTube not verified.
+   */
+  videoNodes?: (doh: DohServer, path: DirectPath) => Promise<string[]>
   /** our VPN servers' addresses (never touched by zapret) */
   excludeIps: () => Promise<string[]>
   /** names an own domain may not be (the subscription host, the servers) */
@@ -83,6 +102,37 @@ const NOTHING_RETRY_MS = 6 * 60 * 60_000
 /** own domains checked during a pick (all of them in the regular checks) */
 const PICK_CUSTOM_MAX = 8
 const MEMORY_MAX = 30
+/** a target of a pick gets this long (failing strategies are many, the budget ~2 min) */
+const PICK_TARGET_MS = 5000
+/** the video nodes found are reused this long (per network) */
+const NODES_TTL_MS = 30 * 60_000
+
+// --- the fallback by live traffic (0.7.1) -----------------------------------
+// A connection the zapret set sent direct that got NOTHING back for this long
+// counts as «no answer» (the monitor's «Нет ответа» uses 4 s; a TLS ClientHello
+// eaten by DPI never gets an answer, a slow server answers well within 5 s).
+export const LIVE_STALL_MS = 5000
+/**
+ * this many such connections of one item within LIVE_WINDOW_MS → it goes back
+ * through the VPN at once. One stalled connection is a dead server or a lost
+ * packet; three different ones within a minute (a video page opens dozens) is
+ * the DPI. Not 2: a page with two dead trackers must not flip YouTube.
+ */
+export const LIVE_STALLS = 3
+export const LIVE_WINDOW_MS = 60_000
+/** re-checked this long after such a fallback (not at once: no flip-flop) */
+export const LIVE_RECHECK_MS = 3 * 60_000
+/** a second fallback of the same item within this time keeps it in the VPN this long */
+export const LIVE_REPEAT_MS = 30 * 60_000
+
+// --- DNS: the app switches the direct DoH when the core says it fails -------
+// sing-box has no fallback between DNS servers: «dns: exchange failed for x:
+// dial tcp 8.8.8.8:443: i/o timeout» → after this many in a minute the zapret
+// domains move to the other DoH (the rule-sets cw-z-dn / cw-z-dn2) and stay
+// there for DNS_HOLD_MS (the periodic check does not switch back meanwhile).
+export const DNS_FAILS = 2
+export const DNS_HOLD_MS = 30 * 60_000
+const DNS_FAIL_RE = /exchange failed for .*?\b(8\.8\.8\.8|1\.1\.1\.1):(?:443|853)\b/
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 
@@ -141,6 +191,15 @@ export function dpiErrorText(err: unknown): string {
   return `zapret не запустился: ${err instanceof Error ? err.message : String(err)}`
 }
 
+/** the part of a Clash API connection the live fallback reads */
+export interface LiveConnection {
+  id: string
+  rule?: string
+  start?: string
+  download?: number
+  metadata?: { host?: string; network?: string }
+}
+
 interface ItemState {
   state: ZapretItem['state']
   detail?: string
@@ -171,6 +230,14 @@ export class ZapretService {
   private lastAutoPick = new Map<string, number>()
   private timers: NodeJS.Timeout[] = []
   private lastRouting: string = JSON.stringify(NO_ZAPRET)
+  private nodes: { net: string | null; at: number; list: string[] } | null = null
+  /** live fallback: item → connection id → when it was seen stalled */
+  private stalls = new Map<string, Map<string, number>>()
+  /** item → direct is not trusted again before this time (after a live fallback) */
+  private liveHold = new Map<string, number>()
+  private lastLive = new Map<string, number>()
+  private dnsFails: number[] = []
+  private dnsHoldUntil = 0
 
   constructor(private d: ZapretDeps) {}
 
@@ -433,7 +500,8 @@ export class ZapretService {
   private async startFor(gen: number, firstCheck: boolean): Promise<void> {
     const memo = this.netId ? this.d.getMemory()[this.netId] : undefined
     const stale = memo && memo.id === null && this.now() - memo.at > NOTHING_RETRY_MS
-    if (!memo || stale || (memo.id && !strategyById(memo.id))) {
+    const old = memo && (memo.v ?? 0) < MEMO_VERSION
+    if (!memo || stale || old || (memo.id && !strategyById(memo.id))) {
       await this.pick(gen, false)
       return
     }
@@ -442,7 +510,9 @@ export class ZapretService {
     else await this.stopDpi()
     if (gen !== this.gen) return
     this.phase = 'running'
-    await this.check(gen, !firstCheck)
+    // a remembered strategy that no longer opens what it opened: picked again (rate-limited)
+    void firstCheck
+    await this.check(gen, true)
   }
 
   private async pollNetwork(gen: number): Promise<void> {
@@ -564,24 +634,51 @@ export class ZapretService {
   }
 
   /** key → ok / the first failure, every target of every key (bounded in time) */
+  /** the video nodes of this network (cached NODES_TTL_MS); null = no video check */
+  private async videoTargets(doh: DohServer): Promise<CheckTarget[] | null> {
+    if (!this.d.videoNodes) return null
+    const fresh =
+      this.nodes && this.nodes.net === this.netId && this.now() - this.nodes.at < NODES_TTL_MS
+    if (!fresh || !this.nodes?.list.length) {
+      const list = await this.d.videoNodes(doh, this.path()).catch(() => [] as string[])
+      this.nodes = { net: this.netId, at: this.now(), list }
+      if (list.length)
+        this.d.log('info', `zapret: видеосерверы YouTube для проверки — ${list.join(', ')}`)
+    }
+    return (this.nodes?.list ?? []).map((host) => ({
+      host,
+      http: true,
+      path: '/generate_204',
+      video: true
+    }))
+  }
+
   private async probe(
     keys: string[],
     doh: DohServer,
-    budgetMs: number
+    budgetMs: number,
+    targetMs?: number
   ): Promise<Map<string, { ok: boolean; detail?: string }>> {
     const path = this.path()
     const out = new Map<string, { ok: boolean; detail?: string }>()
     const jobs = keys.flatMap((key) => this.targetsOf(key).map((t) => ({ key, t })))
+    // YouTube = its pages AND a real video node (the video may be throttled alone)
+    let noVideo = false
+    if (keys.includes('youtube')) {
+      const video = await this.videoTargets(doh)
+      if (video && video.length === 0) noVideo = true
+      for (const t of video ?? []) jobs.push({ key: 'youtube', t })
+    }
     const results: (TargetResult | null)[] = new Array(jobs.length).fill(null)
     let next = 0
     const worker = async (): Promise<void> => {
       while (next < jobs.length) {
         const i = next++
         const { key, t } = jobs[i]
-        let r = await this.d.checkTarget(t, doh, path)
+        let r = await this.d.checkTarget(t, doh, path, targetMs)
         // an own domain without an address of its own: www.<domain>
         if (!r.ok && r.error === 'dns' && key.startsWith('d:') && !t.host.startsWith('www.')) {
-          r = await this.d.checkTarget({ ...t, host: `www.${t.host}` }, doh, path)
+          r = await this.d.checkTarget({ ...t, host: `www.${t.host}` }, doh, path, targetMs)
         }
         results[i] = r
       }
@@ -595,8 +692,19 @@ export class ZapretService {
     jobs.forEach(({ key, t }, i) => {
       const r = results[i] ?? { host: t.host, ok: false, error: 'timeout' }
       const cur = out.get(key)
-      if (!r.ok && cur?.ok) out.set(key, { ok: false, detail: failureText(r) })
+      if (!r.ok && cur?.ok) {
+        out.set(key, {
+          ok: false,
+          detail: t.video ? `видео не открывается напрямую — ${failureText(r)}` : failureText(r)
+        })
+      }
     })
+    if (noVideo && out.get('youtube')?.ok) {
+      out.set('youtube', {
+        ok: false,
+        detail: 'не найден видеосервер YouTube — видео не проверить'
+      })
+    }
     return out
   }
 
@@ -610,7 +718,8 @@ export class ZapretService {
       const doh = await this.d.pickDoh(this.path()).catch(() => null)
       if (gen !== this.gen) return
       const before = new Set(this.direct)
-      if (doh) this.dns = doh
+      // after the core reported the DoH failing, keep the other one for a while
+      if (doh && this.now() >= this.dnsHoldUntil) this.dns = doh
       const res = doh
         ? await this.probe(keys, doh, this.d.checkBudgetMs ?? 60_000)
         : new Map(
@@ -627,7 +736,12 @@ export class ZapretService {
       const lost = [...before].filter((k) => keys.includes(k) && !this.direct.has(k))
       if (lost.length)
         this.d.log('warn', `zapret: напрямую перестало открываться — ${lost.join(', ')}; через VPN`)
-      if (auto && lost.length && this.strategyId && this.canAutoPick()) {
+      // the strategy broke: an item it opened when it was picked (or was open a moment ago) fails
+      const memo = this.netId ? this.d.getMemory()[this.netId] : undefined
+      const broken = keys.some(
+        (k) => !this.direct.has(k) && (before.has(k) || (memo?.ok ?? []).includes(k))
+      )
+      if (auto && broken && this.strategyId && this.canAutoPick()) {
         this.checking = false
         this.d.log('info', 'zapret: стратегия перестала работать — подбираем заново')
         await this.pick(gen, false)
@@ -644,7 +758,14 @@ export class ZapretService {
     this.direct.clear()
     for (const key of keys) {
       const r = res.get(key)
-      if (r?.ok) {
+      const held = (this.liveHold.get(key) ?? 0) > this.now()
+      if (r?.ok && held) {
+        // went back to the VPN because live connections got no answer: not yet
+        this.items.set(key, {
+          state: 'vpn',
+          detail: 'соединения напрямую недавно не получали ответа — проверим ещё раз позже'
+        })
+      } else if (r?.ok) {
         this.direct.add(key)
         this.items.set(key, { state: 'direct' })
       } else {
@@ -683,6 +804,94 @@ export class ZapretService {
     return zapretRouting(this.d.getSettings(), this.active ? this.direct : new Set(), this.dns)
   }
 
+  // --- live traffic (0.7.1) ---------------------------------------------------------
+
+  /** which switched-on item a host belongs to (null = none) */
+  private keyOfHost(host: string): string | null {
+    const h = host.toLowerCase()
+    const under = (d: string): boolean => h === d || h.endsWith(`.${d}`)
+    const s = this.d.getSettings()
+    for (const id of s.services) {
+      if ((SERVICE_DEFS[id]?.domains ?? []).some(under)) return id
+    }
+    for (const d of s.custom) if (under(d)) return customKey(d)
+    return null
+  }
+
+  /**
+   * Every /connections snapshot of the core (once a second): a direct
+   * connection of a zapret item that got nothing back for LIVE_STALL_MS is
+   * counted; LIVE_STALLS of them within LIVE_WINDOW_MS → that item goes back
+   * through the VPN at once and is re-checked after LIVE_RECHECK_MS.
+   */
+  onConnections(raw: { connections?: LiveConnection[] | null }): void {
+    if (!this.active || this.direct.size === 0) return
+    const now = this.now()
+    for (const c of raw.connections ?? []) {
+      if (!/cw-z-d\b/.test(c.rule ?? '')) continue
+      if ((c.metadata?.network ?? 'tcp') !== 'tcp' || (c.download ?? 0) > 0) continue
+      const start = c.start ? Date.parse(c.start) : NaN
+      if (!Number.isFinite(start) || now - start < LIVE_STALL_MS) continue
+      const key = this.keyOfHost(c.metadata?.host ?? '')
+      if (!key || !this.direct.has(key)) continue
+      let m = this.stalls.get(key)
+      if (!m) this.stalls.set(key, (m = new Map()))
+      if (!m.has(c.id)) m.set(c.id, now)
+    }
+    for (const [key, m] of this.stalls) {
+      for (const [id, at] of m) if (now - at > LIVE_WINDOW_MS) m.delete(id)
+      if (m.size >= LIVE_STALLS && this.direct.has(key)) this.liveFallback(key, m.size)
+    }
+  }
+
+  private liveFallback(key: string, count: number): void {
+    const now = this.now()
+    const repeated = now - (this.lastLive.get(key) ?? -Infinity) < LIVE_REPEAT_MS
+    this.lastLive.set(key, now)
+    this.liveHold.set(key, now + (repeated ? LIVE_REPEAT_MS : LIVE_RECHECK_MS))
+    this.stalls.delete(key)
+    this.direct.delete(key)
+    this.items.set(key, {
+      state: 'vpn',
+      detail: 'соединения напрямую не получают ответа — временно через VPN'
+    })
+    this.d.log(
+      'warn',
+      `zapret: ${key}: ${count} соединения напрямую без ответа за минуту — через VPN, перепроверка через ${repeated ? 30 : 3} мин`
+    )
+    void this.route().then(() => this.publish())
+    const gen = this.gen
+    const t = setTimeout(
+      () => {
+        if (gen !== this.gen) return
+        void this.serial(() => this.check(gen, true)).catch(() => undefined)
+      },
+      (repeated ? LIVE_REPEAT_MS : LIVE_RECHECK_MS) + 1000
+    )
+    t.unref?.()
+    this.timers.push(t)
+  }
+
+  /** core log lines: the direct DoH failing → the zapret domains to the other one */
+  onCoreLine(line: string): void {
+    if (!this.active) return
+    const m = DNS_FAIL_RE.exec(line)
+    if (!m) return
+    const failed: DohServer = m[1] === '8.8.8.8' ? 'primary' : 'fallback'
+    if (failed !== this.dns) return
+    const now = this.now()
+    this.dnsFails = [...this.dnsFails.filter((t) => now - t < 60_000), now]
+    if (this.dnsFails.length < DNS_FAILS) return
+    this.dnsFails = []
+    this.dns = failed === 'primary' ? 'fallback' : 'primary'
+    this.dnsHoldUntil = now + DNS_HOLD_MS
+    this.d.log(
+      'warn',
+      `zapret: DNS ${m[1]} не отвечает — домены переключены на ${this.dns === 'primary' ? '8.8.8.8' : '1.1.1.1'}`
+    )
+    void this.route()
+  }
+
   // --- the pick ------------------------------------------------------------------
 
   /**
@@ -716,7 +925,7 @@ export class ZapretService {
       if (!doh) {
         reason = 'DNS-серверы 8.8.8.8 и 1.1.1.1 не отвечают напрямую'
       } else {
-        this.dns = doh
+        if (this.now() >= this.dnsHoldUntil) this.dns = doh
         for (const s of STRATEGIES) {
           if (gen !== this.gen) return
           const left = end - this.now()
@@ -730,7 +939,8 @@ export class ZapretService {
           const res = await this.probe(
             sample,
             doh,
-            Math.min(15_000, Math.max(1000, end - this.now()))
+            Math.min(15_000, Math.max(1000, end - this.now())),
+            PICK_TARGET_MS
           )
           if (gen !== this.gen) return
           const ok = new Set(sample.filter((k) => res.get(k)?.ok))
@@ -752,7 +962,9 @@ export class ZapretService {
         'info',
         `zapret: выбрана стратегия «${strategyById(best.id)?.name}» — открывается ${best.ok.size} из ${sample.length}`
       )
-      if (this.netId) memory[this.netId] = { id: best.id, at: this.now() }
+      if (this.netId) {
+        memory[this.netId] = { id: best.id, at: this.now(), v: MEMO_VERSION, ok: [...best.ok] }
+      }
     } else {
       this.strategyId = null
       await this.stopDpi()
@@ -762,7 +974,7 @@ export class ZapretService {
       )
       // «nothing works here» only when strategies were really tried (not: no service / another bypass)
       if (this.netId && !this.warning && !this.error)
-        memory[this.netId] = { id: null, at: this.now() }
+        memory[this.netId] = { id: null, at: this.now(), v: MEMO_VERSION }
     }
     if (this.netId) this.d.setMemory(trimMemory(memory))
     if (gen !== this.gen) return

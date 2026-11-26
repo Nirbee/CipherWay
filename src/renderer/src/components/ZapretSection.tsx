@@ -3,7 +3,10 @@ import {
   ZAPRET_CUSTOM_MAX,
   ZAPRET_SERVICES,
   normalizeZapretDomain,
-  zapretStateText,
+  zapretRoute,
+  ZAPRET_ROUTE_TEXT,
+  type RuleLike,
+  type ZapretRoute,
   type ZapretItem,
   type ZapretServiceId,
   type ZapretView
@@ -33,10 +36,38 @@ const WARNING_POINTS = [
   'Если сайт не откроется напрямую, приложение само вернёт его в VPN и попробует снова позже.'
 ]
 
-export function ZapretSection({
-  Section
+/** «Правила» → the section's frame (the page has no settings cards) */
+function DefaultSection({
+  title,
+  hint,
+  children
 }: {
-  Section: (p: { title: string; hint?: string; children: ReactNode }) => JSX.Element
+  title: string
+  hint?: string
+  children: ReactNode
+}): JSX.Element {
+  return (
+    <section className="mt-4">
+      <div className="mb-2 px-1">
+        <div className="text-sm font-semibold text-text-primary">{title}</div>
+        {hint && <div className="mt-0.5 text-[11px] text-text-muted">{hint}</div>}
+      </div>
+      <Card className="space-y-4 p-4">{children}</Card>
+    </section>
+  )
+}
+
+/**
+ * «Правила» (0.7.1): «Ускорение без VPN» right under the user's rules — they
+ * are checked first, and every service / own site shows how it goes now.
+ */
+export function ZapretSection({
+  rules,
+  Section = DefaultSection
+}: {
+  /** the user's rules: one that catches a service wins over zapret */
+  rules: readonly RuleLike[]
+  Section?: (p: { title: string; hint?: string; children: ReactNode }) => JSX.Element
 }) {
   const [view, setView] = useState<ZapretView | null>(null)
   const [busy, setBusy] = useState(false)
@@ -134,8 +165,12 @@ export function ZapretSection({
                 />
                 {svc.name}
               </label>
-              {s.enabled && s.services.includes(svc.id) && (
-                <StatePill item={items.get(svc.id)} phase={view.phase} />
+              {s.services.includes(svc.id) && (
+                <RoutePill
+                  item={items.get(svc.id) ?? { key: svc.id, state: 'idle' }}
+                  phase={view.phase}
+                  rules={rules}
+                />
               )}
             </div>
           ))}
@@ -184,7 +219,11 @@ export function ZapretSection({
                   {d}
                 </span>
                 <div className="flex shrink-0 items-center gap-2">
-                  {s.enabled && <StatePill item={items.get(`d:${d}`)} phase={view.phase} />}
+                  <RoutePill
+                    item={items.get(`d:${d}`) ?? { key: `d:${d}`, state: 'idle' }}
+                    phase={view.phase}
+                    rules={rules}
+                  />
                   <button
                     className="flex h-6 w-6 items-center justify-center rounded-lg text-text-muted hover:bg-bg-elevated hover:text-text-primary disabled:opacity-40"
                     title="Удалить"
@@ -256,14 +295,35 @@ export function ZapretSection({
   )
 }
 
-function StatePill({ item, phase }: { item: ZapretItem | undefined; phase: ZapretView['phase'] }) {
-  if (!item || item.state === 'idle') {
-    return <Pill>{phase === 'idle' ? 'включится с VPN' : 'выключено'}</Pill>
-  }
-  const tone = item.state === 'direct' ? 'green' : item.state === 'vpn' ? 'amber' : 'blue'
+const ROUTE_TONE: Record<ZapretRoute, 'green' | 'amber' | 'blue' | 'neutral' | 'red'> = {
+  direct: 'green',
+  vpn_failed: 'amber',
+  vpn_off: 'neutral',
+  user_vpn: 'blue',
+  user_direct: 'neutral',
+  user_block: 'red',
+  checking: 'blue',
+  waiting: 'neutral'
+}
+
+/** how the item goes right now: the user's rules first, then zapret */
+function RoutePill({
+  item,
+  phase,
+  rules
+}: {
+  item: Pick<ZapretItem, 'key' | 'state' | 'detail'>
+  phase: ZapretView['phase']
+  rules: readonly RuleLike[]
+}) {
+  const route = zapretRoute(item, phase, rules)
   return (
-    <Pill tone={tone} title={item.detail}>
-      {zapretStateText(item)}
+    <Pill
+      tone={ROUTE_TONE[route]}
+      title={route === 'vpn_failed' ? item.detail : undefined}
+      className="max-w-[260px] truncate"
+    >
+      {ZAPRET_ROUTE_TEXT[route]}
     </Pill>
   )
 }
