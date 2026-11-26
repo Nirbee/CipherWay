@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest'
+import { DPI_ALL } from './coreNames'
 import {
+  dpiTaskName,
   elevateCommand,
   installScript,
   isValidSid,
@@ -67,7 +69,7 @@ describe('«Служба TUN» scripts (0.4.2)', () => {
     expect(broker).toContain('$psi.FileName = $CoreExe')
     for (const k of ['cache', 'path', '_ui', 'download', 'certificate', 'platform'])
       expect(broker).toMatch(new RegExp(`\\$Forbidden = .*${k}`))
-    expect(broker).toContain("'^127\\.0\\.0\\.1:\\d{1,5}$'")
+    expect(broker).toContain("'^127\\.0\\.0\\.1:\\d{1,5}\\z'")
     expect(broker).toContain("if ($x.type -ne 'tun')")
     expect(broker).toContain("$x.type -ne 'local' -or $x.format -ne 'source'")
   })
@@ -106,9 +108,12 @@ describe('«Служба TUN» scripts (0.4.2)', () => {
   })
 
   it('needs a fresh request from a live app', () => {
-    expect(broker).toContain("$ctl.cmd -ne 'run'")
+    expect(broker).toContain("$ctl.cmd -cne 'run'")
     expect(broker).toContain('-gt 120000')
-    expect(broker).toContain('Alive $ctl.pid')
+    // numbers of the request: range-checked before any cast (never quoted in an error)
+    expect(broker).toContain('(Num $ctl.ts)')
+    expect(broker).toContain('Alive (Num $ctl.pid)')
+    expect(broker).not.toMatch(/\[long\]\$c(tl)?\./)
   })
 
   const install = installScript({
@@ -182,5 +187,102 @@ describe('«Служба TUN» scripts (0.4.2)', () => {
       `'-File','"C:\\Users\\O''Нил\\x.ps1"'`
     )
     expect(elevateCommand('C:\\x.ps1')).toContain('catch { exit 1223 }')
+  })
+})
+
+describe('the zapret task of the service (0.7.0)', () => {
+  const sid = 'S-1-5-21-1111111111-2222222222-3333333333-1001'
+  const base = { 'cipherway-core.exe': 'a'.repeat(64), 'wintun.dll': 'b'.repeat(64) }
+  const dpiHashes = Object.fromEntries(DPI_ALL.map((f, i) => [f, String(i + 1).repeat(64)]))
+  const params = {
+    sid,
+    srcBinDir: 'C:\b',
+    brokerText: 'tun',
+    brokerHash: 'c'.repeat(64),
+    appVersion: '0.7.0'
+  }
+
+  it('copies every zapret file (hash-checked) and registers «CipherWay DPI <SID>» as SYSTEM', () => {
+    const install = installScript({
+      ...params,
+      hashes: { ...base, ...dpiHashes },
+      dpiBrokerText: 'dpi',
+      dpiBrokerHash: 'd'.repeat(64)
+    })
+    for (const f of DPI_ALL) {
+      expect(install).toContain(`'${f}' = '${dpiHashes[f]}'`)
+      expect(install).toContain(`Put-File (Join-Path $SrcBin '${f}') '${f}' $DpiBin`)
+    }
+    expect(install).toContain(`$DpiTaskName = '${dpiTaskName(sid)}'`)
+    expect(install).toContain('RegisterTask($DpiTaskName, $DpiXml, 6, $null, $null, 5, $TaskSddl)')
+    expect(install).toContain('-File "$DpiBrokerX"')
+    expect(install).toContain('"dpiBroker":"' + 'd'.repeat(64) + '"')
+    // a loaded WinDivert can't be overwritten: renamed instead, only for zapret's files
+    expect(install).toContain('if ($DpiNames -notcontains $name) { throw }')
+  })
+
+  it('a build without zapret: no DPI task, nothing of it copied', () => {
+    const install = installScript({ ...params, hashes: base })
+    expect(install).not.toContain('DpiXml')
+    expect(install).not.toContain("Put-File (Join-Path $SrcBin 'cipherway-dpi.exe')")
+    expect(() =>
+      installScript({
+        ...params,
+        hashes: { ...base, ...dpiHashes, 'cygwin1.dll': 'zz' },
+        dpiBrokerText: 'dpi',
+        dpiBrokerHash: 'd'.repeat(64)
+      })
+    ).toThrow()
+  })
+
+  it('removal deletes the DPI task and stops only our winws', () => {
+    const u = uninstallScript(sid)
+    expect(u).toContain('DeleteTask($DpiTaskName, 0)')
+    // our file (new or old place) AND this user's hostlist in its command line
+    expect(u).toContain("$DpiHosts = Join-Path $Dir 'dpi\\hosts.txt'")
+    expect(u).toContain(`$cl.IndexOf('"--hostlist=' + $DpiHosts + '"'`)
+    expect(u).toContain('$DpiExes -contains $o.MainModule.FileName -and $mine')
+  })
+
+  it("zapret's files: admin-only <Root>\\dpi\\bin (Cygwin's root <Root>\\dpi holds nothing else); out of the shared bin", () => {
+    const install = installScript({
+      ...params,
+      hashes: { ...base, ...dpiHashes },
+      dpiBrokerText: 'dpi',
+      dpiBrokerHash: 'd'.repeat(64)
+    })
+    expect(install).toContain("$DpiRoot = Join-Path $Root 'dpi'")
+    expect(install).toMatch(
+      /Secure-Dir \$DpiRoot \$Admins\s+Clean-CygwinRoot\s+Secure-Dir \$DpiBin \$Admins/
+    )
+    expect(install).toContain("Secure-Dir (Join-Path $Root 'tmp') $Admins")
+    expect(install).toContain("if ($leaf -eq 'bin' -and $isDir -and -not $link) { continue }")
+    // links removed as links (no recursion into them); anything else moved aside, never deleted recursively
+    expect(install).toContain('if ($isDir) { [IO.Directory]::Delete($e) } else { [IO.File]::Delete($e) }')
+    expect(install).toContain("} elseif ($leaf -like '*.untrusted-*') {")
+    const clean = install.slice(install.indexOf('function Clean-CygwinRoot'), install.indexOf('function Remove-DpiFromBin'))
+    expect(clean).not.toContain('Delete($e, $true)')
+    // the old place: removed after the new copies are in (a loaded driver: renamed)
+    expect(install).toMatch(
+      /Put-File \(Join-Path \$SrcBin 'quic_initial_www_google_com\.bin'\)[^\n]*\n\s+try \{ Remove-DpiFromBin \}/
+    )
+    expect(install).toContain(
+      "[IO.File]::Move($f, $f + '.old-' + [Guid]::NewGuid().ToString('N'))"
+    )
+    expect(install).not.toMatch(/'cipherway-dpi\.exe'\) 'cipherway-dpi\.exe'\s*$/m)
+  })
+
+  it('anchors of the shared broker helpers and the TUN config check: \\z, refused values cleaned', () => {
+    const tun = serviceBrokerScript({ sid, userRunDir: 'C:\\r', hashes: base })
+    expect(tun).toContain("$c.session -cnotmatch '^[0-9a-f]{16,64}\\z'")
+    expect(tun).toContain("$NameRe = '^cw-[0-9a-z-]{1,40}\\.json\\z'")
+    expect(tun).toContain("'^127\\.0\\.0\\.1:\\d{1,5}\\z'")
+    expect(tun).not.toMatch(/match '[^']*\$'/)
+    expect(tun).toContain("throw ('cw-config выход ' + (Safe $x.type))")
+    expect(tun).toContain("[regex]::Replace(([string]$s).ToLowerInvariant(), '[^a-z0-9._-]', '')")
+    // the state: a fixed code only; the JSON parse never quotes the config
+    expect(tun).toContain("try { $c = $text | ConvertFrom-Json } catch { throw 'cw-config не JSON' }")
+    expect(tun).toContain("$State.error = 'failed'")
+    expect(tun).not.toContain('$State.error = [string]$_.Exception.Message')
   })
 })

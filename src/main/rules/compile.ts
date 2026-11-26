@@ -446,5 +446,67 @@ export function ruleSkeleton(
       interrupt_exist_connections: false
     })
   }
+  // «Ускорение без VPN»: after every user slot — the user's rules win
+  ruleSets.push(...ZAPRET_SETS.map(local))
+  routeRules.push(
+    { rule_set: [ZAPRET_DIRECT], action: 'route', outbound: TAG_DIRECT },
+    { rule_set: [ZAPRET_PROXY], action: 'route', outbound: TAG_PROXY_GROUP }
+  )
+  dnsRules.push(
+    { rule_set: [ZAPRET_DNS], server: ZAPRET_DNS_SERVER },
+    { rule_set: [ZAPRET_DNS2], server: ZAPRET_DNS_SERVER2 }
+  )
   return { ruleSets, routeRules, dnsRules, outbounds }
+}
+
+// ---------------------------------------------------------------------------
+// «Ускорение без VPN (zapret)» (0.7.0): the domains / addresses of the chosen
+// services and the user's own domains. Four fixed rule-sets after all slots of
+// the user's rules (so the user's rules always win), in every config — turning
+// the feature on / off or moving a service between «напрямую» and «через VPN»
+// only rewrites the files, the core is never restarted:
+//   cw-z-d    → direct (zapret, src/main/zapret, removes DPI throttling for them)
+//   cw-z-p    → proxy  (a service that did not open directly — back to the VPN)
+//   cw-z-dn   domains of cw-z-d → DNS «zapret-dns»  (DoH 8.8.8.8, direct)
+//   cw-z-dn2  domains of cw-z-d → DNS «zapret-dns2» (DoH 1.1.1.1, direct) — the
+//             fallback while 8.8.8.8 does not answer directly
+// Never the provider's DNS (77.88.8.8 / the system one): it may answer with a
+// stub page for these domains. Only one of the two DNS sets is filled at a time.
+// ---------------------------------------------------------------------------
+
+export const ZAPRET_DIRECT = 'cw-z-d'
+export const ZAPRET_PROXY = 'cw-z-p'
+export const ZAPRET_DNS = 'cw-z-dn'
+export const ZAPRET_DNS2 = 'cw-z-dn2'
+const ZAPRET_SETS = [ZAPRET_DIRECT, ZAPRET_PROXY, ZAPRET_DNS, ZAPRET_DNS2]
+export const ZAPRET_DNS_SERVER = 'zapret-dns'
+export const ZAPRET_DNS_SERVER2 = 'zapret-dns2'
+
+/** What the zapret sets hold right now (src/main/zapret/routing.ts builds it). */
+export interface ZapretRouting {
+  /** rules of the services / domains that open directly */
+  direct: HeadlessRule[]
+  /** … that did not: through the VPN */
+  proxy: HeadlessRule[]
+  /** which direct DoH resolves the direct domains */
+  dns: 'primary' | 'fallback'
+}
+
+export const NO_ZAPRET: ZapretRouting = { direct: [], proxy: [], dns: 'primary' }
+
+/** File name → rule-set text of the four zapret sets (empty ones included). */
+export function zapretFiles(r: ZapretRouting = NO_ZAPRET): Record<string, string> {
+  const names = domainOnly(r.direct)
+  return {
+    [slotFile(ZAPRET_DIRECT)]: ruleSetText(r.direct),
+    [slotFile(ZAPRET_PROXY)]: ruleSetText(r.proxy),
+    [slotFile(ZAPRET_DNS)]: ruleSetText(r.dns === 'primary' ? names : []),
+    [slotFile(ZAPRET_DNS2)]: ruleSetText(r.dns === 'fallback' ? names : [])
+  }
+}
+
+/** «Подключения»: what the zapret sets are called. */
+export const ZAPRET_LABELS: Record<string, string> = {
+  [ZAPRET_DIRECT]: 'Ускорение без VPN (zapret)',
+  [ZAPRET_PROXY]: 'Ускорение без VPN: напрямую не открылся — через VPN'
 }

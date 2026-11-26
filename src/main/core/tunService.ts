@@ -5,8 +5,9 @@ import { readdir, readFile, rm, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import type { TunServiceInfo } from '@shared/types'
 import { brokerScript, parseCoreExit, psQuote, type CoreExit } from './broker'
-import { CORE_EXE, LAN_EXE } from './coreNames'
+import { CORE_EXE, DPI_ALL, DPI_EXE, DPI_HASHES, LAN_EXE, ZAPRET_TAG } from './coreNames'
 import {
+  dpiTaskName,
   elevateCommand,
   installScript,
   isValidSid,
@@ -14,10 +15,12 @@ import {
   serviceBrokerScript,
   taskName,
   uninstallScript,
-  type BrokerHashes
+  type BrokerHashes,
+  type InstallParams
 } from './serviceScripts'
 import { writeAtomic } from './atomicFile'
 import { lanBrokerScript } from '../lan/lanBroker'
+import { dpiBrokerScript, type DpiHashes } from '../zapret/dpiBroker'
 
 // ---------------------------------------------------------------------------
 // TUN needs admin rights. Two ways to get them (see serviceScripts.ts):
@@ -273,6 +276,11 @@ export interface TunServiceOpts {
   taskExists?: (name: string) => Promise<boolean>
   /** tests: the Windows user instead of `whoami` */
   sidOverride?: string
+  /**
+   * the app's own exe (default process.execPath — electron.exe in dev): the
+   * zapret broker serves only a live process of exactly this file of this user
+   */
+  appExe?: string
 }
 
 /** Install / status / removal of the «Служба TUN» task. */
@@ -309,11 +317,37 @@ export class TunService {
     return existsSync(join(this.o.binDir, LAN_EXE))
   }
 
+  /** this build ships zapret (cipherway-dpi.exe and every file it needs) */
+  get hasDpi(): boolean {
+    return DPI_ALL.every((f) => existsSync(join(this.o.binDir, f)))
+  }
+
+  /**
+   * Why zapret can't be set up from this build (a file differs from the pinned
+   * release); null = fine or not shipped. TUN and LAN are not affected.
+   */
+  dpiProblem: string | null = null
+
   private async hashes(): Promise<BrokerHashes> {
+    let dpi: Record<string, string> = {}
+    this.dpiProblem = null
+    if (this.hasDpi) {
+      for (const f of DPI_ALL) {
+        dpi[f] = await fileSha256(join(this.o.binDir, f))
+        // only the pinned files of the zapret release ever go to the SYSTEM folder;
+        // another file: zapret is left out, TUN and LAN are set up as usual
+        if (dpi[f] !== DPI_HASHES[f]) {
+          this.dpiProblem = `Файл zapret ${f} не совпадает с закреплённым выпуском ${ZAPRET_TAG} — переустановите приложение`
+          dpi = {}
+          break
+        }
+      }
+    }
     return {
       [CORE_EXE]: await fileSha256(join(this.o.binDir, CORE_EXE)),
       'wintun.dll': await fileSha256(join(this.o.binDir, 'wintun.dll')),
-      ...(this.hasLan ? { [LAN_EXE]: await fileSha256(join(this.o.binDir, LAN_EXE)) } : {})
+      ...(this.hasLan ? { [LAN_EXE]: await fileSha256(join(this.o.binDir, LAN_EXE)) } : {}),
+      ...dpi
     }
   }
 
@@ -340,6 +374,19 @@ export class TunService {
     })
   }
 
+  /** null = this build has no zapret */
+  async dpiBrokerText(sid: string): Promise<string | null> {
+    const h = await this.hashes()
+    if (!h[DPI_EXE]) return null
+    return dpiBrokerScript({
+      sid,
+      userRunDir: this.o.runDir,
+      appExe: this.o.appExe ?? process.execPath,
+      hashes: Object.fromEntries(DPI_ALL.map((f) => [f, h[f] ?? ''])) as DpiHashes,
+      rootOverride: this.o.rootOverride
+    })
+  }
+
   private taskExists(name: string): Promise<boolean> {
     return this.o.taskExists
       ? this.o.taskExists(name)
@@ -355,17 +402,21 @@ export class TunService {
             JSON.parse(t.replace(/^\ufeff/, '')) as {
               broker?: string
               lanBroker?: string
+              dpiBroker?: string
               files?: BrokerHashes
             }
         )
         .catch(() => null)
       const task = await this.taskExists(taskName(sid))
-      if (!manifest || !task) return { state: 'missing', lan: false }
+      if (!manifest || !task) return { state: 'missing', lan: false, dpi: false }
       // the installed LAN task works on its own even when the app is newer
       const lan = !!manifest.lanBroker && (await this.taskExists(lanTaskName(sid)))
+      const dpi = !!manifest.dpiBroker && (await this.taskExists(dpiTaskName(sid)))
       const want = await this.hashes()
       const broker = sha256(await this.brokerText(sid))
       const lanText = await this.lanBrokerText(sid)
+      const dpiText = await this.dpiBrokerText(sid)
+      const dpiError = this.dpiProblem
       const same =
         manifest.broker === broker &&
         // a manifest of ≤0.4.2 lists sing-box.exe → «outdated» → one UAC prompt
@@ -374,12 +425,23 @@ export class TunService {
         // ≤0.4.5 had no LAN task → «outdated»
         manifest.files?.[LAN_EXE] === want[LAN_EXE] &&
         manifest.lanBroker === (lanText === null ? undefined : sha256(lanText)) &&
-        (lanText === null || lan)
-      return { state: same ? 'ok' : 'outdated', lan }
+        (lanText === null || lan) &&
+        // ≤0.6.0 had no zapret task → «outdated»; broken zapret files: its part is not compared
+        (dpiError !== null ||
+          (DPI_ALL.every((f) => manifest.files?.[f] === want[f]) &&
+            manifest.dpiBroker === (dpiText === null ? undefined : sha256(dpiText)) &&
+            (dpiText === null || dpi)))
+      return {
+        state: same ? 'ok' : 'outdated',
+        lan,
+        dpi: dpi && dpiError === null,
+        ...(dpiError ? { dpiError } : {})
+      }
     } catch (err) {
       return {
         state: 'missing',
         lan: false,
+        dpi: false,
         detail: err instanceof Error ? err.message : String(err)
       }
     }
@@ -401,23 +463,35 @@ export class TunService {
     }
   }
 
-  async install(): Promise<'ok' | 'cancelled' | 'failed'> {
-    const sid = await this.sid()
+  /**
+   * What the installer gets. The zapret files are checked against the pinned
+   * hashes here: other files → no zapret part at all (TUN and LAN as usual).
+   */
+  async installParams(sid: string): Promise<InstallParams> {
     const brokerText = await this.brokerText(sid)
     const lanBrokerText = await this.lanBrokerText(sid)
-    this.o.log('info', 'Установка службы CipherWay (TUN и LAN, один запрос прав администратора)')
-    const res = await this.elevated(
-      'tun-install',
-      installScript({
-        sid,
-        srcBinDir: this.o.binDir,
-        brokerText,
-        hashes: await this.hashes(),
-        brokerHash: sha256(brokerText),
-        ...(lanBrokerText ? { lanBrokerText, lanBrokerHash: sha256(lanBrokerText) } : {}),
-        appVersion: this.o.appVersion
-      })
+    const dpiBrokerText = await this.dpiBrokerText(sid)
+    if (this.dpiProblem) this.o.log('error', `zapret не устанавливается: ${this.dpiProblem}`)
+    return {
+      sid,
+      srcBinDir: this.o.binDir,
+      brokerText,
+      hashes: await this.hashes(),
+      brokerHash: sha256(brokerText),
+      ...(lanBrokerText ? { lanBrokerText, lanBrokerHash: sha256(lanBrokerText) } : {}),
+      ...(dpiBrokerText ? { dpiBrokerText, dpiBrokerHash: sha256(dpiBrokerText) } : {}),
+      appVersion: this.o.appVersion
+    }
+  }
+
+  async install(): Promise<'ok' | 'cancelled' | 'failed'> {
+    const sid = await this.sid()
+    const params = await this.installParams(sid)
+    this.o.log(
+      'info',
+      `Установка службы CipherWay (TUN, LAN${params.dpiBrokerText ? ' и zapret' : ''}, один запрос прав администратора)`
     )
+    const res = await this.elevated('tun-install', installScript(params))
     if (res === 'failed') {
       const why = await readFile(join(this.homeDir(sid), 'install-error.txt'), 'utf8').catch(
         () => ''
@@ -447,6 +521,23 @@ export class TunService {
         })
     )
   }
+}
+
+/**
+ * The broker writes fixed codes only (never an exception text or a piece of the
+ * user's config) — the readable text is made here. Details: its broker.log.
+ */
+const TUN_BROKER_ERRORS: Record<string, string> = {
+  no_request: 'нет свежего запроса на запуск',
+  config: 'конфигурация не прошла проверку службы',
+  core_changed: 'файлы ядра изменены — обновите службу в «Настройках»',
+  link: 'папка приложения — ссылка',
+  write: 'не удалось записать файл службы',
+  failed: 'внутренняя ошибка службы (подробности — в её журнале broker.log)'
+}
+
+export function tunBrokerErrorText(code: string): string {
+  return TUN_BROKER_ERRORS[code] ?? code
 }
 
 /** Service broker protocol, app side (see serviceScripts.ts). */
@@ -554,7 +645,7 @@ export class ServiceLauncher implements TunLauncher {
     if (this.s.isCancelled()) return
     if (!st) this.reason = 'Служба TUN не ответила'
     else if (st.status !== 'running') {
-      this.reason = `Служба TUN отказалась запускать ядро: ${st.error || st.status}`
+      this.reason = `Служба TUN отказалась запускать ядро: ${tunBrokerErrorText(st.error || st.status || '')}`
     }
   }
 
@@ -576,7 +667,9 @@ export class ServiceLauncher implements TunLauncher {
       code: typeof st.exitCode === 'number' ? st.exitCode : null,
       uptimeMs: typeof st.uptimeMs === 'number' ? st.uptimeMs : null,
       stderr: st.stderr ?? '',
-      ...(st.stopReason || st.error ? { note: st.stopReason || st.error } : {})
+      ...(st.stopReason || st.error
+        ? { note: st.stopReason || tunBrokerErrorText(st.error ?? '') }
+        : {})
     }
   }
 

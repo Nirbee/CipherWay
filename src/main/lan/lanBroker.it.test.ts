@@ -81,16 +81,35 @@ describe.skipIf(!win)('LAN broker (no elevation, fake daemon)', () => {
     writeFileSync(join(bin, 'wintun.dll'), 'not really wintun')
   }, 90_000)
 
-  afterEach(async () => {
-    for (const p of procs.splice(0)) if (p.exitCode === null) p.kill()
-    await sleep(300)
-  })
-  afterAll(() => {
+  /**
+   * A broker killed by the test never runs its `finally`: the daemon it started
+   * would stay and make the next test «lan_busy». Only the copies under this
+   * test's temp folder are stopped (never another test's or a real one).
+   */
+  const killOurDaemons = (): void => {
+    const like = `${tmp.replace(/'/g, "''")}\\*`
     try {
-      execFileSync('taskkill', ['/f', '/im', LAN_EXE], { stdio: 'ignore' })
+      execFileSync(
+        'powershell.exe',
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-Command',
+          `Get-Process -Name '${LAN_EXE.replace(/\.exe$/, '')}' -ErrorAction SilentlyContinue | Where-Object { $_.Path -like '${like}' } | Stop-Process -Force -ErrorAction SilentlyContinue`
+        ],
+        { stdio: 'ignore', windowsHide: true, timeout: 30_000 }
+      )
     } catch {
       /* none left */
     }
+  }
+  afterEach(async () => {
+    for (const p of procs.splice(0)) if (p.exitCode === null) p.kill()
+    killOurDaemons()
+    await sleep(300)
+  })
+  afterAll(() => {
+    killOurDaemons()
     rmSync(tmp, { recursive: true, force: true })
   })
 
@@ -107,12 +126,18 @@ describe.skipIf(!win)('LAN broker (no elevation, fake daemon)', () => {
 
   /** LanDaemon with the «task» = this broker run without elevation */
   function daemon(file = brokerFile()): LanDaemon {
+    let last: ChildProcess | null = null
     return new LanDaemon({
       runDir: userRun,
       home,
       task: 'unused',
       log: () => undefined,
+      // like the real task (MultipleInstancesPolicy IgnoreNew): a /run while this
+      // daemon's broker still runs is ignored. LanDaemon re-runs the task when the
+      // first answer is slow (> 3 s on a loaded test run); a second broker of the
+      // same session would refuse («lan_busy») and overwrite the first one's state
       runTask: async () => {
+        if (last && last.exitCode === null) return { code: 0, out: '' }
         const p = spawn(
           'powershell.exe',
           ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', file],
@@ -121,6 +146,7 @@ describe.skipIf(!win)('LAN broker (no elevation, fake daemon)', () => {
             env: { ...process.env, ProgramData: plantedPd, ALLUSERSPROFILE: plantedPd }
           }
         )
+        last = p
         procs.push(p)
         return { code: 0, out: '' }
       }
@@ -182,6 +208,26 @@ describe.skipIf(!win)('LAN broker (no elevation, fake daemon)', () => {
     // the daemon is gone
     await sleep(500)
     expect(() => process.kill(st!.pid!, 0)).toThrow()
+  }, 60_000)
+
+  it('a daemon an earlier broker left behind is stopped (its pid is read before the new state)', async () => {
+    // our exe with this user's state dir in its command line: what a broker started
+    const orphan = spawn(join(bin, LAN_EXE), [`"--statedir=${lanDir}"`, '--short-no'], {
+      windowsHide: true,
+      cwd: tmp,
+      windowsVerbatimArguments: true
+    })
+    procs.push(orphan)
+    await sleep(500)
+    writeFileSync(join(home, 'lan-state.json'), JSON.stringify({ pid: orphan.pid }))
+    const d = daemon()
+    await d.start()
+    await sleep(300)
+    expect(orphan.exitCode !== null || orphan.signalCode !== null).toBe(true)
+    expect(readFileSync(join(home, 'lan-broker.log'), 'utf8')).toContain(
+      `остановлен LAN прошлого запуска, pid ${orphan.pid}`
+    )
+    await d.stop()
   }, 60_000)
 
   it('refuses without a fresh request of a live app', async () => {

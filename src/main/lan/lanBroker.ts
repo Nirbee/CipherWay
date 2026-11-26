@@ -216,15 +216,21 @@ function Kill-Daemon($p, [bool]$report) {
   if (-not $p.HasExited) { $p.Kill(); $null = $p.WaitForExit(5000) }
 }
 # a daemon of an earlier session that outlived its broker (only that pid)
-function Stop-Orphan {
+# the daemon pid an earlier broker left in the state file — read BEFORE this
+# broker writes its own state (Save-State would overwrite it with 0)
+function Prev-Pid {
   try {
-    if (-not [IO.File]::Exists($StateF)) { return }
-    $prev = [IO.File]::ReadAllText($StateF, $Utf8) | ConvertFrom-Json
-    if ([int]$prev.pid -le 0) { return }
-    $o = [Diagnostics.Process]::GetProcessById([int]$prev.pid)
+    if (-not [IO.File]::Exists($StateF)) { return [long]0 }
+    return (Num ([IO.File]::ReadAllText($StateF, $Utf8) | ConvertFrom-Json).pid)
+  } catch { return [long]0 }
+}
+function Stop-Orphan([long]$id) {
+  try {
+    if ($id -le 0) { return }
+    $o = [Diagnostics.Process]::GetProcessById([int]$id)
     if (Is-OurDaemon $o) {
       Kill-Daemon $o $false
-      Note ('остановлен LAN прошлого запуска, pid ' + $prev.pid)
+      Note ('остановлен LAN прошлого запуска, pid ' + $id)
     }
   } catch {}
 }
@@ -239,16 +245,16 @@ function Rotate([string]$f) {
 }
 function Start-Daemon {
   foreach ($k in @($Hashes.Keys)) {
-    if ((Sha (Join-Path $Bin $k)) -ne $Hashes[$k]) { throw ('файл LAN изменён: ' + $k) }
+    if ((Sha (Join-Path $Bin $k)) -ne $Hashes[$k]) { throw ('cw- файл LAN изменён: ' + $k) }
   }
-  if (-not [IO.Directory]::Exists($LanDir) -or (Is-Reparse $LanDir)) { throw 'нет защищённой папки LAN — обновите службу' }
+  if (-not [IO.Directory]::Exists($LanDir) -or (Is-Reparse $LanDir)) { throw 'cw- нет защищённой папки LAN — обновите службу' }
   # pd / tmp: created inside the admin-only $LanDir (they inherit its ACL), never a link
   foreach ($d in @($Pd, $TmpD)) {
     if ([IO.Directory]::Exists($d) -or [IO.File]::Exists($d)) {
-      if ((Is-Reparse $d) -or -not [IO.Directory]::Exists($d)) { throw ('папка LAN подменена: ' + $d) }
+      if ((Is-Reparse $d) -or -not [IO.Directory]::Exists($d)) { throw 'cw- папка LAN подменена' }
     } else { $null = [IO.Directory]::CreateDirectory($d) }
   }
-  if ((Is-Reparse $PolicyF)) { throw 'файл политики LAN подменён' }
+  if ((Is-Reparse $PolicyF)) { throw 'cw- файл политики LAN подменён' }
   Write-Atomic $PolicyF $Policy
   # the adapter of the previous run normally goes with its process; the device it
   # leaves behind is removed (nobody else uses the GUID: Other-Tailscale said so)
@@ -281,15 +287,17 @@ $daemon = $null
 try {
   $ctl = Read-Ctl
   if ($null -ne $ctl) { $State.session = [string]$ctl.session }
-  if ($null -eq $ctl -or $ctl.cmd -ne 'run' -or [math]::Abs((Now-Ms) - [long]$ctl.ts) -gt 120000 -or -not (Alive $ctl.pid)) {
+  if ($null -eq $ctl -or $ctl.cmd -cne 'run' -or [math]::Abs((Now-Ms) - (Num $ctl.ts)) -gt 120000 -or -not (Alive (Num $ctl.pid))) {
     $State.status = 'refused'
     $State.error = 'no_request'
     exit 0
   }
+  # the orphan's pid first: the next Save-State overwrites the file it is in
+  $orphan = Prev-Pid
   # the app waits for this session id: it knows the task really started
   # (before Stop-Orphan: that one may wait for an adapter being created)
   Save-State
-  Stop-Orphan
+  Stop-Orphan $orphan
   $busy = Other-Tailscale $true
   if ($busy) {
     $State.status = 'refused'
@@ -330,7 +338,7 @@ try {
     if ($c.session -ne $State.session) { $State.stopReason = 'новая сессия'; break }
     if ($c.cmd -ne 'run') { $State.stopReason = 'команда остановки'; break }
     if (($tick % 4) -eq 0) {
-      if (-not (Alive $c.pid)) { $State.stopReason = 'приложение закрыто'; break }
+      if (-not (Alive (Num $c.pid))) { $State.stopReason = 'приложение закрыто'; break }
       $busy = Other-Tailscale $false
       if ($busy) {
         $State.error = 'tailscale_running'
@@ -343,10 +351,12 @@ try {
   }
   $State.status = 'stopped'
 } catch {
+  # a fixed text only: our own message, never an exception text
+  $m = [string]$_.Exception.Message
   $State.status = 'error'
   $State.error = 'failed'
-  $State.detail = [string]$_.Exception.Message
-  Note ('ошибка: ' + $State.detail)
+  $State.detail = $(if ($m.StartsWith('cw- ')) { $m.Substring(4) } else { 'LAN не запустился' })
+  Note ('ошибка: ' + $State.detail + $(if ($m.StartsWith('cw- ')) { '' } else { ' (' + $_.Exception.GetType().Name + ')' }))
 } finally {
   Stop-Daemon $daemon
   if ($State.stopReason) { Note ('LAN остановлен: ' + $State.stopReason) }

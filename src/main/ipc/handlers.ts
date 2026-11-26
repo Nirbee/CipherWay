@@ -22,7 +22,7 @@ import type {
   LanView
 } from '@shared/types'
 import { LogBatcher } from '@shared/logBuffer'
-import { DEFAULT_SETTINGS, getSettings, store } from '../store'
+import { DEFAULT_SETTINGS, getSettings, getZapretSettings, store } from '../store'
 import {
   findOtherVpnClients,
   listProcesses,
@@ -59,6 +59,11 @@ import { DEV_STATUS_OFF } from '@shared/devversion'
 import { devAcceptSchema, devProcessSchema } from '../devversion/consent'
 import { DevVersionService } from '../devversion/DevVersionService'
 import { TelemetryApi } from '../devversion/api'
+import { createZapretService } from '../zapret'
+import type { ZapretService } from '../zapret/ZapretService'
+import { routingChange } from '../zapret/routing'
+import { NO_ZAPRET, type ZapretRouting } from '../rules/compile'
+import { ZAPRET_SERVICE_IDS, type ZapretServiceId, type ZapretView } from '@shared/zapret'
 
 /** Set once handlers are registered; used for graceful shutdown / startup. */
 export let activeManager: SidecarManager | null = null
@@ -66,6 +71,7 @@ export let appUpdater: AppUpdater | null = null
 export let supportService: SupportService | null = null
 export let lanService: LanService | null = null
 export let devService: DevVersionService | null = null
+export let zapretService: ZapretService | null = null
 
 type GetWindow = () => BrowserWindow | null
 
@@ -177,6 +183,11 @@ const lanRoomNameSchema = z
   .max(40, 'Не длиннее 40 символов')
 const lanCodeSchema = z.string().max(20)
 
+// «Ускорение без VPN»: service ids and a domain as typed (normalized + checked in main)
+const zapretServicesSchema = z.array(z.enum(ZAPRET_SERVICE_IDS as [string, ...string[]])).max(10)
+const zapretDomainSchema = z.string().max(300)
+const zapretRemoveSchema = z.string().max(260)
+
 const exePathSchema = z
   .string()
   .max(1024)
@@ -215,7 +226,9 @@ function buildStartParams() {
     // DevVersion: the bot's host too — the server tells the provider by the IP
     directHosts: [...new Set([...subscriptionHosts(), ...devApiHosts()])],
     // LAN on: its daemon (the service's copy) and its login server bypass the VPN
-    ...(lanWanted() ? { lan: { exePath: lanExePath, loginHost: lanLoginHost() } } : {})
+    ...(lanWanted() ? { lan: { exePath: lanExePath, loginHost: lanLoginHost() } } : {}),
+    // «Ускорение без VPN»: what is confirmed direct so far (nothing before a check)
+    ...(zapretService ? { zapret: zapretService.currentRouting() } : {})
   }
 }
 
@@ -296,6 +309,10 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
   let serverHints: Record<string, string> = {}
   const publish = (next: StatusUpdate): void => {
     devService?.onVpnStatus(next.state)
+    // zapret runs only while the VPN is up (a reload passes «connecting» only)
+    if (next.state === 'connected' || next.state === 'disconnected' || next.state === 'error') {
+      void zapretService?.onVpn(next.state === 'connected').catch(() => undefined)
+    }
     status = { ...next, serverHints }
     send(IPC.evtStatus, status)
     for (const cb of statusListeners) cb(status)
@@ -321,6 +338,8 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
   let supportToken = subscriptionToken(getSubscriptionUrl())
   remnawave.onUpdate((d) => {
     rebuildMask(d)
+    // «Ускорение без VPN»: zapret must skip the new servers' addresses too
+    zapretService?.serversChanged()
     send(IPC.evtSubscription, view(remnawave.getCached()))
     // another subscription = another support account
     const token = subscriptionToken(getSubscriptionUrl())
@@ -749,6 +768,8 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
   ipcMain.handle(IPC.tunServiceRemove, async (): Promise<TunServiceInfo> => {
     // the LAN task goes with the service: LAN off first
     if (store.get('lanEnabled')) await lan.setEnabled(false)
+    // so does the zapret task
+    if (getZapretSettings().enabled) await zapret.setEnabled(false)
     const res = await manager.removeTunService()
     if (res === 'cancelled') throw new Error('Запрос прав администратора отклонён')
     if (res === 'failed') throw new Error('Не удалось удалить службу')
@@ -976,6 +997,50 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
     dev.gameStart(devProcessSchema.parse(name))
   )
   ipcMain.handle(IPC.devGameStop, async () => dev.gameStop())
+
+  // ---- «Ускорение без VPN (zapret)» -----------------------------------------
+  /** the sets last given to the core: only connections that change their way are closed */
+  let lastZapret: ZapretRouting = NO_ZAPRET
+  const zapret = createZapretService({
+    binDir: manager.binDir,
+    runDir: manager.runDir,
+    service: manager.tunService,
+    install: () => manager.installTunService(),
+    getSettings: getZapretSettings,
+    setSettings: (s) => store.set('zapret', s),
+    getMemory: () => store.get('zapretStrategies') ?? {},
+    setMemory: (m) => store.set('zapretStrategies', m),
+    vpn: () => ({ running: manager.isRunning, tun: manager.proxyMode === 'tun' }),
+    outbounds: () => remnawave.getCached()?.outbounds ?? [],
+    reservedHosts: () => {
+      const api = TelemetryApi.host(getSettings().apiBase)
+      return [...subscriptionHosts(), ...(api ? [api] : []), lanLoginHost() ?? '']
+    },
+    applyRouting: (r) => {
+      const change = routingChange(lastZapret, r)
+      lastZapret = r
+      return manager.applyZapret(r, change.domains, change.cidrs)
+    },
+    publish: (v: ZapretView) => send(IPC.evtZapret, v),
+    log: appLog
+  })
+  zapretService = zapret
+  zapret.init()
+
+  ipcMain.handle(IPC.zapretGet, async (): Promise<ZapretView> => zapret.view())
+  ipcMain.handle(IPC.zapretSetEnabled, async (_e, on: unknown, accepted: unknown) =>
+    zapret.setEnabled(z.boolean().parse(on), z.boolean().optional().parse(accepted) ?? false)
+  )
+  ipcMain.handle(IPC.zapretSetServices, async (_e, ids: unknown) =>
+    zapret.setServices(zapretServicesSchema.parse(ids) as ZapretServiceId[])
+  )
+  ipcMain.handle(IPC.zapretAddDomain, async (_e, d: unknown) =>
+    zapret.addDomain(zapretDomainSchema.parse(d))
+  )
+  ipcMain.handle(IPC.zapretRemoveDomain, async (_e, d: unknown) =>
+    zapret.removeDomain(zapretRemoveSchema.parse(d))
+  )
+  ipcMain.handle(IPC.zapretRepick, async () => zapret.repick())
 
   // ---- «Что нового» -------------------------------------------------------
   // decided once per start; a fresh install only records its version

@@ -7,12 +7,14 @@ import {
   groupsFor,
   layoutRules,
   normalizeCidr,
+  NO_ZAPRET,
   planRules,
   portMatcher,
   processNameRegex,
   processPathRegex,
   ruleSkeleton,
   TELEGRAM_CIDRS,
+  zapretFiles,
   type HeadlessRule
 } from './compile'
 
@@ -272,7 +274,10 @@ describe('ruleSkeleton (the fixed part of the config)', () => {
       { rule_set: ['cw-0-x'], action: 'reject' },
       { rule_set: ['cw-1-d'], action: 'route', outbound: 'direct' },
       { rule_set: ['cw-1-p'], action: 'route', outbound: 'cw-1' },
-      { rule_set: ['cw-1-x'], action: 'reject' }
+      { rule_set: ['cw-1-x'], action: 'reject' },
+      // «Ускорение без VPN» after every user slot: the user's rules win
+      { rule_set: ['cw-z-d'], action: 'route', outbound: 'direct' },
+      { rule_set: ['cw-z-p'], action: 'route', outbound: 'proxy' }
     ])
   })
 
@@ -281,7 +286,9 @@ describe('ruleSkeleton (the fixed part of the config)', () => {
       { rule_set: ['cw-0-dn'], server: 'local' },
       { rule_set: ['cw-0-pn'], server: 'remote' },
       { rule_set: ['cw-1-dn'], server: 'local' },
-      { rule_set: ['cw-1-pn'], server: 'remote' }
+      { rule_set: ['cw-1-pn'], server: 'remote' },
+      { rule_set: ['cw-z-dn'], server: 'zapret-dns' },
+      { rule_set: ['cw-z-dn2'], server: 'zapret-dns2' }
     ])
   })
 
@@ -292,7 +299,13 @@ describe('ruleSkeleton (the fixed part of the config)', () => {
       format: 'source',
       path: 'C:\\run\\rules\\cw-0-d.json'
     })
-    expect(sk.ruleSets).toHaveLength(10)
+    expect(sk.ruleSets).toHaveLength(14)
+    expect(sk.ruleSets.slice(10).map((r) => r.tag)).toEqual([
+      'cw-z-d',
+      'cw-z-p',
+      'cw-z-dn',
+      'cw-z-dn2'
+    ])
     const byTag = Object.fromEntries(sk.outbounds.map((o) => [o.tag, o]))
     expect(byTag['cw-0']).toMatchObject({
       type: 'selector',
@@ -302,6 +315,39 @@ describe('ruleSkeleton (the fixed part of the config)', () => {
     expect(byTag['cw-1'].default).toBe('ob_b')
     expect(byTag['cw-final']).toMatchObject({ outbounds: ['proxy', 'direct'], default: 'direct' })
     expect(byTag['cw-dns'].default).toBe('proxy')
+  })
+})
+
+describe('zapret sets («Ускорение без VPN», 0.7.0)', () => {
+  it('four files, always present; empty when off', () => {
+    const f = zapretFiles()
+    expect(Object.keys(f)).toEqual(['cw-z-d.json', 'cw-z-p.json', 'cw-z-dn.json', 'cw-z-dn2.json'])
+    for (const text of Object.values(f)) expect(text).toBe('{"version":3,"rules":[]}')
+    expect(zapretFiles(NO_ZAPRET)).toEqual(f)
+  })
+
+  it('direct domains go to the DoH of the moment, never to both; proxy ones get no DNS rule', () => {
+    const r = {
+      direct: [{ domain_suffix: ['youtube.com'] }, { ip_cidr: ['34.0.48.0/21'] }],
+      proxy: [{ domain_suffix: ['discord.com'] }],
+      dns: 'primary' as const
+    }
+    const f = zapretFiles(r)
+    expect(JSON.parse(f['cw-z-d.json']).rules).toEqual(r.direct)
+    expect(JSON.parse(f['cw-z-p.json']).rules).toEqual(r.proxy)
+    expect(JSON.parse(f['cw-z-dn.json']).rules).toEqual([{ domain_suffix: ['youtube.com'] }])
+    expect(JSON.parse(f['cw-z-dn2.json']).rules).toEqual([])
+    const g = zapretFiles({ ...r, dns: 'fallback' })
+    expect(JSON.parse(g['cw-z-dn.json']).rules).toEqual([])
+    expect(JSON.parse(g['cw-z-dn2.json']).rules).toEqual([{ domain_suffix: ['youtube.com'] }])
+    // the TUN broker copies only files that start like this (serviceScripts Sync-Rules)
+    for (const text of Object.values(g)) expect(text.startsWith('{"version":')).toBe(true)
+  })
+
+  it('names pass the TUN broker\'s file-name check', () => {
+    for (const name of Object.keys(zapretFiles())) {
+      expect(name).toMatch(/^cw-[0-9a-z-]{1,40}\.json$/)
+    }
   })
 })
 

@@ -190,6 +190,10 @@ export interface TunServiceInfo {
   state: 'ok' | 'missing' | 'outdated'
   /** the LAN task of the service is installed (it may be older than the app) */
   lan?: boolean
+  /** the zapret task of the service is installed (0.7.0; it may be older than the app) */
+  dpi?: boolean
+  /** zapret can't be set up from this build (its files differ from the pinned release) */
+  dpiError?: string
   detail?: string
 }
 

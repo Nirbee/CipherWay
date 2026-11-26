@@ -60,7 +60,7 @@ export function exeOf(path: string | undefined): string | undefined {
 }
 
 /** a rule slot of the user's rules (rules/compile.ts) in sing-box's rule text */
-const SLOT_RE = /rule_set=\[?(cw-\d+-[dpx])\]?/
+const SLOT_RE = /rule_set=\[?(cw-(?:\d+|z)-[dpx])\]?/
 
 /** `domain_suffix=[x.com] => route(ob_1)` → «домен x.com»; no node ids survive. */
 export function describeRule(

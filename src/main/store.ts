@@ -8,6 +8,7 @@ import {
   type SubscriptionData
 } from '@shared/types'
 import type { DevLastUpload, DevVersionConsent } from '@shared/devversion'
+import { DEFAULT_ZAPRET, sanitizeZapretSettings, type ZapretSettings } from '@shared/zapret'
 
 interface Schema {
   settings: AppSettings
@@ -40,6 +41,10 @@ interface Schema {
   devVersion: DevVersionConsent | null
   /** «DevVersion»: the result of the last upload (shown on «Статистика») */
   devVersionLastUpload: DevLastUpload | null
+  /** «Ускорение без VPN (zapret)»: off by default (0.7.0) */
+  zapret: ZapretSettings
+  /** zapret: the strategy that worked, per network (hashed gateway id → {id, at}) */
+  zapretStrategies: Record<string, { id: string | null; at: number }>
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -97,11 +102,18 @@ export const store = new Store<Schema>({
     lanHostname: null,
     whatsNewSeenVersion: null,
     devVersion: null,
-    devVersionLastUpload: null
+    devVersionLastUpload: null,
+    zapret: DEFAULT_ZAPRET,
+    zapretStrategies: {}
   }
 })
 
 /** Settings merged over the defaults (stores written by older versions lack new keys). */
 export function getSettings(): AppSettings {
   return { ...DEFAULT_SETTINGS, ...store.get('settings') }
+}
+
+/** «Ускорение без VPN» settings, cleaned up (an older / edited store can't break it). */
+export function getZapretSettings(): ZapretSettings {
+  return sanitizeZapretSettings(store.get('zapret'))
 }

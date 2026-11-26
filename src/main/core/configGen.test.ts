@@ -27,7 +27,15 @@ import {
 import { CORE_EXE, XRAY_EXE } from './coreNames'
 import type { ServerIps } from '../system/resolve'
 import { MIXED_SUB_BODY, TEST_RULES, TEST_SETTINGS } from './fixtures'
-import { groupsFor, layoutRules, planRules, type HeadlessRule } from '../rules/compile'
+import {
+  groupsFor,
+  layoutRules,
+  planRules,
+  zapretFiles,
+  type HeadlessRule,
+  type ZapretRouting
+} from '../rules/compile'
+import { zapretRouting } from '../zapret/routing'
 
 const outbounds = filterSubscription(parseOutbounds(MIXED_SUB_BODY)).outbounds
 const [vlessA, vlessB, hy2] = outbounds
@@ -51,12 +59,15 @@ const GEO = new Map<string, HeadlessRule[]>([
 ])
 const SLOT_DIR = 'C:\\cw\\rules'
 
-/** the slot layout of `rules` (+ its files, for `sing-box check`) */
-function slotsFor(rules: RulesConfig, dir = SLOT_DIR) {
+/** the slot layout of `rules` (+ its files and the zapret sets, for `sing-box check`) */
+function slotsFor(rules: RulesConfig, dir = SLOT_DIR, zapret?: ZapretRouting) {
   const plan = planRules(rules, outbounds)
   const groups = groupsFor(plan)
   const layout = layoutRules(plan, groups, GEO)!
-  return { slots: { groups, dir, selectors: layout.selectors }, files: layout.files }
+  return {
+    slots: { groups, dir, selectors: layout.selectors },
+    files: { ...layout.files, ...zapretFiles(zapret) }
+  }
 }
 
 function singbox(settings: Partial<AppSettings> = {}, extra: Partial<GenParams> = {}) {
@@ -701,10 +712,10 @@ describe('real core validation', () => {
   })
 
   /** slot files of `rules` written into the temp folder (check reads local rule-sets) */
-  function writeSlots(rules: RulesConfig, name: string) {
+  function writeSlots(rules: RulesConfig, name: string, zapret?: ZapretRouting) {
     const dir = join(tmp, name)
     mkdirSync(dir, { recursive: true })
-    const { slots, files } = slotsFor(rules, dir)
+    const { slots, files } = slotsFor(rules, dir, zapret)
     for (const [f, text] of Object.entries(files)) writeFileSync(join(dir, f), text)
     return slots
   }
@@ -751,6 +762,38 @@ describe('real core validation', () => {
       check(SINGBOX, ['check', '-c', file])
     }
   )
+
+  for (const mode of ['system', 'tun'] as const) {
+    it.skipIf(!existsSync(SINGBOX))(
+      `sing-box check accepts «Ускорение без VPN» on (${mode}, 0.7.0)`,
+      () => {
+        const settings = {
+          enabled: true,
+          services: ['youtube', 'discord'] as ('youtube' | 'discord')[],
+          custom: ['example.org', 'xn--80ak6aa92e.com'],
+          warned: true
+        }
+        // YouTube + one own domain direct (DoH fallback in use), Discord back through the VPN
+        const zapret = zapretRouting(settings, new Set(['youtube', 'd:example.org']), 'fallback')
+        expect(zapret.direct.length).toBeGreaterThan(0)
+        expect(zapret.proxy.length).toBe(2)
+        const file = join(tmp, `sing-box-zapret-${mode}.json`)
+        const cfg = singbox(
+          { proxyMode: mode },
+          { serverIps: SERVER_IPS, slots: writeSlots(TEST_RULES, `slots-zapret-${mode}`, zapret) }
+        )
+        const dns = cfg.dns as { servers: { tag: string; server?: string; detour?: string }[] }
+        expect(dns.servers.find((x) => x.tag === 'zapret-dns')).toEqual({
+          type: 'https',
+          tag: 'zapret-dns',
+          server: '8.8.8.8'
+        })
+        expect(dns.servers.find((x) => x.tag === 'zapret-dns2')?.detour).toBeUndefined()
+        writeFileSync(file, JSON.stringify(cfg, null, 2))
+        check(SINGBOX, ['check', '-c', file])
+      }
+    )
+  }
 
   it.skipIf(!existsSync(SINGBOX))('sing-box check accepts the IPv4-only TUN config (0.4.6)', () => {
     const file = join(tmp, 'sing-box-tun-ipv4.json')

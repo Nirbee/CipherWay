@@ -41,7 +41,16 @@ import { writeAtomic } from './atomicFile'
 import { DirectFailures, type RawConnections } from './connections'
 import { LogFilter } from './logFilter'
 import { REALITY_ERROR_RE, RealityWatch } from './realityWatch'
-import { groupsFor, layoutRules, planRules, type RuleLayout } from '../rules/compile'
+import {
+  groupsFor,
+  layoutRules,
+  NO_ZAPRET,
+  planRules,
+  ZAPRET_LABELS,
+  zapretFiles,
+  type RuleLayout,
+  type ZapretRouting
+} from '../rules/compile'
 import { GeoCache } from '../rules/geo'
 import { findFreePort } from '../system/ports'
 import { disableSystemProxy, enableSystemProxy } from '../system/proxy'
@@ -67,6 +76,8 @@ export interface StartParams {
   directHosts?: string[]
   /** «LAN» is on: its daemon + login server bypass the VPN (configGen lanRules) */
   lan?: LanBypass
+  /** «Ускорение без VPN»: what its rule-sets hold at the start (rules/compile.ts) */
+  zapret?: ZapretRouting
 }
 
 /** Optional reactions of the app + what tests replace. */
@@ -303,6 +314,8 @@ export class SidecarManager {
   private written = new Map<string, string>()
   private selectors: Record<string, string> = {}
   private labelMap: Record<string, string> = {}
+  /** «Ускорение без VPN»: the zapret sets of the running core (changed without a restart) */
+  private zapret: ZapretRouting = NO_ZAPRET
   private programMap: Record<string, string[]> = {}
   /** «mode differs» already logged for this core mode → chosen mode */
   private modeWarned = ''
@@ -649,9 +662,10 @@ export class SidecarManager {
       if (cancelled()) return
       this.groups = groupsFor(plan)
       const layout = layoutRules(plan, this.groups, geo) as RuleLayout
+      this.zapret = p.zapret ?? NO_ZAPRET
       await this.writeRuleFiles(layout, true)
       this.selectors = { ...layout.selectors }
-      this.labelMap = layout.labels
+      this.labelMap = { ...layout.labels, ...ZAPRET_LABELS }
       this.programMap = layout.programs
 
       const logFile = this.launcher?.coreLogPath ?? this.logPath
@@ -1286,8 +1300,11 @@ export class SidecarManager {
 
   // --- rules on the fly ------------------------------------------------------
 
-  /** Writes the slot files that changed; `clean` = fresh start (old files removed). */
-  private async writeRuleFiles(layout: RuleLayout, clean: boolean): Promise<number> {
+  /**
+   * Writes the slot files that changed (+ the four zapret sets); `clean` =
+   * fresh start (old files removed).
+   */
+  private async writeRuleFiles(layout: Pick<RuleLayout, 'files'>, clean: boolean): Promise<number> {
     if (clean) {
       this.written.clear()
       for (const f of await readdir(this.rulesDir).catch(() => [] as string[])) {
@@ -1295,7 +1312,7 @@ export class SidecarManager {
       }
     }
     let changed = 0
-    for (const [name, text] of Object.entries(layout.files)) {
+    for (const [name, text] of Object.entries({ ...layout.files, ...zapretFiles(this.zapret) })) {
       if (this.written.get(name) === text) continue
       await writeAtomic(join(this.rulesDir, name), text)
       this.written.set(name, text)
@@ -1338,7 +1355,7 @@ export class SidecarManager {
       else this.log('warn', 'app', `Не удалось переключить ${sel}`)
     }
     this.selectors = { ...layout.selectors }
-    this.labelMap = layout.labels
+    this.labelMap = { ...layout.labels, ...ZAPRET_LABELS }
     this.programMap = layout.programs
     if (this.lastParams) this.lastParams = { ...this.lastParams, rules: p.rules }
     if (changedFiles === 0 && changedSel === 0) return
@@ -1347,6 +1364,39 @@ export class SidecarManager {
     if (gen !== this.opGen || !this.running) return
     await api.closeAll()
     this.log('info', 'app', 'Правила применены без переподключения')
+  }
+
+  /**
+   * «Ускорение без VPN»: new contents of the zapret sets — the files are
+   * rewritten, no restart; open connections of the domains that changed their
+   * way are closed so they reconnect the new way (`cidrs`: an address range
+   * moved — the zapret connections without a domain too). While disconnected
+   * only remembered (StartParams.zapret wins at start).
+   */
+  applyZapret(r: ZapretRouting, domains: string[] = [], cidrs = false): Promise<void> {
+    const gen = this.opGen
+    return this.serial(async () => {
+      this.zapret = r
+      if (gen !== this.opGen || !this.running || !this.api) return
+      const changed = await this.writeRuleFiles({ files: {} }, false)
+      if (changed === 0) return
+      await this.launcher?.syncRules()
+      await sleep(RULE_RELOAD_MS)
+      const api = this.api
+      if (gen !== this.opGen || !this.running || !api) return
+      const raw = await api.connections()
+      let closed = 0
+      for (const c of raw?.connections ?? []) {
+        const host = (c.metadata?.host ?? '').toLowerCase()
+        const hit = host
+          ? domains.some((d) => host === d || host.endsWith(`.${d}`))
+          : cidrs && /rule_set=\[?cw-z-/.test(c.rule ?? '')
+        if (!hit) continue
+        await api.closeConnection(c.id)
+        closed++
+      }
+      this.log('info', 'app', `Ускорение без VPN: правила обновлены${closed ? `, переподключено соединений: ${closed}` : ''}`)
+    })
   }
 
   /** Правила / Весь трафик / Напрямую — on the fly; open connections are reset. */

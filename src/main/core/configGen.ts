@@ -1,5 +1,11 @@
 import { AUTO_OUTBOUND_ID, type AppSettings, type OutboundConfig } from '@shared/types'
-import { ruleSkeleton, SLOT_DNS, SLOT_FINAL } from '../rules/compile'
+import {
+  ruleSkeleton,
+  SLOT_DNS,
+  SLOT_FINAL,
+  ZAPRET_DNS_SERVER,
+  ZAPRET_DNS_SERVER2
+} from '../rules/compile'
 import {
   CLASH_MODE,
   LATENCY_URL,
@@ -337,7 +343,11 @@ export function generateSingboxConfig(p: GenParams): SbConfig {
         // остальное» is direct (sing-box 1.12+ refuses to *start* with an
         // explicit detour to an empty direct outbound — a selector is fine)
         { type: 'https', tag: 'remote', server: '1.1.1.1', detour: SLOT_DNS },
-        { type: 'https', tag: 'local', server: '77.88.8.8' }
+        { type: 'https', tag: 'local', server: '77.88.8.8' },
+        // «Ускорение без VPN»: its direct domains, never the provider's DNS (a stub
+        // page) — DoH straight to Google, Cloudflare as the fallback (compile.ts)
+        { type: 'https', tag: ZAPRET_DNS_SERVER, server: '8.8.8.8' },
+        { type: 'https', tag: ZAPRET_DNS_SERVER2, server: '1.1.1.1' }
       ],
       rules: [
         ...(localDomains.length ? [{ domain: localDomains, server: 'local' }] : []),

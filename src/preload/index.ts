@@ -84,6 +84,14 @@ const api: ExposedApi = {
     devices: () => ipcRenderer.invoke(IPC.lanDevices),
     deleteDevice: (nodeId) => ipcRenderer.invoke(IPC.lanDeleteDevice, nodeId)
   },
+  zapret: {
+    get: () => ipcRenderer.invoke(IPC.zapretGet),
+    setEnabled: (on, accepted) => ipcRenderer.invoke(IPC.zapretSetEnabled, on, accepted ?? false),
+    setServices: (ids) => ipcRenderer.invoke(IPC.zapretSetServices, ids),
+    addDomain: (domain) => ipcRenderer.invoke(IPC.zapretAddDomain, domain),
+    removeDomain: (domain) => ipcRenderer.invoke(IPC.zapretRemoveDomain, domain),
+    repick: () => ipcRenderer.invoke(IPC.zapretRepick)
+  },
   whatsNew: {
     get: () => ipcRenderer.invoke(IPC.whatsNewGet),
     seen: () => ipcRenderer.send(IPC.whatsNewSeen)
@@ -115,6 +123,7 @@ const api: ExposedApi = {
     navigate: (cb) => subscribe(IPC.evtNavigate, (p) => cb(p as never)),
     updater: (cb) => subscribe(IPC.evtUpdater, (p) => cb(p as never)),
     lan: (cb) => subscribe(IPC.evtLan, (p) => cb(p as never)),
+    zapret: (cb) => subscribe(IPC.evtZapret, (p) => cb(p as never)),
     windowMaximized: (cb) => subscribe(IPC.evtWindowMaximized, (p) => cb(p as never)),
     importRequest: (cb) => subscribe(IPC.evtImportRequest, () => cb()),
     settings: (cb) => subscribe(IPC.evtSettings, (p) => cb(p as never)),

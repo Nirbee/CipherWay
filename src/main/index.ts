@@ -25,7 +25,8 @@ import {
   onVpnStatus,
   registerIpcHandlers,
   setRoutingMode,
-  startSubscriptionSync
+  startSubscriptionSync,
+  zapretService
 } from './ipc/handlers'
 import { remnawave } from './remnawave/RemnawaveClient'
 import { getSettings, store } from './store'
@@ -339,6 +340,8 @@ if (!app.requestSingleInstanceLock()) {
     void Promise.all([
       disconnectVpn(),
       lanService?.shutdown().catch(() => undefined),
+      // zapret (winws) stops with the app — never left running without the VPN
+      zapretService?.shutdown().catch(() => undefined),
       // DevVersion: the period so far goes to disk (sent after the next start)
       devService?.shutdown().catch(() => undefined)
     ])

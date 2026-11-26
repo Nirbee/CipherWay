@@ -22,6 +22,7 @@ import type {
   TunServiceInfo
 } from './types'
 import type { UpdaterState } from './updater'
+import type { ZapretServiceId, ZapretView } from './zapret'
 import type { ChangelogEntry } from './changelog'
 import type {
   DevConsentAccept,
@@ -118,6 +119,16 @@ export const IPC = {
   lanDevices: 'lan:devices',
   lanDeleteDevice: 'lan:deleteDevice',
 
+  // «Ускорение без VPN (zapret)» (src/shared/zapret.ts; main/zapret)
+  zapretGet: 'zapret:get',
+  /** on: may set up the service (one UAC prompt); `accepted` = the one-time warning */
+  zapretSetEnabled: 'zapret:setEnabled',
+  zapretSetServices: 'zapret:setServices',
+  zapretAddDomain: 'zapret:addDomain',
+  zapretRemoveDomain: 'zapret:removeDomain',
+  /** «Подобрать заново» */
+  zapretRepick: 'zapret:repick',
+
   // «Что нового» after an update (src/shared/changelog.ts)
   /** the entries to show now ([] = nothing) */
   whatsNewGet: 'whatsNew:get',
@@ -161,6 +172,8 @@ export const IPC = {
   evtUpdater: 'evt:updater',
   /** the whole LanView on every change */
   evtLan: 'evt:lan',
+  /** the whole ZapretView on every change */
+  evtZapret: 'evt:zapret',
   /** settings changed outside the renderer (tray mode switch) */
   evtSettings: 'evt:settings',
   /** subscription data changed (background refresh) */
@@ -256,6 +269,15 @@ export interface ExposedApi {
     devices: () => Promise<LanView>
     deleteDevice: (nodeId: string) => Promise<LanView>
   }
+  zapret: {
+    get: () => Promise<ZapretView>
+    setEnabled: (on: boolean, accepted?: boolean) => Promise<ZapretView>
+    setServices: (ids: ZapretServiceId[]) => Promise<ZapretView>
+    /** throws with a readable reason when the domain is not accepted */
+    addDomain: (domain: string) => Promise<ZapretView>
+    removeDomain: (domain: string) => Promise<ZapretView>
+    repick: () => Promise<ZapretView>
+  }
   whatsNew: {
     get: () => Promise<ChangelogEntry[]>
     seen: () => void
@@ -291,6 +313,7 @@ export interface ExposedApi {
     navigate: (cb: (page: string) => void) => () => void
     updater: (cb: (s: UpdaterState) => void) => () => void
     lan: (cb: (v: LanView) => void) => () => void
+    zapret: (cb: (v: ZapretView) => void) => () => void
     windowMaximized: (cb: (maximized: boolean) => void) => () => void
     importRequest: (cb: () => void) => () => void
     settings: (cb: (s: AppSettings) => void) => () => void

@@ -9,8 +9,12 @@
  * The cores get our own names: other VPN clients stop theirs with
  * `taskkill /im xray.exe`, which must not hit ours (and the reverse).
  *
+ *   - cipherway-dpi.exe (winws.exe of zapret, bol-van/zapret, the official
+ *     Windows x86_64 build, unmodified) + WinDivert.dll / WinDivert64.sys /
+ *     cygwin1.dll and two fake payloads — «Ускорение без VPN (zapret)», 0.7.0
+ *
  * Run via `npm run download:cores` (also invoked before packaging).
- * Fetch only some cores: `npm run download:cores -- xray` (names: singbox, xray, wintun, lan).
+ * Fetch only some cores: `npm run download:cores -- xray` (names: singbox, xray, wintun, lan, zapret).
  * Binaries are NOT committed to git (see .gitignore).
  *
  * Xray is pinned to the exact release the nodes run (26.7.x series): the zip is
@@ -24,18 +28,30 @@
  * must be the very file we ship (one wintun.dll serves both daemons).
  * Licence: resources/THIRD-PARTY-NOTICES.txt (BSD-3-Clause + PATENTS).
  *
+ * zapret is pinned to a stable tag: the zip is checked against the GitHub asset
+ * digest AND the SHA-256 pinned below, every file taken from it against the
+ * release's sha256sum.txt (binaries) AND its own pinned hash. The zip is read
+ * in memory and never written to disk: Windows Defender flags the archive as a
+ * whole («Trojan:Win32/Suschil!rfn», seen 26.11.2026 — other tools in it), the
+ * files we take are not flagged on their own; each of them still goes through
+ * the antivirus when it is written (and is re-hashed after that). Licences:
+ * zapret MIT, WinDivert LGPLv3 / GPLv2, Cygwin DLL LGPLv3+ (THIRD-PARTY-NOTICES).
+ *
  * NOTE: the generated sing-box config targets the 1.12+ schema (typed DNS
  * servers, route.default_domain_resolver, action-based route rules, rule-sets
  * for geosite/geoip) and is validated against sing-box 1.13.x via
  * `sing-box check`. Bump SINGBOX_SERIES when migrating the schema.
  */
 import { createHash } from 'node:crypto'
+import { inflateRawSync } from 'node:zlib'
 import { createWriteStream } from 'node:fs'
 import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { Readable } from 'node:stream'
 import { execFileSync, spawnSync } from 'node:child_process'
+// the zapret tag and the pinned hashes live in ONE place (the app checks them too)
+import { DPI_EXE, DPI_HASHES, ZAPRET_TAG } from '../src/main/core/coreNames'
 
 const BIN_DIR = join(process.cwd(), 'resources', 'bin')
 const CORE_EXE = 'cipherway-core.exe' // = src/main/core/coreNames.ts
@@ -65,10 +81,31 @@ const TAILSCALE_FILES: Record<string, { to: string; sha256: string }> = {
   }
 }
 
+// zapret (DPI bypass): exact stable release, Windows x86_64 binaries
+const ZAPRET_ASSET = `zapret-${ZAPRET_TAG}.zip`
+const ZAPRET_ZIP_SHA256 = 'c493e33a0dc4eba23a8686efdaba55f59755ad6ade3564aebd9d13f4c65e2e0c'
+const ZAPRET_ROOT = `zapret-${ZAPRET_TAG}`
+/** path in the zip → our name (its pinned SHA-256: DPI_HASHES in src/main/core/coreNames.ts) */
+const ZAPRET_FILES: Record<string, { to: keyof typeof DPI_HASHES; listed: boolean }> = {
+  'binaries/windows-x86_64/winws.exe': { to: DPI_EXE, listed: true },
+  'binaries/windows-x86_64/WinDivert.dll': { to: 'WinDivert.dll', listed: true },
+  'binaries/windows-x86_64/WinDivert64.sys': { to: 'WinDivert64.sys', listed: true },
+  'binaries/windows-x86_64/cygwin1.dll': { to: 'cygwin1.dll', listed: true },
+  // fake payloads: sha256sum.txt lists binaries only — pinned hash only
+  'files/fake/tls_clienthello_www_google_com.bin': {
+    to: 'tls_clienthello_www_google_com.bin',
+    listed: false
+  },
+  'files/fake/quic_initial_www_google_com.bin': {
+    to: 'quic_initial_www_google_com.bin',
+    listed: false
+  }
+}
+
 interface GhRelease {
   tag_name: string
   prerelease: boolean
-  assets: { name: string; browser_download_url: string }[]
+  assets: { name: string; browser_download_url: string; digest?: string | null }[]
 }
 
 async function ghReleases(repo: string): Promise<GhRelease[]> {
@@ -277,9 +314,119 @@ async function getLan(): Promise<void> {
   await rm(msi, { force: true })
 }
 
+async function downloadBuffer(url: string): Promise<Buffer> {
+  const res = await fetch(url, { headers: { 'User-Agent': 'cipherway-build' } })
+  if (!res.ok) throw new Error(`download failed ${url}: ${res.status}`)
+  return Buffer.from(await res.arrayBuffer())
+}
+
+const sha256Of = (b: Buffer): string => createHash('sha256').update(b).digest('hex')
+
+/**
+ * The files of a zip held in memory (stored / deflate, no zip64 — enough for
+ * the zapret release): name → bytes, only for the names in `wanted`.
+ */
+function unzipInMemory(zip: Buffer, wanted: Set<string>): Map<string, Buffer> {
+  const out = new Map<string, Buffer>()
+  let eocd = -1
+  for (let i = zip.length - 22; i >= Math.max(0, zip.length - 22 - 65_535); i--) {
+    if (zip.readUInt32LE(i) === 0x06054b50) {
+      eocd = i
+      break
+    }
+  }
+  if (eocd < 0) throw new Error('zip: no end of central directory')
+  const count = zip.readUInt16LE(eocd + 10)
+  let pos = zip.readUInt32LE(eocd + 16)
+  for (let n = 0; n < count; n++) {
+    if (zip.readUInt32LE(pos) !== 0x02014b50) throw new Error('zip: bad central directory')
+    const method = zip.readUInt16LE(pos + 10)
+    const csize = zip.readUInt32LE(pos + 20)
+    const usize = zip.readUInt32LE(pos + 24)
+    const nameLen = zip.readUInt16LE(pos + 28)
+    const extraLen = zip.readUInt16LE(pos + 30)
+    const commentLen = zip.readUInt16LE(pos + 32)
+    const local = zip.readUInt32LE(pos + 42)
+    const name = zip.toString('utf8', pos + 46, pos + 46 + nameLen)
+    pos += 46 + nameLen + extraLen + commentLen
+    if (!wanted.has(name)) continue
+    if (zip.readUInt32LE(local) !== 0x04034b50) throw new Error(`zip: bad local header ${name}`)
+    const start = local + 30 + zip.readUInt16LE(local + 26) + zip.readUInt16LE(local + 28)
+    const raw = zip.subarray(start, start + csize)
+    const data = method === 0 ? Buffer.from(raw) : method === 8 ? inflateRawSync(raw) : null
+    if (!data) throw new Error(`zip: unsupported method ${method} for ${name}`)
+    if (data.length !== usize) throw new Error(`zip: size mismatch for ${name}`)
+    out.set(name, data)
+  }
+  return out
+}
+
+async function getZapret(): Promise<void> {
+  console.log(`\n== zapret ${ZAPRET_TAG} (DPI bypass) ==`)
+  const res = await fetch(
+    `https://api.github.com/repos/bol-van/zapret/releases/tags/${ZAPRET_TAG}`,
+    { headers: { 'User-Agent': 'cipherway-build', Accept: 'application/vnd.github+json' } }
+  )
+  if (!res.ok) throw new Error(`GitHub API zapret ${ZAPRET_TAG}: ${res.status} ${res.statusText}`)
+  const rel = (await res.json()) as GhRelease
+  const asset = rel.assets.find((a) => a.name === ZAPRET_ASSET)
+  const sums = rel.assets.find((a) => a.name === 'sha256sum.txt')
+  if (!asset || !sums) throw new Error(`${ZAPRET_ASSET} / sha256sum.txt not found in ${rel.tag_name}`)
+
+  console.log(`downloading ${asset.name} (${rel.tag_name}) into memory…`)
+  const zip = await downloadBuffer(asset.browser_download_url)
+  const actual = sha256Of(zip)
+  const published = /^sha256:([0-9a-f]{64})$/i.exec(asset.digest ?? '')?.[1]?.toLowerCase()
+  if (published && published !== actual) {
+    throw new Error(`checksum mismatch for ${ZAPRET_ASSET}: GitHub ${published}, got ${actual}`)
+  }
+  if (actual !== ZAPRET_ZIP_SHA256) {
+    throw new Error(
+      `checksum mismatch for ${ZAPRET_ASSET}: pinned ${ZAPRET_ZIP_SHA256}, got ${actual}`
+    )
+  }
+  console.log(`checksum OK (${actual.slice(0, 12)}…, pinned${published ? ' + GitHub digest' : ''})`)
+
+  const listed = new Map<string, string>()
+  const sumText = (await downloadBuffer(sums.browser_download_url)).toString('utf8')
+  for (const line of sumText.split(/\r?\n/)) {
+    const m = /^([0-9a-f]{64})\s+\*?(\S.*)$/i.exec(line.trim())
+    if (m) listed.set(m[2], m[1].toLowerCase())
+  }
+
+  const wanted = new Set(Object.keys(ZAPRET_FILES).map((f) => `${ZAPRET_ROOT}/${f}`))
+  const files = unzipInMemory(zip, wanted)
+  for (const [inZip, f] of Object.entries(ZAPRET_FILES)) {
+    const full = `${ZAPRET_ROOT}/${inZip}`
+    const data = files.get(full)
+    if (!data) throw new Error(`${inZip} not found in ${ZAPRET_ASSET}`)
+    const got = sha256Of(data)
+    const pinned = DPI_HASHES[f.to]
+    if (f.listed && listed.get(full) !== got) {
+      throw new Error(`checksum mismatch for ${inZip}: sha256sum.txt ${listed.get(full)}, got ${got}`)
+    }
+    if (got !== pinned) {
+      throw new Error(`checksum mismatch for ${inZip}: pinned ${pinned}, got ${got}`)
+    }
+    const dest = join(BIN_DIR, f.to)
+    await writeFile(dest, data)
+    // an antivirus may take the file away (or change it) right after it was written
+    if ((await sha256(dest).catch(() => '')) !== pinned) {
+      throw new Error(`${f.to} is gone or changed after writing — check the antivirus quarantine`)
+    }
+    console.log(`-> ${dest}`)
+  }
+}
+
 async function main(): Promise<void> {
   await mkdir(BIN_DIR, { recursive: true })
-  const all = { singbox: getSingbox, xray: getXray, wintun: getWintun, lan: getLan } as const
+  const all = {
+    singbox: getSingbox,
+    xray: getXray,
+    wintun: getWintun,
+    lan: getLan,
+    zapret: getZapret
+  } as const
   const wanted = process.argv.slice(2).map((a) => a.toLowerCase().replace(/[^a-z]/g, ''))
   for (const name of wanted) {
     if (!(name in all))

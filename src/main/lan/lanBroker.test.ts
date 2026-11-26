@@ -51,7 +51,7 @@ describe('LAN broker allow-list (security)', () => {
     expect(script.match(/\$UserRun/g)).toHaveLength(2)
     // a stale request or a dead app pid: no start
     expect(script).toContain(
-      '[math]::Abs((Now-Ms) - [long]$ctl.ts) -gt 120000 -or -not (Alive $ctl.pid)'
+      '[math]::Abs((Now-Ms) - (Num $ctl.ts)) -gt 120000 -or -not (Alive (Num $ctl.pid))'
     )
     // user-provided strings are single-quoted literals
     expect(script).toContain("$UserRun = 'C:\\Users\\O''Neil $x\\run'")
@@ -77,7 +77,7 @@ describe('LAN broker allow-list (security)', () => {
     for (const v of ['ProgramData', 'ALLUSERSPROFILE']) expect(script).toContain(`$env:${v} = $Pd`)
     for (const v of ['TEMP', 'TMP']) expect(script).toContain(`$env:${v} = $TmpD`)
     expect(script).toContain(
-      "if ((Is-Reparse $d) -or -not [IO.Directory]::Exists($d)) { throw ('папка LAN подменена: ' + $d) }"
+      "if ((Is-Reparse $d) -or -not [IO.Directory]::Exists($d)) { throw 'cw- папка LAN подменена' }"
     )
     // set before the one Start-Process
     expect(script.indexOf('$env:ProgramData = $Pd')).toBeLessThan(script.indexOf('Start-Process'))
@@ -126,7 +126,10 @@ describe('LAN broker allow-list (security)', () => {
     expect(script).toContain('try { Kill-Daemon $d $true } catch {}')
     expect(script).toContain('Kill-Daemon $o $false')
     // the session is reported before an orphan (maybe creating its adapter) is waited for
-    expect(script).toMatch(/Save-State\s+Stop-Orphan\s+\$busy = Other-Tailscale \$true/)
+    // the orphan's pid is read before Save-State replaces the file it is in
+    expect(script).toMatch(
+      /\$orphan = Prev-Pid\s+(#[^\n]*\s+)*Save-State\s+Stop-Orphan \$orphan\s+\$busy = Other-Tailscale \$true/
+    )
   })
 
   it('«LAN busy» counts only processes of our exact file, not anything called cipherway-lan', () => {
@@ -229,7 +232,8 @@ describe('the TUN broker still accepts the VPN config with the LAN rules', () =>
     // the broker's own exceptions, taken from the script itself
     const src = /\$w -notmatch '([^']*)'\)/.exec(tunBroker)?.[1]
     expect(src).toBeTruthy()
-    const allowed = new RegExp(src!)
+    // .NET \z (the very end) = JS $ without the m flag
+    const allowed = new RegExp(src!.replace(/\\z$/, '$'))
     expect(allowed.test('.route.rules[0].process_path')).toBe(true)
     expect(allowed.test('.route.rule_set[3].path')).toBe(true)
     expect(allowed.test('.log.path')).toBe(false)

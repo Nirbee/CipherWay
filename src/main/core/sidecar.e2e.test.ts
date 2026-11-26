@@ -510,7 +510,7 @@ describe.skipIf(!enabled)('SidecarManager with real cores', () => {
   it('TUN config with real DNS answers passes sing-box check (route_exclude_address)', async () => {
     const { generateSingboxConfig } = await import('./configGen')
     const { resolveServers } = await import('../system/resolve')
-    const { groupsFor, layoutRules, planRules } = await import('../rules/compile')
+    const { groupsFor, layoutRules, planRules, zapretFiles } = await import('../rules/compile')
     const node: OutboundConfig = { ...live, server: 'www.gstatic.com', port: 443 }
     const ips = await resolveServers([node])
     expect(ips['www.gstatic.com']?.length).toBeGreaterThan(0)
@@ -518,7 +518,9 @@ describe.skipIf(!enabled)('SidecarManager with real cores', () => {
     mkdirSync(dir, { recursive: true })
     const plan = planRules(TEST_RULES, [node])
     const layout = layoutRules(plan, groupsFor(plan), new Map())!
-    for (const [f, t] of Object.entries(layout.files)) writeFileSync(join(dir, f), t)
+    for (const [f, t] of Object.entries({ ...layout.files, ...zapretFiles() })) {
+      writeFileSync(join(dir, f), t)
+    }
     const cfg = generateSingboxConfig({
       outbounds: [node],
       activeOutboundId: 'auto',
@@ -1980,6 +1982,12 @@ describe.skipIf(!enabled)('SidecarManager with real cores', () => {
         // 0.5.0: a build with the LAN daemon installs its task too (as install() does)
         const lanBrokerText = await svc.lanBrokerText(sid)
         const lanExe = join(BIN, 'cipherway-lan.exe')
+        // 0.7.0: … and zapret's
+        const dpiBrokerText = await svc.dpiBrokerText(sid)
+        const { DPI_ALL } = await import('./coreNames')
+        const dpiHashes = dpiBrokerText
+          ? Object.fromEntries(DPI_ALL.map((f) => [f, sha(join(BIN, f))]))
+          : {}
         const script = installScript({
           sid,
           srcBinDir: BIN,
@@ -1987,13 +1995,20 @@ describe.skipIf(!enabled)('SidecarManager with real cores', () => {
           hashes: {
             [CORE_EXE]: sha(SINGBOX),
             'wintun.dll': sha(join(BIN, 'wintun.dll')),
-            ...(lanBrokerText ? { 'cipherway-lan.exe': sha(lanExe) } : {})
+            ...(lanBrokerText ? { 'cipherway-lan.exe': sha(lanExe) } : {}),
+            ...dpiHashes
           },
           brokerHash: createHash('sha256').update(brokerText, 'utf8').digest('hex'),
           ...(lanBrokerText
             ? {
                 lanBrokerText,
                 lanBrokerHash: createHash('sha256').update(lanBrokerText, 'utf8').digest('hex')
+              }
+            : {}),
+          ...(dpiBrokerText
+            ? {
+                dpiBrokerText,
+                dpiBrokerHash: createHash('sha256').update(dpiBrokerText, 'utf8').digest('hex')
               }
             : {}),
           appVersion: '0.4.3',
@@ -2046,7 +2061,29 @@ describe.skipIf(!enabled)('SidecarManager with real cores', () => {
           brokerHash: 'c'.repeat(64),
           appVersion: '0.4.3'
         }),
-        remove: uninstallScript(sid)
+        remove: uninstallScript(sid),
+        // 0.7.0: zapret's broker and an installer with its task
+        dpi: (await import('../zapret/dpiBroker')).dpiBrokerScript({
+          sid,
+          userRunDir: "C:\\Users\\O'Нил\\run",
+          appExe: "C:\\Users\\O'Нил\\AppData\\Local\\Programs\\CipherWay VPN\\CipherWay VPN.exe",
+          hashes: Object.fromEntries(
+            (await import('./coreNames')).DPI_ALL.map((f) => [f, 'd'.repeat(64)])
+          ) as never
+        }),
+        installDpi: installScript({
+          sid,
+          srcBinDir: 'C:\\b',
+          brokerText: service,
+          hashes: {
+            ...hashes,
+            ...Object.fromEntries((await import('./coreNames')).DPI_ALL.map((f) => [f, 'd'.repeat(64)]))
+          },
+          brokerHash: 'c'.repeat(64),
+          dpiBrokerText: 'x',
+          dpiBrokerHash: 'e'.repeat(64),
+          appVersion: '0.7.0'
+        })
       }
       const dir = join(tmp, 'parse')
       mkdirSync(dir, { recursive: true })

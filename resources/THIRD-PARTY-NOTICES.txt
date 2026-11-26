@@ -82,3 +82,48 @@ Wintun (wintun.dll) — https://www.wintun.net
 License: the Wintun prebuilt binaries license (redistribution of the
 unmodified DLL with an application is permitted), see https://www.wintun.net
 -------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+zapret v72.13 (winws.exe -> cipherway-dpi.exe) — https://github.com/bol-van/zapret
+Official Windows x86_64 build from the release, unmodified. Used for
+«Ускорение без VPN (zapret)». Fake payloads from the same release:
+tls_clienthello_www_google_com.bin, quic_initial_www_google_com.bin.
+-------------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) 2016-2024 bol-van
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+-------------------------------------------------------------------------------
+WinDivert 2.2.2 (WinDivert.dll, WinDivert64.sys) — https://reqrypt.org/windivert.html
+Copyright (C) 2011-2022 Basil. Shipped unmodified (byte-identical to the
+official WinDivert-2.2.2-A release). Dual-licensed: GNU Lesser General Public
+License v3 or GNU General Public License v2 (at your choice); we distribute it
+under the LGPLv3. Source code: https://github.com/basil00/WinDivert
+License texts: https://www.gnu.org/licenses/lgpl-3.0.html
+               https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+
+Cygwin DLL 3.4.10 (cygwin1.dll) — https://cygwin.com
+Copyright (C) Cygwin Authors. Shipped unmodified, as needed by winws.exe.
+License: GNU Lesser General Public License v3 or later, see
+https://cygwin.com/licensing.html. Source code: https://cygwin.com/git/?p=newlib-cygwin.git
+License text: https://www.gnu.org/licenses/lgpl-3.0.html
+-------------------------------------------------------------------------------

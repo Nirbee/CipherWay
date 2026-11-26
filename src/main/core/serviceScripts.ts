@@ -6,7 +6,7 @@ import {
   WINTUN_DEVICE_PS,
   wintunGuid
 } from './broker'
-import { CORE_EXE, LAN_EXE, LEGACY_EXES, TUN_INTERFACE } from './coreNames'
+import { CORE_EXE, DPI_ALL, DPI_EXE, LAN_EXE, LEGACY_EXES, TUN_INTERFACE } from './coreNames'
 
 // ---------------------------------------------------------------------------
 // «Служба TUN» (0.4.2): instead of a UAC prompt on every TUN connect, the
@@ -50,6 +50,8 @@ export interface BrokerHashes {
   'wintun.dll': string
   /** the LAN daemon (0.5.0); absent in a build without it */
   [LAN_EXE]?: string
+  /** zapret (0.7.0): cipherway-dpi.exe and its files (DPI_ALL); absent in a build without it */
+  [name: string]: string | undefined
 }
 
 export interface ServiceBrokerParams {
@@ -74,6 +76,11 @@ export function taskName(sid: string): string {
   return `CipherWay TUN ${sid}`
 }
 
+/** The third task of the service: zapret (src/main/zapret/dpiBroker.ts), 0.7.0. */
+export function dpiTaskName(sid: string): string {
+  return `CipherWay DPI ${sid}`
+}
+
 /** The second task of the service: the LAN daemon (src/main/lan/lanBroker.ts). */
 export function lanTaskName(sid: string): string {
   return `CipherWay LAN ${sid}`
@@ -92,15 +99,48 @@ export function rootExpr(override?: string): string {
  */
 export const BROKER_HELPERS_PS = `
 function Now-Ms { [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
+# an unchecked value for a message: only a-z 0-9 . _ -, at most 40 characters
+function Safe([string]$s) {
+  $t = [regex]::Replace(([string]$s).ToLowerInvariant(), '[^a-z0-9._-]', '')
+  if ($t.Length -gt 40) { $t = $t.Substring(0, 40) }
+  return $t
+}
+# a JSON number of the request as a whole number, else -1 — the range is checked
+# BEFORE any cast (a cast of 1e30 or of a string would quote the value in an error)
+function Num($v) {
+  if ($v -is [int] -or $v -is [long]) { return [long]$v }
+  if ($v -is [double] -or $v -is [decimal]) {
+    $d = [double]$v
+    if ([double]::IsNaN($d) -or $d -gt 9007199254740991 -or $d -lt -9007199254740991) { return [long]-1 }
+    return [long][math]::Truncate($d)
+  }
+  return [long]-1
+}
 function Is-Reparse([string]$p) {
   try { return (([IO.File]::GetAttributes($p) -band [IO.FileAttributes]::ReparsePoint) -ne 0) } catch { return $false }
+}
+# at most $max bytes of an open stream: read into max+1, more = refused (the size
+# is never taken from the file system — it may change between a check and the read)
+function Read-Bounded($fs, [long]$max) {
+  $buf = New-Object byte[] ($max + 1)
+  $n = 0
+  while ($n -le $max) {
+    $r = $fs.Read($buf, $n, $buf.Length - $n)
+    if ($r -le 0) { break }
+    $n += $r
+  }
+  if ($n -gt $max) { return $null }
+  $off = 0
+  if ($n -ge 3 -and $buf[0] -eq 0xEF -and $buf[1] -eq 0xBB -and $buf[2] -eq 0xBF) { $off = 3 }
+  return $Utf8.GetString($buf, $off, $n - $off)
 }
 function Read-UserFile([string]$p, [long]$max) {
   try {
     $fi = New-Object IO.FileInfo($p)
-    if (-not $fi.Exists -or $fi.Length -gt $max) { return $null }
+    if (-not $fi.Exists) { return $null }
     if (($fi.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $null }
-    return [IO.File]::ReadAllText($p, $Utf8)
+    $fs = New-Object IO.FileStream($p, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+    try { return (Read-Bounded $fs $max) } finally { $fs.Dispose() }
   } catch { return $null }
 }
 function Write-Atomic([string]$p, [string]$text) {
@@ -112,7 +152,7 @@ function Write-Atomic([string]$p, [string]$text) {
       return
     } catch { Start-Sleep -Milliseconds 100 }
   }
-  throw ('не удалось записать ' + $p)
+  throw 'cw-write не удалось записать файл службы'
 }
 function Note([string]$m) {
   try {
@@ -128,7 +168,7 @@ function Read-Ctl {
   $t = Read-UserFile $CtlF 4096
   if (-not $t) { return $null }
   try { $c = $t | ConvertFrom-Json } catch { return $null }
-  if (-not ($c.session -is [string]) -or $c.session -notmatch '^[0-9a-f]{16,64}$') { return $null }
+  if (-not ($c.session -is [string]) -or $c.session -cnotmatch '^[0-9a-f]{16,64}\\z') { return $null }
   return $c
 }
 function Sha([string]$p) {
@@ -141,7 +181,7 @@ function Sha([string]$p) {
 /** The SYSTEM-side broker (installed into <home>\broker.ps1). */
 export function serviceBrokerScript(p: ServiceBrokerParams): string {
   if (!isValidSid(p.sid)) throw new Error('bad sid')
-  for (const h of Object.values(p.hashes)) if (!HASH_RE.test(h)) throw new Error('bad hash')
+  for (const h of Object.values(p.hashes)) if (!HASH_RE.test(h ?? '')) throw new Error('bad hash')
   return `
 # CipherWay VPN — TUN service broker. Runs as SYSTEM from Task Scheduler.
 $ErrorActionPreference = 'Stop'
@@ -167,7 +207,7 @@ $CfgIn = Join-Path $UserRun 'config.json'
 $RulesIn = Join-Path $UserRun 'rules'
 $Hashes = @{ ${psQuote(CORE_EXE)} = ${psQuote(p.hashes[CORE_EXE])}; 'wintun.dll' = ${psQuote(p.hashes['wintun.dll'])} }
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
-$NameRe = '^cw-[0-9a-z-]{1,40}\\.json$'
+$NameRe = '^cw-[0-9a-z-]{1,40}\\.json\\z'
 $Forbidden = '(?i)(path|file|dir|_ui|download|certificate|key|script|command|exec|acme|cache|store|platform)'
 $OkOut = @('direct', 'socks', 'hysteria2', 'vmess', 'selector', 'urltest')
 $OkDns = @('https', 'udp', 'tcp', 'tls', 'local')
@@ -179,7 +219,7 @@ function Test-Keys($node, [string]$where) {
   if ($node -is [System.Management.Automation.PSCustomObject]) {
     foreach ($q in $node.PSObject.Properties) {
       $w = $where + '.' + $q.Name
-      if ($q.Name -match $Forbidden -and $w -notmatch '^\\.route\\.(rule_set\\[\\d+\\]\\.path|rules\\[\\d+\\]\\.process_path)$') { throw ('запрещённое поле ' + $w) }
+      if ($q.Name -match $Forbidden -and $w -notmatch '^\\.route\\.(rule_set\\[\\d+\\]\\.path|rules\\[\\d+\\]\\.process_path)\\z') { throw ('cw-config запрещённое поле ' + (Safe $w)) }
       Test-Keys $q.Value $w
     }
   } elseif ($node -is [array]) {
@@ -187,33 +227,33 @@ function Test-Keys($node, [string]$where) {
   }
 }
 function Test-Config([string]$text) {
-  if (-not $text) { throw 'нет конфигурации' }
-  $c = $text | ConvertFrom-Json
-  if (-not ($c -is [System.Management.Automation.PSCustomObject])) { throw 'конфигурация не объект' }
+  if (-not $text) { throw 'cw-config нет конфигурации' }
+  try { $c = $text | ConvertFrom-Json } catch { throw 'cw-config не JSON' }
+  if (-not ($c -is [System.Management.Automation.PSCustomObject])) { throw 'cw-config не объект' }
   foreach ($q in $c.PSObject.Properties) {
-    if (@('log', 'dns', 'inbounds', 'outbounds', 'route', 'experimental') -notcontains $q.Name) { throw ('поле ' + $q.Name) }
+    if (@('log', 'dns', 'inbounds', 'outbounds', 'route', 'experimental') -notcontains $q.Name) { throw ('cw-config поле ' + (Safe $q.Name)) }
   }
   Test-Keys $c ''
   if ($null -ne $c.log) {
-    foreach ($q in $c.log.PSObject.Properties) { if (@('level', 'output', 'timestamp', 'disabled') -notcontains $q.Name) { throw ('log.' + $q.Name) } }
-    if ($null -ne $c.log.output -and [string]$c.log.output -ne $LogOut) { throw 'log.output' }
+    foreach ($q in $c.log.PSObject.Properties) { if (@('level', 'output', 'timestamp', 'disabled') -notcontains $q.Name) { throw ('cw-config log.' + (Safe $q.Name)) } }
+    if ($null -ne $c.log.output -and [string]$c.log.output -ne $LogOut) { throw 'cw-config log.output' }
   }
   if ($null -ne $c.experimental) {
-    foreach ($q in $c.experimental.PSObject.Properties) { if ($q.Name -ne 'clash_api') { throw ('experimental.' + $q.Name) } }
+    foreach ($q in $c.experimental.PSObject.Properties) { if ($q.Name -ne 'clash_api') { throw ('cw-config experimental.' + (Safe $q.Name)) } }
     $ca = $c.experimental.clash_api
     if ($null -ne $ca) {
-      foreach ($q in $ca.PSObject.Properties) { if (@('external_controller', 'default_mode', 'secret') -notcontains $q.Name) { throw ('clash_api.' + $q.Name) } }
-      if ([string]$ca.external_controller -notmatch '^127\\.0\\.0\\.1:\\d{1,5}$') { throw 'clash_api.external_controller' }
+      foreach ($q in $ca.PSObject.Properties) { if (@('external_controller', 'default_mode', 'secret') -notcontains $q.Name) { throw ('cw-config clash_api.' + (Safe $q.Name)) } }
+      if ([string]$ca.external_controller -notmatch '^127\\.0\\.0\\.1:\\d{1,5}\\z') { throw 'cw-config clash_api.external_controller' }
     }
   }
-  if ($null -ne $c.inbounds) { foreach ($x in @($c.inbounds)) { if ($x.type -ne 'tun') { throw ('вход ' + $x.type) } } }
-  if ($null -ne $c.outbounds) { foreach ($x in @($c.outbounds)) { if ($OkOut -notcontains $x.type) { throw ('выход ' + $x.type) } } }
-  if ($null -ne $c.dns -and $null -ne $c.dns.servers) { foreach ($x in @($c.dns.servers)) { if ($OkDns -notcontains $x.type) { throw ('DNS ' + $x.type) } } }
+  if ($null -ne $c.inbounds) { foreach ($x in @($c.inbounds)) { if ($x.type -ne 'tun') { throw ('cw-config вход ' + (Safe $x.type)) } } }
+  if ($null -ne $c.outbounds) { foreach ($x in @($c.outbounds)) { if ($OkOut -notcontains $x.type) { throw ('cw-config выход ' + (Safe $x.type)) } } }
+  if ($null -ne $c.dns -and $null -ne $c.dns.servers) { foreach ($x in @($c.dns.servers)) { if ($OkDns -notcontains $x.type) { throw ('cw-config DNS ' + (Safe $x.type)) } } }
   if ($null -ne $c.route -and $null -ne $c.route.rule_set) {
     foreach ($x in @($c.route.rule_set)) {
-      if ($x.type -ne 'local' -or $x.format -ne 'source') { throw 'rule_set: только local/source' }
+      if ($x.type -ne 'local' -or $x.format -ne 'source') { throw 'cw-config rule_set: только local/source' }
       $leaf = [IO.Path]::GetFileName([string]$x.path)
-      if ($leaf -notmatch $NameRe -or [string]$x.path -ne (Join-Path $RulesOut $leaf)) { throw ('rule_set.path ' + $x.path) }
+      if ($leaf -notmatch $NameRe -or [string]$x.path -ne (Join-Path $RulesOut $leaf)) { throw ('cw-config rule_set.path ' + (Safe ([IO.Path]::GetFileName([string]$x.path)))) }
     }
   }
 }
@@ -240,9 +280,9 @@ function Sync-Rules {
   }
 }
 function Prepare {
-  if (Is-Reparse $UserRun) { throw 'папка приложения — ссылка' }
+  if (Is-Reparse $UserRun) { throw 'cw-link папка приложения — ссылка' }
   foreach ($k in @($Hashes.Keys)) {
-    if ((Sha (Join-Path $Bin $k)) -ne $Hashes[$k]) { throw ('файл ядра изменён: ' + $k) }
+    if ((Sha (Join-Path $Bin $k)) -ne $Hashes[$k]) { throw ('cw-core файл ядра изменён: ' + $k) }
   }
   $text = Read-UserFile $CfgIn 4194304
   Test-Config $text
@@ -290,14 +330,14 @@ $core = $null
 try {
   $ctl = Read-Ctl
   if ($null -ne $ctl) { $State.session = [string]$ctl.session }
-  if ($null -eq $ctl -or $ctl.cmd -ne 'run' -or [math]::Abs((Now-Ms) - [long]$ctl.ts) -gt 120000 -or -not (Alive $ctl.pid)) {
+  if ($null -eq $ctl -or $ctl.cmd -cne 'run' -or [math]::Abs((Now-Ms) - (Num $ctl.ts)) -gt 120000 -or -not (Alive (Num $ctl.pid))) {
     $State.status = 'refused'
-    $State.error = 'нет свежего запроса на запуск'
+    $State.error = 'no_request'
     exit 0
   }
   $State.session = [string]$ctl.session
-  $State.restart = [long]$ctl.restart
-  $State.rules = [long]$ctl.rules
+  $State.restart = Num $ctl.restart
+  $State.rules = Num $ctl.rules
   Stop-Orphan
   # the app waits for this session id: it knows the task really started
   Save-State
@@ -323,21 +363,21 @@ try {
     $miss = 0
     if ($c.session -ne $State.session) { $State.stopReason = 'новая сессия'; break }
     if ($c.cmd -ne 'run') { $State.stopReason = 'команда остановки'; break }
-    if ([long]$c.restart -gt $State.restart) {
+    if ((Num $c.restart) -gt $State.restart) {
       Stop-Core $core
       $core = $null
       Clear-StaleAdapter
       Prepare
       $core = Start-Core
-      $State.restart = [long]$c.restart
-      $State.rules = [long]$c.rules
+      $State.restart = Num $c.restart
+      $State.rules = Num $c.rules
       $idle = 0
       Save-State
       continue
     }
-    if ([long]$c.rules -gt $State.rules) {
+    if ((Num $c.rules) -gt $State.rules) {
       Sync-Rules
-      $State.rules = [long]$c.rules
+      $State.rules = Num $c.rules
       Save-State
     }
     if ($core.HasExited) {
@@ -346,15 +386,19 @@ try {
       if ($idle -gt 240) { $State.stopReason = 'ядро завершилось, перезапуск не запрошен'; break }
     }
     if (($tick % 8) -eq 0) {
-      if (-not (Alive $c.pid)) { $State.stopReason = 'приложение закрыто'; break }
+      if (-not (Alive (Num $c.pid))) { $State.stopReason = 'приложение закрыто'; break }
       Save-State
     }
   }
   $State.status = 'stopped'
 } catch {
+  # the state gets a fixed code only (never an exception text or a piece of JSON);
+  # the journal: our own message (values only through Safe) or the exception's type
+  $m = [string]$_.Exception.Message
   $State.status = 'error'
-  $State.error = [string]$_.Exception.Message
-  Note ('ошибка: ' + $State.error)
+  $State.error = 'failed'
+  if ($m -cmatch '^cw-(config|core|link|write) ') { $State.error = @{ config = 'config'; core = 'core_changed'; link = 'link'; write = 'write' }[$Matches[1]] }
+  Note ('ошибка: ' + $State.error + ' — ' + $(if ($m.StartsWith('cw-')) { $m.Substring($m.IndexOf(' ') + 1) } else { $_.Exception.GetType().Name }))
 } finally {
   Stop-Core $core
   if ($State.stopReason) { Note ('ядро остановлено: ' + $State.stopReason) }
@@ -375,6 +419,9 @@ export interface InstallParams {
   /** the LAN broker (lanBrokerScript) + its sha256; absent = no LAN task */
   lanBrokerText?: string
   lanBrokerHash?: string
+  /** the zapret broker (dpiBrokerScript) + its sha256; absent = no DPI task */
+  dpiBrokerText?: string
+  dpiBrokerHash?: string
   appVersion: string
   /**
    * tests only: run the file part (copy, hash check, removal of the old names,
@@ -408,17 +455,18 @@ function Remove-LegacyCores {
 
 const TASK_DESCRIPTION = {
   tun: 'CipherWay VPN: ядро sing-box в режиме TUN без запроса прав при каждом подключении',
-  lan: 'CipherWay VPN: LAN — виртуальная локальная сеть для игр с друзьями'
+  lan: 'CipherWay VPN: LAN — виртуальная локальная сеть для игр с друзьями',
+  dpi: 'CipherWay VPN: ускорение без VPN (zapret) для выбранных сайтов'
 } as const
 
 /**
  * XML of a task: SYSTEM, highest, on demand only, no time limit, also on
  * battery, normal priority (the default 7 would make sing-box «below normal»).
- * $PsX / $BrokerX (TUN) or $LanBrokerX (LAN) / $DirX are expanded
+ * $PsX / $BrokerX (TUN), $LanBrokerX (LAN) or $DpiBrokerX (zapret) / $DirX are expanded
  * (XML-escaped) by the installer's PowerShell here-string.
  */
-export function taskXml(kind: 'tun' | 'lan' = 'tun'): string {
-  const broker = kind === 'lan' ? '$LanBrokerX' : '$BrokerX'
+export function taskXml(kind: 'tun' | 'lan' | 'dpi' = 'tun'): string {
+  const broker = kind === 'lan' ? '$LanBrokerX' : kind === 'dpi' ? '$DpiBrokerX' : '$BrokerX'
   return `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo><Author>CipherWay VPN</Author><Description>${TASK_DESCRIPTION[kind]}</Description></RegistrationInfo>
@@ -452,21 +500,31 @@ export function installScript(p: InstallParams): string {
     throw new Error('bad hash')
   }
   const lanB64 = lan ? Buffer.from(p.lanBrokerText ?? '', 'utf8').toString('base64') : ''
+  const dpi = DPI_ALL.every((f) => !!p.hashes[f]) && !!p.dpiBrokerText && !!p.dpiBrokerHash
+  if (
+    dpi &&
+    (!DPI_ALL.every((f) => HASH_RE.test(p.hashes[f] ?? '')) || !HASH_RE.test(p.dpiBrokerHash ?? ''))
+  ) {
+    throw new Error('bad hash')
+  }
+  const dpiB64 = dpi ? Buffer.from(p.dpiBrokerText ?? '', 'utf8').toString('base64') : ''
   const manifest = JSON.stringify({
     version: 1,
     app: p.appVersion,
     broker: p.brokerHash,
     ...(lan ? { lanBroker: p.lanBrokerHash } : {}),
+    ...(dpi ? { dpiBroker: p.dpiBrokerHash } : {}),
     files: p.hashes
   })
   const want = [
     `${psQuote(CORE_EXE)} = ${psQuote(p.hashes[CORE_EXE])}`,
     `'wintun.dll' = ${psQuote(p.hashes['wintun.dll'])}`,
-    ...(lan ? [`${psQuote(LAN_EXE)} = ${psQuote(p.hashes[LAN_EXE] ?? '')}`] : [])
+    ...(lan ? [`${psQuote(LAN_EXE)} = ${psQuote(p.hashes[LAN_EXE] ?? '')}`] : []),
+    ...(dpi ? DPI_ALL.map((f) => `${psQuote(f)} = ${psQuote(p.hashes[f] ?? '')}`) : [])
   ].join('; ')
   // <Root>\lan\<SID>: the LAN daemon's node key — SYSTEM / Administrators only
   const secureDirs = p.testRoot
-    ? `foreach ($d in @($Root, $Bin, (Join-Path $Root 'u'), $Dir, (Join-Path $Dir 'rules')${lan ? ", (Join-Path $Root 'lan'), $LanDir, (Join-Path $LanDir 'pd'), (Join-Path $LanDir 'tmp')" : ''})) { $null = [IO.Directory]::CreateDirectory($d) }`
+    ? `foreach ($d in @($Root, $Bin, (Join-Path $Root 'u'), $Dir, (Join-Path $Dir 'rules')${lan ? ", (Join-Path $Root 'lan'), $LanDir, (Join-Path $LanDir 'pd'), (Join-Path $LanDir 'tmp')" : ''}${dpi ? ', $DpiRoot, $DpiBin' : ''})) { $null = [IO.Directory]::CreateDirectory($d) }`
     : `Secure-Dir $Root $Shared
   Secure-Dir $Bin $Shared
   Secure-Dir (Join-Path $Root 'u') $Shared
@@ -478,6 +536,14 @@ export function installScript(p: InstallParams): string {
   Secure-Dir $LanDir $Admins
   Secure-Dir (Join-Path $LanDir 'pd') $Admins
   Secure-Dir (Join-Path $LanDir 'tmp') $Admins`
+      : ''
+  }${
+    dpi
+      ? `
+  Secure-Dir $DpiRoot $Admins
+  Clean-CygwinRoot
+  Secure-Dir $DpiBin $Admins
+  Secure-Dir (Join-Path $Root 'tmp') $Admins`
       : ''
   }`
   const registerTask = p.testRoot
@@ -503,6 +569,15 @@ ${taskXml('lan')}
 "@
   $null = $folder.RegisterTask($LanTaskName, $LanXml, 6, $null, $null, 5, $TaskSddl)`
       : ''
+  }${
+    dpi
+      ? `
+  $DpiBrokerX = [Security.SecurityElement]::Escape($DpiBrokerX)
+  $DpiXml = @"
+${taskXml('dpi')}
+"@
+  $null = $folder.RegisterTask($DpiTaskName, $DpiXml, 6, $null, $null, 5, $TaskSddl)`
+      : ''
   }`
   return `
 $ErrorActionPreference = 'Stop'
@@ -511,18 +586,25 @@ $Sid = ${psQuote(p.sid)}
 $SrcBin = ${psQuote(p.srcBinDir)}
 $TaskName = ${psQuote(taskName(p.sid))}
 $LanTaskName = ${psQuote(lanTaskName(p.sid))}
+$DpiTaskName = ${psQuote(dpiTaskName(p.sid))}
 $Want = @{ ${want} }
 $Manifest = ${psQuote(manifest)}
 $BrokerText = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${b64}'))
 $LanBrokerText = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${lanB64}'))
+$DpiBrokerText = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${dpiB64}'))
 $Root = ${rootExpr(p.testRoot)}
 $Dir = Join-Path $Root ('u\\' + $Sid)
 $Bin = Join-Path $Root 'bin'
 $LanDir = Join-Path $Root ('lan\\' + $Sid)
+# zapret: SYSTEM / Administrators only — cygwin1.dll takes its parent ($DpiRoot) as
+# the Cygwin root (etc\fstab, passwd…), and no user process may load that copy
+$DpiRoot = Join-Path $Root 'dpi'
+$DpiBin = Join-Path $DpiRoot 'bin'
 $Trusted = @('S-1-5-32-544', 'S-1-5-18')
 $Shared = 'O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)'
 $Mine = 'O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;' + $Sid + ')'
 $Admins = 'O:BAG:SYD:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)'
+$DpiNames = @(${DPI_ALL.map(psQuote).join(', ')})
 
 function Sha([string]$p) {
   $h = [Security.Cryptography.SHA256]::Create()
@@ -563,14 +645,62 @@ function Stop-RunningFrom([string]$path) {
     try { if ($p.Path -ieq $path) { $p.Kill(); $null = $p.WaitForExit(5000) } } catch {}
   }
 }
-function Put-File([string]$src, [string]$name) {
-  $dest = Join-Path $Bin $name
+function Put-File([string]$src, [string]$name, [string]$dir = $Bin) {
+  $dest = Join-Path $dir $name
   if ([IO.File]::Exists($dest) -and (Sha $dest) -eq $Want[$name]) { return }
-  if ($name -eq ${psQuote(LAN_EXE)} -and [IO.File]::Exists($dest)) { Stop-RunningFrom $dest }
+  if (($name -eq ${psQuote(LAN_EXE)} -or $name -eq ${psQuote(DPI_EXE)}) -and [IO.File]::Exists($dest)) { Stop-RunningFrom $dest }
   $tmp = $dest + '.new'
   [IO.File]::Copy($src, $tmp, $true)
   if ((Sha $tmp) -ne $Want[$name]) { [IO.File]::Delete($tmp); throw ('файл подменён при копировании: ' + $name) }
-  if ([IO.File]::Exists($dest)) { [IO.File]::Replace($tmp, $dest, [NullString]::Value) } else { [IO.File]::Move($tmp, $dest) }
+  if (-not [IO.File]::Exists($dest)) { [IO.File]::Move($tmp, $dest); return }
+  try { [IO.File]::Replace($tmp, $dest, [NullString]::Value) } catch {
+    # a loaded driver / DLL can't be overwritten but can be renamed (zapret's WinDivert)
+    if ($DpiNames -notcontains $name) { throw }
+    [IO.File]::Move($dest, $dest + '.old-' + [Guid]::NewGuid().ToString('N'))
+    [IO.File]::Move($tmp, $dest)
+  }
+}
+# renamed copies of a loaded WinDivert / DLL (Put-File) — gone once nothing holds them
+function Remove-OldDpi([string]$dir) {
+  if (-not [IO.Directory]::Exists($dir)) { return }
+  foreach ($n in $DpiNames) {
+    foreach ($f in [IO.Directory]::GetFiles($dir, $n + '.old-*')) { try { [IO.File]::Delete($f) } catch {} }
+  }
+}
+# the Cygwin root holds only its bin folder — nothing else (etc, tmp…) may steer the SYSTEM copy
+function Clean-CygwinRoot {
+  foreach ($e in [IO.Directory]::GetFileSystemEntries($DpiRoot)) {
+    try {
+      $leaf = [IO.Path]::GetFileName($e)
+      $link = ([IO.File]::GetAttributes($e) -band [IO.FileAttributes]::ReparsePoint) -ne 0
+      $isDir = [IO.Directory]::Exists($e)
+      if ($leaf -eq 'bin' -and $isDir -and -not $link) { continue }
+      if ($link) {
+        # a link itself is removed, never what it points to
+        if ($isDir) { [IO.Directory]::Delete($e) } else { [IO.File]::Delete($e) }
+      } elseif ($leaf -like '*.untrusted-*') {
+        # moved aside earlier: left as it is, never deleted recursively
+        continue
+      } elseif ($isDir -or $Trusted -notcontains (Owner-Of $e)) {
+        # an etc / tmp (or anything of somebody else): moved aside, never deleted recursively
+        $junk = $e + '.untrusted-' + [Guid]::NewGuid().ToString('N')
+        if ($isDir) { [IO.Directory]::Move($e, $junk) } else { [IO.File]::Move($e, $junk) }
+      } else { [IO.File]::Delete($e) }
+    } catch {}
+  }
+}
+# 0.7.0 test builds put zapret into the shared bin (users: read & run): moved out
+function Remove-DpiFromBin {
+  foreach ($n in $DpiNames) {
+    $f = Join-Path $Bin $n
+    if (-not [IO.File]::Exists($f)) { continue }
+    if ($n -eq ${psQuote(DPI_EXE)}) { Stop-RunningFrom $f }
+    try { [IO.File]::Delete($f) } catch {
+      # a loaded WinDivert64.sys: renamed now, deleted by a later install
+      try { [IO.File]::Move($f, $f + '.old-' + [Guid]::NewGuid().ToString('N')) } catch {}
+    }
+  }
+  Remove-OldDpi $Bin
 }
 ${legacyCleanupPs()}
 
@@ -585,6 +715,15 @@ try {
   Put-File (Join-Path $SrcBin ${psQuote(LAN_EXE)}) ${psQuote(LAN_EXE)}
   $LanBrokerX = Join-Path $Dir 'lan-broker.ps1'
   [IO.File]::WriteAllText($LanBrokerX, $LanBrokerText, (New-Object Text.UTF8Encoding($true)))`
+      : ''
+  }${
+    dpi
+      ? `
+  try { Remove-OldDpi $DpiBin } catch {}
+${DPI_ALL.map((f) => `  Put-File (Join-Path $SrcBin ${psQuote(f)}) ${psQuote(f)} $DpiBin`).join('\n')}
+  try { Remove-DpiFromBin } catch {}
+  $DpiBrokerX = Join-Path $Dir 'dpi-broker.ps1'
+  [IO.File]::WriteAllText($DpiBrokerX, $DpiBrokerText, (New-Object Text.UTF8Encoding($true)))`
       : ''
   }
   ${registerTask}
@@ -609,15 +748,27 @@ $env:PSModulePath = Join-Path $PSHOME 'Modules'
 $Sid = ${psQuote(sid)}
 $TaskName = ${psQuote(taskName(sid))}
 $LanTaskName = ${psQuote(lanTaskName(sid))}
+$DpiTaskName = ${psQuote(dpiTaskName(sid))}
 $Root = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'CipherWay'
 $Dir = Join-Path $Root ('u\\' + $Sid)
 $LanDir = Join-Path $Root ('lan\\' + $Sid)
 $LanExe = Join-Path (Join-Path $Root 'bin') ${psQuote(LAN_EXE)}
+$DpiExes = @((Join-Path $Root ('dpi\\bin\\' + ${psQuote(DPI_EXE)})), (Join-Path (Join-Path $Root 'bin') ${psQuote(DPI_EXE)}))
+$DpiHosts = Join-Path $Dir 'dpi\\hosts.txt'
 try {
   $svc = New-Object -ComObject 'Schedule.Service'
   $svc.Connect()
   try { $svc.GetFolder('\\').DeleteTask($TaskName, 0) } catch {}
   try { $svc.GetFolder('\\').DeleteTask($LanTaskName, 0) } catch {}
+  try { $svc.GetFolder('\\').DeleteTask($DpiTaskName, 0) } catch {}
+  # this user's zapret (its pid from the broker's state, only if it runs our file)
+  try {
+    $st = [IO.File]::ReadAllText((Join-Path $Dir 'dpi-state.json')) | ConvertFrom-Json
+    $o = [Diagnostics.Process]::GetProcessById([int]$st.dpiPid)
+    $cl = [string](Get-CimInstance Win32_Process -Filter ('ProcessId=' + [int]$o.Id)).CommandLine
+    $mine = $cl.IndexOf('"--hostlist=' + $DpiHosts + '"', [StringComparison]::OrdinalIgnoreCase) -ge 0
+    if ($DpiExes -contains $o.MainModule.FileName -and $mine) { $o.Kill(); $null = $o.WaitForExit(5000) }
+  } catch {}
   # this user's LAN daemon (its pid from the broker's state, only if it runs our file)
   try {
     $st = [IO.File]::ReadAllText((Join-Path $Dir 'lan-state.json')) | ConvertFrom-Json
