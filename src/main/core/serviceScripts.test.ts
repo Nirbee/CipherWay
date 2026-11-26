@@ -1,3 +1,7 @@
+import { execFileSync } from 'node:child_process'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { DPI_ALL } from './coreNames'
 import {
@@ -69,7 +73,7 @@ describe('«Служба TUN» scripts (0.4.2)', () => {
     expect(broker).toContain('$psi.FileName = $CoreExe')
     for (const k of ['cache', 'path', '_ui', 'download', 'certificate', 'platform'])
       expect(broker).toMatch(new RegExp(`\\$Forbidden = .*${k}`))
-    expect(broker).toContain("'^127\\.0\\.0\\.1:\\d{1,5}\\z'")
+    expect(broker).toContain("'^127\\.0\\.0\\.1:[0-9]{1,5}\\z'")
     expect(broker).toContain("if ($x.type -ne 'tun')")
     expect(broker).toContain("$x.type -ne 'local' -or $x.format -ne 'source'")
   })
@@ -242,6 +246,15 @@ describe('the zapret task of the service (0.7.0)', () => {
     expect(u).toContain("$DpiHosts = Join-Path $Dir 'dpi\\hosts.txt'")
     expect(u).toContain(`$cl.IndexOf('"--hostlist=' + $DpiHosts + '"'`)
     expect(u).toContain('$DpiExes -contains $o.MainModule.FileName -and $mine')
+    // TCP timestamps (0.7.2): only while no broker holds the lock; confirmed before the marker goes
+    expect(u).toContain(
+      '[IO.File]::Open($LockF, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)'
+    )
+    expect(u).toContain("$Netsh = Join-Path ([Environment]::GetFolderPath('System')) 'netsh.exe'")
+    expect(u).not.toContain('$env:SystemRoot')
+    expect(u).toContain("$si.Arguments = 'interface tcp set global timestamps=disabled'")
+    expect(u).toContain('$done = $pr.WaitForExit(15000) -and $pr.ExitCode -eq 0')
+    expect(u).toContain('if ($done -and (& $tsNow) -eq 0) { [IO.File]::Delete($TsF) }')
   })
 
   it("zapret's files: admin-only <Root>\\dpi\\bin (Cygwin's root <Root>\\dpi holds nothing else); out of the shared bin", () => {
@@ -276,7 +289,7 @@ describe('the zapret task of the service (0.7.0)', () => {
     const tun = serviceBrokerScript({ sid, userRunDir: 'C:\\r', hashes: base })
     expect(tun).toContain("$c.session -cnotmatch '^[0-9a-f]{16,64}\\z'")
     expect(tun).toContain("$NameRe = '^cw-[0-9a-z-]{1,40}\\.json\\z'")
-    expect(tun).toContain("'^127\\.0\\.0\\.1:\\d{1,5}\\z'")
+    expect(tun).toContain("'^127\\.0\\.0\\.1:[0-9]{1,5}\\z'")
     expect(tun).not.toMatch(/match '[^']*\$'/)
     expect(tun).toContain("throw ('cw-config выход ' + (Safe $x.type))")
     expect(tun).toContain("[regex]::Replace(([string]$s).ToLowerInvariant(), '[^a-z0-9._-]', '')")
@@ -284,5 +297,24 @@ describe('the zapret task of the service (0.7.0)', () => {
     expect(tun).toContain("try { $c = $text | ConvertFrom-Json } catch { throw 'cw-config не JSON' }")
     expect(tun).toContain("$State.error = 'failed'")
     expect(tun).not.toContain('$State.error = [string]$_.Exception.Message')
+  })
+})
+
+describe.skipIf(process.platform !== 'win32')('the removal script is valid PowerShell', () => {
+  it('no parse errors (Windows PowerShell 5.1)', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'cw-un-'))
+    const f = join(dir, 'un.ps1')
+    writeFileSync(f, '\ufeff' + uninstallScript('S-1-5-21-1111111111-2222222222-3333333333-1001'))
+    const out = execFileSync(
+      'powershell.exe',
+      [
+        '-NoProfile',
+        '-Command',
+        `$e = $null; $null = [System.Management.Automation.Language.Parser]::ParseFile('${f}', [ref]$null, [ref]$e); $e.Count`
+      ],
+      { encoding: 'utf8', windowsHide: true, timeout: 60_000 }
+    )
+    rmSync(dir, { recursive: true, force: true })
+    expect(out.trim()).toBe('0')
   })
 })

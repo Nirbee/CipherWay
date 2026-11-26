@@ -118,7 +118,7 @@ export const GEOIP_CATEGORIES = [
 export type ActionTone = 'blue' | 'green' | 'red' | 'neutral'
 
 export function actionTone(action: string): ActionTone {
-  if (action === 'DIRECT') return 'green'
+  if (action === 'DIRECT' || action === 'ZAPRET') return 'green'
   if (action === 'REJECT' || action === 'BLOCK') return 'red'
   return 'blue'
 }
@@ -126,6 +126,7 @@ export function actionTone(action: string): ActionTone {
 export function actionLabel(action: string): string {
   if (action === 'PROXY') return 'Через VPN'
   if (action === 'DIRECT') return 'Напрямую'
+  if (action === 'ZAPRET') return 'Напрямую + zapret'
   if (action === 'REJECT' || action === 'BLOCK') return 'Блокировать'
   return `VPN · ${action}`
 }

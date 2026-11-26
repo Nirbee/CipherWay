@@ -3,7 +3,9 @@ import { DPI_ALL } from '../core/coreNames'
 import {
   CYGWIN_DIR_SDDL,
   cygwinKey,
+  DPI_NO_HOST,
   dpiBrokerScript,
+  ipPlansPs,
   parseDpiState,
   plansPs,
   servicesPs,
@@ -17,12 +19,13 @@ const HASHES = Object.fromEntries(DPI_ALL.map((f, i) => [f, String(i).repeat(64)
 const APP = "C:\\Users\\O'Neil\\AppData\\Local\\Programs\\CipherWay VPN\\CipherWay VPN.exe"
 
 describe('dpiBrokerScript', () => {
-  const ps = dpiBrokerScript({
+  const P = {
     sid: SID,
     userRunDir: "C:\\Users\\O'Neil\\AppData\\run",
     appExe: APP,
     hashes: HASHES
-  })
+  }
+  const ps = dpiBrokerScript(P)
 
   it('pins every file of zapret by its hash; they live in the admin-only <Root>\\dpi\\bin', () => {
     for (const f of DPI_ALL) expect(ps).toContain(`'${f}' = '${HASHES[f]}'`)
@@ -48,6 +51,54 @@ describe('dpiBrokerScript', () => {
     expect(plansPs()).toContain("'--ipset=%DISCORD_IPS%'")
     expect(ps).toContain(`$DiscordIps = @('${SERVICE_DEFS.discord.cidrs[0]}'`)
     expect(ps).toContain(".Replace('%DISCORD_IPS%', $DiscordF)")
+    // 0.7.2: the user's IP rules — their own profiles, appended only for a non-empty ipset
+    for (const s of STRATEGIES) expect(ipPlansPs()).toContain(`'${s.id}' = @('--new'`)
+    expect(ipPlansPs()).not.toMatch(/%HOSTS%|[A-Za-z]:\\/)
+    expect(ps).toContain('if ($l.ips.Count -gt 0) {')
+    expect(ps).toContain(".Replace('%USER_IPS%', $IpsF)")
+    expect(ps).toContain(`$NoHost = '${DPI_NO_HOST}'`)
+  })
+
+  it('TCP timestamps: two fixed netsh calls, exit code checked, read back; only by the lock holder', () => {
+    expect(ps).toContain("$Netsh = Join-Path ([Environment]::GetFolderPath('System')) 'netsh.exe'")
+    expect(ps).not.toContain('$env:SystemRoot')
+    expect(ps).toContain("$si.Arguments = 'interface tcp set global timestamps=' + $v")
+    expect(ps).toContain("if ($v -cne 'enabled' -and $v -cne 'disabled') { return $false }")
+    expect(ps).toContain('return ($pr.ExitCode -eq 0)')
+    expect(ps).not.toMatch(/netsh[^\n]*2>&1/)
+    // read through CIM (the template applied to Internet connections), not localized text
+    expect(ps).toContain(
+      `-ClassName 'MSFT_NetTCPSetting' -Filter "SettingName='Internet'"`
+    )
+    expect(ps).toContain("$TsF = Join-Path $Tmp 'dpi-tcp-ts.txt'")
+    // already on: nothing touched, no marker
+    expect(ps).toContain("if ((Tcp-Ts) -ne 'Disabled') { return }")
+    // the marker goes only after a confirmed return
+    expect(ps).toContain("if (-not $ok -or (Tcp-Ts) -ne $orig) {")
+    expect(ps).toContain('$TcpTs = $true')
+    expect(ps.indexOf('  Enable-TcpTs\n')).toBeGreaterThan(ps.indexOf('$lock = Take-Lock'))
+    expect(ps).toContain('if ($null -ne $lock) { Restore-TcpTs }')
+    // cleanup / no request: put back if the lock is free
+    expect(ps).toMatch(/Stop-Orphan\n\s+Restore-IfIdle\n\s+\$State.status = 'stopped'/)
+    expect(ps).toMatch(/Restore-IfIdle\n\s+\$State.status = 'refused'/)
+    // tests (a temp root) never touch the computer's setting; a fake only on request
+    expect(dpiBrokerScript({ ...P, rootOverride: 'C:\\tmp\\x' })).toContain('$TcpTs = $false')
+    expect(() =>
+      dpiBrokerScript({ ...P, tcpTsTest: { netsh: 'C:\\x\\n.cmd', stateFile: 'C:\\x\\s' } })
+    ).toThrow()
+  })
+
+  it('patterns use [0-9], never \\d (a Unicode digit is not a digit here)', () => {
+    const pats = [...ps.matchAll(/\$(V4Re|V6Re) = '([^']+)'/g)].map((m) => m[2])
+    expect(pats).toHaveLength(2)
+    for (const s of pats) expect(s).not.toContain('\\d')
+    const v4 = new RegExp(pats[0].replace(/\\z/g, '$(?![\\s\\S])'))
+    expect(v4.test('198.51.100.0/24')).toBe(true)
+    // Arabic-Indic / full-width digits
+    expect(v4.test('١٩٨.51.100.0/24')).toBe(false)
+    expect(v4.test('198.51.100.0/２４')).toBe(false)
+    expect(ps).toContain('function Test-UserIp([string]$s) {')
+    expect(ps).toContain("if (-not ($x -is [string]) -or -not (Test-UserIp $x)) { throw 'cw-bad_request адрес' }")
   })
 
   it('every pattern is anchored with \\z: a value ending in a newline never matches', () => {

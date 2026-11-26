@@ -171,6 +171,7 @@ export function toConnItems(raw: RawConnections, ctx: ConnContext): ConnItem[] {
       serverName,
       ...(route === 'direct' &&
       download === 0 &&
+      !directNoise(host, String(md.destinationPort ?? ''), process) &&
       ctx.now - (Number.isFinite(start) ? start : ctx.now) > STALL_MS
         ? { stalled: true }
         : {}),
@@ -191,6 +192,23 @@ export function toConnItems(raw: RawConnections, ctx: ConnContext): ConnItem[] {
 // Collected per address; the process comes from live connections seen while
 // they were still dialing (the Clash API lists them during the dial).
 // ---------------------------------------------------------------------------
+
+/** torrent clients: thousands of peers that never answer are normal for them */
+const P2P_RE = /^(?:qbittorrent|utorrent|bittorrent|transmission(?:-qt|-gtk|-daemon)?|deluge(?:d)?|tixati|vuze|biglybt|frostwire|aria2c|halite|bitcomet|picotorrent|motrix)(?:\.exe)?$/i
+/** ports of usual services: a bare address on one of them may still be a site / a messenger */
+const KNOWN_PORTS = new Set(['80', '443', '8080', '8443', '853', '5222', '5223', '5228', '993', '995', '465', '587'])
+const BARE_IP_RE = /^(?:\d{1,3}(?:\.\d{1,3}){3}|\[?[0-9a-f]*:[0-9a-f:]+\]?)$/i
+
+/**
+ * 0.7.2: «no answer» that says nothing about the VPN — never offered as
+ * «добавьте правило через VPN»: a torrent client, or a bare address (no
+ * domain) on a non-standard port (P2P, games' peers, LAN scanners).
+ */
+export function directNoise(host: string, port: string, process?: string): boolean {
+  if (process && P2P_RE.test(process.split(/[\\/]/).pop() ?? process)) return true
+  if (BARE_IP_RE.test(host) && !isTelegramIp(host) && !KNOWN_PORTS.has(port)) return true
+  return false
+}
 
 const FAIL_RE =
   /open connection to (\S+?):(\d+) using outbound\/direct\[direct\]:.*(i\/o timeout|timed out|did not properly respond)/i
@@ -266,6 +284,7 @@ export class DirectFailures {
         const p = f.process ?? this.seen.get(key)?.process
         return p ? { ...f, process: p } : f
       })
+      .filter((f) => !directNoise(f.host, f.port, f.process))
       .sort((a, b) => b.last - a.last)
       .slice(0, MAX_FAILED)
   }

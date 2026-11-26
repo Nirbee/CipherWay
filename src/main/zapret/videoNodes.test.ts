@@ -64,7 +64,23 @@ describe('findVideoNodes', () => {
       nodes: ['rr3---sn-nvm-cxb6.googlevideo.com'],
       via: 'page'
     })
-    expect(asked).toEqual(['www.youtube.com/watch?v=jNQXAC9IVRw'])
+    expect(asked).toContain('www.youtube.com/watch?v=jNQXAC9IVRw')
+  })
+
+  it('0.7.2: the page nodes AND report_mapping ones (a pick alternates between them)', async () => {
+    const { d } = deps({
+      page: 'x rr3---sn-nvm-cxb6.googlevideo.com y',
+      mapping: '1.2.3.4 => vimpelcom-voz2 (1.2.3.0/24)',
+      resolves: ['rr1---sn-8ph2xajvh-8v1l.googlevideo.com', 'rr2---sn-8ph2xajvh-8v1l.googlevideo.com']
+    })
+    expect(await findVideoNodes(d)).toEqual({
+      nodes: [
+        'rr3---sn-nvm-cxb6.googlevideo.com',
+        'rr1---sn-8ph2xajvh-8v1l.googlevideo.com',
+        'rr2---sn-8ph2xajvh-8v1l.googlevideo.com'
+      ],
+      via: 'both'
+    })
   })
 
   it('no page: report_mapping → rr1 / rr2 of the sn- name, only those that resolve', async () => {

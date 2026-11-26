@@ -1,6 +1,7 @@
 import { join } from 'node:path'
 import type { OutboundConfig, RoutingRule, RulesConfig } from '@shared/types'
 import { parsePortSpec } from '@shared/rulesText'
+import { ZAPRET_ACTION } from '@shared/zapret'
 import {
   TAG_DIRECT,
   TAG_PROXY_GROUP,
@@ -225,6 +226,8 @@ function resolveAction(
 ): { kind: RunKind; target: string } {
   if (action === 'REJECT' || action === 'BLOCK') return { kind: 'reject', target: '' }
   if (action === 'DIRECT') return { kind: 'direct', target: TAG_DIRECT }
+  // «Напрямую + zapret» not resolved by ZapretService.effectiveRules: plain direct
+  if (action === ZAPRET_ACTION) return { kind: 'direct', target: TAG_DIRECT }
   if (action === 'PROXY') return { kind: 'proxy', target: TAG_PROXY_GROUP }
   return { kind: 'proxy', target: outboundsByName.get(action) ?? TAG_PROXY_GROUP }
 }
@@ -301,6 +304,16 @@ const DOMAIN_KEYS = ['domain', 'domain_suffix', 'domain_keyword', 'domain_regex'
 export function domainOnly(rules: HeadlessRule[]): HeadlessRule[] {
   const out: HeadlessRule[] = []
   for (const r of rules) {
+    // a logical rule (zapret: a domain minus its VPN subdomains): the same, domain parts only
+    if (r.type === 'logical' && Array.isArray(r.rules)) {
+      const subs = r.rules as HeadlessRule[]
+      const parts = subs.map((x) => {
+        const p = domainOnly([x])[0]
+        return p && x.invert === true ? { ...p, invert: true } : p
+      })
+      if (parts.every(Boolean)) out.push({ ...r, rules: parts })
+      continue
+    }
     const d: HeadlessRule = {}
     for (const k of DOMAIN_KEYS) if (Array.isArray(r[k]) && (r[k] as unknown[]).length) d[k] = r[k]
     if (Object.keys(d).length) out.push(d)

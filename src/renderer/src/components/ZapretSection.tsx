@@ -4,7 +4,7 @@ import {
   ZAPRET_SERVICES,
   normalizeZapretDomain,
   zapretRoute,
-  ZAPRET_ROUTE_TEXT,
+  zapretRouteText,
   type RuleLike,
   type ZapretRoute,
   type ZapretItem,
@@ -297,11 +297,13 @@ export function ZapretSection({
 
 const ROUTE_TONE: Record<ZapretRoute, 'green' | 'amber' | 'blue' | 'neutral' | 'red'> = {
   direct: 'green',
+  partial: 'green',
   vpn_failed: 'amber',
   vpn_off: 'neutral',
   user_vpn: 'blue',
   user_direct: 'neutral',
   user_block: 'red',
+  user_zapret: 'green',
   checking: 'blue',
   waiting: 'neutral'
 }
@@ -312,7 +314,7 @@ function RoutePill({
   phase,
   rules
 }: {
-  item: Pick<ZapretItem, 'key' | 'state' | 'detail'>
+  item: Pick<ZapretItem, 'key' | 'state' | 'detail' | 'note'>
   phase: ZapretView['phase']
   rules: readonly RuleLike[]
 }) {
@@ -320,10 +322,14 @@ function RoutePill({
   return (
     <Pill
       tone={ROUTE_TONE[route]}
-      title={route === 'vpn_failed' ? item.detail : undefined}
-      className="max-w-[260px] truncate"
+      title={
+        route === 'vpn_failed' || route === 'partial'
+          ? [zapretRouteText(route, item.note), item.detail].filter(Boolean).join(' — ')
+          : zapretRouteText(route, item.note)
+      }
+      className="max-w-[300px] truncate"
     >
-      {ZAPRET_ROUTE_TEXT[route]}
+      {zapretRouteText(route, item.note)}
     </Pill>
   )
 }

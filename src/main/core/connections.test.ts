@@ -4,6 +4,7 @@ import {
   connectionRule,
   describeRule,
   DirectFailures,
+  directNoise,
   exeOf,
   inCidr4,
   isTelegramIp,
@@ -303,5 +304,22 @@ describe('DirectFailures («не удалось подключиться нап�
     expect(isTelegramIp('91.108.56.142')).toBe(true)
     expect(isTelegramIp('194.221.250.50')).toBe(false)
     expect(isTelegramIp('example.com')).toBe(false)
+  })
+})
+describe('0.7.2: no «add a VPN rule» for P2P noise', () => {
+  it('torrent clients and bare addresses on odd ports are noise; sites and Telegram are not', () => {
+    expect(directNoise('203.0.113.9', '51413', 'qbittorrent.exe')).toBe(true)
+    expect(directNoise('tracker.example.org', '443', 'uTorrent.exe')).toBe(true)
+    expect(directNoise('203.0.113.9', '6881', 'game.exe')).toBe(true)
+    expect(directNoise('[2001:db8::1]', '27015', 'game.exe')).toBe(true)
+    expect(directNoise('203.0.113.9', '443', 'chrome.exe')).toBe(false)
+    expect(directNoise('steam.example.com', '27015', 'steam.exe')).toBe(false)
+    expect(directNoise('149.154.167.41', '5555', 'Telegram.exe')).toBe(false)
+    const f = new DirectFailures()
+    const line = (h: string, p: string): string =>
+      `ERROR [1 5.0s] connection: open connection to ${h}:${p} using outbound/direct[direct]: dial tcp ${h}:${p}: i/o timeout`
+    f.noteLog(line('203.0.113.9', '6881'))
+    f.noteLog(line('198.51.100.4', '443'))
+    expect(f.list(new Set()).map((x) => x.host)).toEqual(['198.51.100.4'])
   })
 })

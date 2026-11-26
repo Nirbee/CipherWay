@@ -9,6 +9,7 @@ import {
 } from '../../lib/ruleMeta'
 import { ProcessPicker } from './ProcessPicker'
 import { validateValue } from '@shared/rulesText'
+import { ZAPRET_ACTION, zapretRuleTarget } from '@shared/zapret'
 
 type Draft = Omit<RoutingRule, 'id'>
 
@@ -46,6 +47,7 @@ export function RuleEditor({ open, initial, outboundNames, onClose, onSave }: Pr
     () => [
       { value: 'PROXY', label: 'Через VPN (текущий сервер)' },
       { value: 'DIRECT', label: 'Напрямую' },
+      { value: ZAPRET_ACTION, label: 'Напрямую + zapret' },
       { value: 'REJECT', label: 'Блокировать' },
       ...outboundNames.map((n) => ({ value: n, label: `Через VPN · только ${n}` }))
     ],
@@ -53,7 +55,11 @@ export function RuleEditor({ open, initial, outboundNames, onClose, onSave }: Pr
   )
 
   const check = draft.value.trim() ? validateValue(draft.conditionType, draft.value) : null
-  const valid = check?.ok === true
+  // «Напрямую + zapret»: only conditions zapret can take (a host list / an address list)
+  const isZapret = draft.action === ZAPRET_ACTION
+  const zt = isZapret && check?.ok ? zapretRuleTarget({ ...draft, value: check.value }) : null
+  const zapretBad = isZapret && !!check?.ok && zt !== null && !zt.ok
+  const valid = check?.ok === true && !zapretBad
 
   return (
     <Modal
@@ -122,13 +128,33 @@ export function RuleEditor({ open, initial, outboundNames, onClose, onSave }: Pr
           )}
         </Field>
 
-        <Field label="Действие">
+        <Field
+          label="Действие"
+          hint={
+            zt && !zt.ok
+              ? zt.reason
+              : isZapret
+                ? 'Напрямую, а zapret снимает замедление провайдера. Работает, когда в «Ускорении без VPN» включён zapret; иначе — просто напрямую.'
+                : undefined
+          }
+        >
           <Select
             value={draft.action}
             options={actionOptions}
             onChange={(v) => setDraft((d) => ({ ...d, action: v }))}
           />
         </Field>
+        {isZapret && (
+          <label className="flex cursor-pointer items-center gap-2.5 text-sm text-text-primary">
+            <input
+              type="checkbox"
+              className="h-4 w-4 accent-accent-green"
+              checked={draft.zapretFallback !== false}
+              onChange={(e) => setDraft((d) => ({ ...d, zapretFallback: e.target.checked }))}
+            />
+            Если напрямую не открывается — через VPN
+          </label>
+        )}
       </div>
 
       <ProcessPicker

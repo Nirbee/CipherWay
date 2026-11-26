@@ -125,8 +125,13 @@ export interface RoutingRule {
   enabled: boolean
   conditionType: RuleConditionType
   value: string
-  /** 'PROXY' | 'DIRECT' | 'REJECT' or an outbound id/name */
+  /** 'PROXY' | 'DIRECT' | 'REJECT' | 'ZAPRET' (0.7.2) or an outbound id/name */
   action: RuleActionType
+  /**
+   * «Напрямую + zapret»: back through the VPN when it does not open directly
+   * (default: yes; false = always direct)
+   */
+  zapretFallback?: boolean
 }
 
 export type DefaultBehavior = 'proxy' | 'direct' | 'auto'

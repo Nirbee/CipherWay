@@ -23,6 +23,8 @@ export interface DpiRequest {
   hosts: string[]
   /** our VPN servers' addresses (IP / CIDR) */
   exclude: string[]
+  /** the user's «Напрямую + zapret» IP rules (IP / CIDR, 0.7.2) */
+  ips?: string[]
 }
 
 interface CtlFile {
@@ -129,7 +131,8 @@ export class DpiDaemon implements DpiDaemonLike {
         strategy: req.strategy,
         services: req.services,
         hosts: req.hosts,
-        exclude: req.exclude
+        exclude: req.exclude,
+        ips: req.ips ?? []
       })
     )
   }

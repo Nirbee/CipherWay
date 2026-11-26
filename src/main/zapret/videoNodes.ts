@@ -149,21 +149,28 @@ export interface VideoNodeDeps {
 
 /**
  * The video nodes to check, `via` what they were found. [] = none found (the
- * caller treats YouTube as «not verified» → through the VPN).
+ * caller treats YouTube's video as «not verified» → through the VPN).
+ * 0.7.2: the page's nodes AND the ones of report_mapping (a pick alternates
+ * between them: DPI may «punish» one address hit by many failing tries).
  */
 export async function findVideoNodes(
   d: VideoNodeDeps
-): Promise<{ nodes: string[]; via: 'page' | 'mapping' | 'none' }> {
-  const page = await d.get('www.youtube.com', `/watch?v=${PROBE_VIDEO}`, 3_000_000, 12_000)
+): Promise<{ nodes: string[]; via: 'page' | 'mapping' | 'both' | 'none' }> {
+  const [page, mapping] = await Promise.all([
+    d.get('www.youtube.com', `/watch?v=${PROBE_VIDEO}`, 3_000_000, 12_000),
+    d.get('redirector.googlevideo.com', '/report_mapping?di=no', 4096, 6000)
+  ])
   const fromPage = page ? nodesFromPage(page, 2) : []
-  if (fromPage.length) return { nodes: fromPage, via: 'page' }
-  const mapping = await d.get('redirector.googlevideo.com', '/report_mapping?di=no', 4096, 6000)
   const cluster = mapping ? parseReportMapping(mapping) : null
   const sn = cluster ? clusterToSn(cluster) : null
+  const fromMap: string[] = []
   if (sn) {
-    const hosts: string[] = []
-    for (const h of snHosts(sn)) if (await d.resolves(h)) hosts.push(h)
-    if (hosts.length) return { nodes: hosts, via: 'mapping' }
+    for (const h of snHosts(sn)) {
+      if (fromMap.length >= 2) break
+      if (!fromPage.includes(h) && (await d.resolves(h))) fromMap.push(h)
+    }
   }
-  return { nodes: [], via: 'none' }
+  const nodes = [...fromPage, ...fromMap].slice(0, 4)
+  const via = fromPage.length ? (fromMap.length ? 'both' : 'page') : fromMap.length ? 'mapping' : 'none'
+  return { nodes, via }
 }

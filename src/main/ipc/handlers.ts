@@ -105,7 +105,8 @@ const ruleSchema = z.object({
   enabled: z.boolean(),
   conditionType: z.enum(CONDITION_TYPES),
   value: z.string().max(2000),
-  action: z.string().max(200)
+  action: z.string().max(200),
+  zapretFallback: z.boolean().optional()
 })
 
 const rulesConfigSchema = z.object({
@@ -219,7 +220,8 @@ function buildStartParams() {
   return {
     outbounds: sub?.outbounds ?? [],
     activeOutboundId: store.get('activeOutboundId') ?? undefined,
-    rules: store.get('rules'),
+    // «Напрямую + zapret» resolved: direct, or through the VPN while it does not open
+    rules: effectiveRules(store.get('rules')),
     settings: getSettings(),
     latencies: store.get('latencyCache') ?? {},
     // its refresh must work while the tunnel is broken (a stale REALITY key);
@@ -230,6 +232,10 @@ function buildStartParams() {
     // «Ускорение без VPN»: what is confirmed direct so far (nothing before a check)
     ...(zapretService ? { zapret: zapretService.currentRouting() } : {})
   }
+}
+
+function effectiveRules(r: RulesConfig): RulesConfig {
+  return zapretService ? { ...r, rules: zapretService.effectiveRules(r.rules) } : r
 }
 
 function lanWanted(): boolean {
@@ -508,6 +514,8 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
     store.set('settings', next)
     publishSettings(next)
     if (manager.isRunning) {
+      // every connection is reset: not «no answer» for zapret's live check
+      zapretService?.noteReconnect()
       const ok = await manager.setRoutingMode(mode)
       // the core didn't take the mode (GET /configs shows another one) — a new
       // config with the mode as its default_mode
@@ -640,7 +648,9 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
     if (rulesTimer) clearTimeout(rulesTimer)
     rulesTimer = setTimeout(() => {
       rulesTimer = null
-      if (manager.isRunning) void manager.applyRules(buildStartParams()).catch(() => undefined)
+      if (!manager.isRunning) return
+      zapretService?.noteReconnect()
+      void manager.applyRules(buildStartParams()).catch(() => undefined)
     }, RULES_DEBOUNCE_MS)
   }
 
@@ -650,6 +660,7 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
     const parsed = rulesConfigSchema.parse(config)
     store.set('rules', parsed)
     scheduleRulesApply()
+    void zapretService?.rulesUpdated().catch(() => undefined)
   })
 
   ipcMain.handle(IPC.rulesExport, async (): Promise<string | null> => {
@@ -676,6 +687,7 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
     const parsed = rulesConfigSchema.parse(JSON.parse(raw))
     store.set('rules', parsed)
     scheduleRulesApply()
+    void zapretService?.rulesUpdated().catch(() => undefined)
     return parsed
   })
 
@@ -1024,10 +1036,12 @@ export function registerIpcHandlers(getWindow: GetWindow, hooks?: HandlerHooks):
       const api = TelemetryApi.host(getSettings().apiBase)
       return [...subscriptionHosts(), ...(api ? [api] : []), lanLoginHost() ?? '']
     },
+    rules: () => store.get('rules').rules,
+    rulesChanged: () => scheduleRulesApply(),
     applyRouting: (r) => {
       const change = routingChange(lastZapret, r)
       lastZapret = r
-      return manager.applyZapret(r, change.domains, change.cidrs)
+      return manager.applyZapret(r, change.affects)
     },
     publish: (v: ZapretView) => send(IPC.evtZapret, v),
     log: appLog

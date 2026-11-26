@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto'
 import { request as httpsRequest } from 'node:https'
 import { isIP } from 'node:net'
-import { connect as tlsConnect, type TLSSocket } from 'node:tls'
+import { checkServerIdentity, connect as tlsConnect, type TLSSocket } from 'node:tls'
 import { execLow, parseDefaultRoutes, parseDohJson, pickPhysicalSource } from '../devversion/probes'
 import type { CheckTarget } from './lists'
+import { probeQuic } from './quic'
 
 // ---------------------------------------------------------------------------
 // The direct checks of «Ускорение без VPN»: does a service open WITHOUT the
@@ -27,10 +28,41 @@ export interface DirectPath {
 
 export type DohServer = 'primary' | 'fallback'
 
-const DOH: Record<DohServer, { host: string; path: (name: string) => string }> = {
+const DOH: Record<DohServer, { host: string; path: (name: string, type: string) => string }> = {
   // Google's JSON API answers on the IP too (the certificate has 8.8.8.8 in it)
-  primary: { host: '8.8.8.8', path: (n) => `/resolve?name=${encodeURIComponent(n)}&type=A` },
-  fallback: { host: '1.1.1.1', path: (n) => `/dns-query?name=${encodeURIComponent(n)}&type=A` }
+  primary: {
+    host: '8.8.8.8',
+    path: (n, type) => `/resolve?name=${encodeURIComponent(n)}&type=${type}`
+  },
+  fallback: {
+    host: '1.1.1.1',
+    path: (n, type) => `/dns-query?name=${encodeURIComponent(n)}&type=${type}`
+  }
+}
+
+/**
+ * The DoH answer of a name: its addresses, and whether the server ANSWERED
+ * (a JSON with a Status) — «no such address» vs «DNS did not answer».
+ */
+export interface DohAnswer {
+  ips: string[]
+  answered: boolean
+}
+
+/** parses a DoH JSON answer of `type` (1 = A, 28 = AAAA) */
+export function parseDohAnswer(json: unknown, type: 1 | 28): DohAnswer {
+  const o = json as { Status?: unknown; Answer?: unknown } | null
+  const answered = !!o && typeof o === 'object' && typeof o.Status === 'number'
+  if (type === 1) return { ips: parseDohJson(json), answered }
+  const ans = Array.isArray(o?.Answer) ? (o.Answer as unknown[]) : []
+  const ips = ans
+    .filter(
+      (a): a is { type: number; data: string } =>
+        !!a && typeof a === 'object' && (a as { type?: unknown }).type === 28
+    )
+    .map((a) => String(a.data))
+    .filter((ip) => isIP(ip) === 6)
+  return { ips, answered }
 }
 
 /** answers of the last minute: a pick asks the same names for every strategy */
@@ -38,34 +70,49 @@ const dohCache = new Map<string, { ips: string[]; until: number }>()
 const DOH_CACHE_MS = 60_000
 
 /** A records of `name` from one DoH server, directly; [] on any failure. */
-export function dohResolve(
+export async function dohResolve(
   name: string,
   server: DohServer,
   path: DirectPath,
   timeoutMs = 4000,
   cache = true
 ): Promise<string[]> {
+  return (await dohLookup(name, server, path, timeoutMs, cache)).ips
+}
+
+/** A (or AAAA) records of `name` from one DoH server, directly; never throws. */
+export function dohLookup(
+  name: string,
+  server: DohServer,
+  path: DirectPath,
+  timeoutMs = 4000,
+  cache = true,
+  type: 1 | 28 = 1
+): Promise<DohAnswer> {
   const d = DOH[server]
-  const key = `${server}|${path.localAddress ?? ''}|${name}`
+  const key = `${server}|${path.localAddress ?? ''}|${name}|${type}`
   const hit = dohCache.get(key)
-  if (cache && hit && hit.until > Date.now()) return Promise.resolve(hit.ips)
+  if (cache && hit && hit.until > Date.now()) {
+    return Promise.resolve({ ips: hit.ips, answered: true })
+  }
   return new Promise((resolve) => {
     let done = false
-    const finish = (v: string[]): void => {
+    const finish = (v: DohAnswer): void => {
       if (done) return
       done = true
       clearTimeout(timer)
-      if (v.length) {
+      if (v.ips.length) {
         if (dohCache.size > 500) dohCache.clear()
-        dohCache.set(key, { ips: v, until: Date.now() + DOH_CACHE_MS })
+        dohCache.set(key, { ips: v.ips, until: Date.now() + DOH_CACHE_MS })
       }
       resolve(v)
     }
+    const fail: DohAnswer = { ips: [], answered: false }
     const req = httpsRequest(
       {
         host: d.host,
         port: 443,
-        path: d.path(name),
+        path: d.path(name, type === 1 ? 'A' : 'AAAA'),
         method: 'GET',
         headers: { accept: 'application/dns-json' },
         agent: false,
@@ -79,19 +126,20 @@ export function dohResolve(
         })
         res.on('end', () => {
           try {
-            finish(parseDohJson(JSON.parse(body)).slice(0, 8))
+            const a = parseDohAnswer(JSON.parse(body), type)
+            finish({ ips: a.ips.slice(0, 8), answered: a.answered && res.statusCode === 200 })
           } catch {
-            finish([])
+            finish(fail)
           }
         })
-        res.on('error', () => finish([]))
+        res.on('error', () => finish(fail))
       }
     )
     const timer = setTimeout(() => {
       req.destroy()
-      finish([])
+      finish(fail)
     }, timeoutMs)
-    req.on('error', () => finish([]))
+    req.on('error', () => finish(fail))
     req.end()
   })
 }
@@ -109,9 +157,17 @@ export async function pickDoh(path: DirectPath, timeoutMs = 4000): Promise<DohSe
 export interface TargetResult {
   host: string
   ok: boolean
-  /** what went wrong: dns, timeout, tls:<code>, http:closed… */
+  /**
+   * what went wrong: dns, timeout, tls:<code>, http:closed…; `noaddr` = DNS
+   * answered: the name has no address (a bare root of a game's domains)
+   */
   error?: string
   ms?: number
+  /**
+   * tlsOnly, a domain: the server answered TLS, but its certificate is not a
+   * valid one for this name — reachable, not confirmed (live traffic decides)
+   */
+  unconfirmed?: boolean
 }
 
 function errCode(e: unknown): string {
@@ -123,7 +179,17 @@ function errCode(e: unknown): string {
 }
 
 /**
+ * A TLS alert from the server: it read our ClientHello and answered — the way
+ * is open (an own domain without a web site on its root; DPI drops or resets,
+ * it does not send alerts).
+ */
+export function isServerAlert(code: string): boolean {
+  return /^ERR_SSL_(?:SSLV3|TLSV1)_(?:ALERT_|UNRECOGNIZED_NAME)/.test(code)
+}
+
+/**
  * One target: TCP + TLS to `ip` with SNI `host` (+ HEAD and the status line).
+ * `tlsOnly`: any certificate, a finished handshake or a TLS alert = ok.
  * Never throws, never takes longer than `timeoutMs`.
  */
 export function probeTls(
@@ -137,29 +203,49 @@ export function probeTls(
   return new Promise((resolve) => {
     let sock: TLSSocket | null = null
     let done = false
-    const finish = (ok: boolean, error?: string): void => {
+    const finish = (ok: boolean, error?: string, unconfirmed = false): void => {
       if (done) return
       done = true
       clearTimeout(timer)
       sock?.destroy()
-      resolve({ host: t.host, ok, ...(error ? { error } : { ms: Date.now() - t0 }) })
+      resolve({
+        host: t.host,
+        ok,
+        ...(error ? { error } : { ms: Date.now() - t0 }),
+        ...(unconfirmed ? { unconfirmed: true } : {})
+      })
     }
     const timer = setTimeout(() => finish(false, 'timeout'), timeoutMs)
     try {
       sock = tlsConnect({
         host: ip,
         port,
-        servername: t.host,
+        // an IP rule: no SNI (RFC 6066 forbids an address there)
+        ...(isIP(t.host) ? {} : { servername: t.host }),
         ALPNProtocols: ['http/1.1'],
+        ...(t.tlsOnly ? { rejectUnauthorized: false } : {}),
         ...(path.localAddress ? { localAddress: path.localAddress } : {})
       })
     } catch (e) {
       finish(false, errCode(e))
       return
     }
-    sock.once('error', (e) => finish(false, `tls:${errCode(e)}`))
+    sock.once('error', (e) => {
+      const code = errCode(e)
+      // an alert: the server read our ClientHello (who it is — not confirmed for a domain)
+      if (t.tlsOnly && isServerAlert(code)) finish(true, undefined, !isIP(t.host))
+      else finish(false, `tls:${code}`)
+    })
     sock.once('secureConnect', () => {
+      if (t.tlsOnly && !isIP(t.host)) {
+        // a domain: its certificate must be valid AND for this name — else «not confirmed»
+        const s = sock as TLSSocket
+        const valid = s.authorized && !checkServerIdentity(t.host, s.getPeerCertificate())
+        finish(true, undefined, !valid)
+        return
+      }
       if (!t.http) {
+        // an IP rule (no name to check): any certificate — the handshake is the answer
         finish(true)
         return
       }
@@ -191,9 +277,23 @@ export async function checkTarget(
   timeoutMs = 9000
 ): Promise<TargetResult> {
   const t0 = Date.now()
-  const ips = isIP(t.host) ? [t.host] : await dohResolve(t.host, doh, path, 4000)
+  let ips = [t.host]
+  if (!isIP(t.host)) {
+    const a = await dohLookup(t.host, doh, path, 4000)
+    ips = a.ips
+    // an own domain: no A record — an AAAA one, or «no address» (not a failure of the way)
+    if (!ips.length && a.answered && t.tlsOnly) {
+      const v6 = await dohLookup(t.host, doh, path, 3000, true, 28)
+      if (!v6.ips.length && v6.answered) return { host: t.host, ok: false, error: 'noaddr' }
+      ips = v6.ips
+    }
+  }
   if (!ips.length) return { host: t.host, ok: false, error: 'dns' }
   const left = Math.max(1000, timeoutMs - (Date.now() - t0))
+  if (t.quic) {
+    const r = await probeQuic(ips[0], t.host, path.localAddress, Math.min(3000, left))
+    return { host: t.host, ok: r.ok, ...(r.ok ? { ms: r.ms } : { error: r.error ?? 'timeout' }) }
+  }
   return probeTls(ips[0], t, path, left)
 }
 

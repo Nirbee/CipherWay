@@ -13,6 +13,8 @@
 //   %HOSTS% the hostlist the broker wrote (built-in services + validated own domains)
 //   %EXCL%  the ipset of addresses zapret must never touch (our VPN servers + LAN ranges)
 //   %DISCORD_IPS%  the ipset of Discord's voice servers (lists.ts, baked into the broker)
+//   %USER_IPS%  the ipset of the user's «Напрямую + zapret» IP rules (0.7.2; parsed
+//               by the broker like the exclusions, only lines of a file)
 // Every combination is checked with `cipherway-dpi.exe --dry-run` in
 // strategies.test.ts (the official build accepts all of them).
 // Stage 2 (presets from the server, a strategy per domain) adds entries here /
@@ -124,7 +126,9 @@ export const STRATEGIES: readonly DpiStrategy[] = [
     id: 'fake-multisplit-ts',
     name: 'Fake + multisplit (ts)',
     from: 'general (ALT11), general v9.2 (ALT), UltimateFix v9.2',
+    // 0.7.2: as UltimateFix v9.2 — the fakes carry IP ID 0 (some DPI keys on it)
     tls: [
+      '--ip-id=zero',
       '--dpi-desync=fake,multisplit',
       '--dpi-desync-split-seqovl=681',
       '--dpi-desync-split-pos=1',
@@ -245,7 +249,14 @@ export const DISCORD_UDP = '19294-19344,50000-50100'
 export const DISCORD_TCP = '2053,2083,2087,2096,8443'
 
 /** placeholders the broker fills in; nothing else may appear in a token */
-export const PLACEHOLDERS = ['%TLS%', '%QUIC%', '%HOSTS%', '%EXCL%', '%DISCORD_IPS%'] as const
+export const PLACEHOLDERS = [
+  '%TLS%',
+  '%QUIC%',
+  '%HOSTS%',
+  '%EXCL%',
+  '%DISCORD_IPS%',
+  '%USER_IPS%'
+] as const
 /** a token: `--option` or `--option=value`, value without spaces / quotes / shell syntax */
 export const TOKEN_RE = /^--[a-z0-9-]+(=[A-Za-z0-9@%.,:+!=_-]+)?$/
 
@@ -298,6 +309,34 @@ export function winwsTokens(s: DpiStrategy, discord: boolean): string[] {
     )
   }
   return t
+}
+
+/**
+ * 0.7.2: the profiles of the user's «Напрямую + zapret» IP rules — the same
+ * desync as the hostlist profiles, by address (QUIC, HTTP, TLS). Appended by
+ * the broker only when that ipset is not empty (an empty ipset would not
+ * filter at all). Starts with `--new`: it follows winwsTokens.
+ */
+export function userIpTokens(s: DpiStrategy): string[] {
+  const excl = '--ipset-exclude=%EXCL%'
+  const ips = '--ipset=%USER_IPS%'
+  return [
+    '--new',
+    '--filter-udp=443',
+    ips,
+    excl,
+    ...s.quic,
+    '--new',
+    '--filter-tcp=80',
+    ips,
+    excl,
+    ...HTTP_DESYNC,
+    '--new',
+    '--filter-tcp=443',
+    ips,
+    excl,
+    ...s.tls
+  ]
 }
 
 /** Every token of every strategy is a plain option (checked by the tests and the broker build). */

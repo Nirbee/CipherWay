@@ -770,13 +770,20 @@ describe('real core validation', () => {
         const settings = {
           enabled: true,
           services: ['youtube', 'discord'] as ('youtube' | 'discord')[],
-          custom: ['example.org', 'xn--80ak6aa92e.com'],
+          custom: ['example.org', 'xn--80ak6aa92e.com', 'bad.example.org'],
           warned: true
         }
-        // YouTube + one own domain direct (DoH fallback in use), Discord back through the VPN
-        const zapret = zapretRouting(settings, new Set(['youtube', 'd:example.org']), 'fallback')
-        expect(zapret.direct.length).toBeGreaterThan(0)
-        expect(zapret.proxy.length).toBe(2)
+        // YouTube's pages + its video over QUIC + one own domain direct (DoH fallback in use),
+        // the video over TCP, a subdomain and Discord back through the VPN (0.7.2: network
+        // rules and a logical «domain minus its VPN subdomain» rule)
+        const zapret = zapretRouting(
+          settings,
+          new Set(['youtube', 'youtube:quic', 'd:example.org']),
+          'fallback'
+        )
+        expect(JSON.stringify(zapret.direct)).toContain('"network":["udp"]')
+        expect(JSON.stringify(zapret.direct)).toContain('"invert":true')
+        expect(JSON.stringify(zapret.proxy)).toContain('"network":["tcp"]')
         const file = join(tmp, `sing-box-zapret-${mode}.json`)
         const cfg = singbox(
           { proxyMode: mode },

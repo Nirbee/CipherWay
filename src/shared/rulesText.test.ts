@@ -237,3 +237,44 @@ describe('validators', () => {
     expect(isValidCidr('example.com')).toBe(false)
   })
 })
+describe('0.7.2: «Напрямую + zapret» in the text', () => {
+  it('ZAPRET as the target; its option keeps the fallback off; old lines unchanged', () => {
+    expect(parseClashLine('DOMAIN-SUFFIX,pragmaengine.com,ZAPRET')).toEqual({
+      kind: 'rule',
+      rule: rule({ conditionType: 'DomainSuffix', value: 'pragmaengine.com', action: 'ZAPRET' })
+    })
+    expect(parseClashLine('IP-CIDR,198.51.100.0/24,zapret,no-resolve,no-vpn-fallback')).toEqual({
+      kind: 'rule',
+      rule: rule({
+        conditionType: 'IPCIDR',
+        value: '198.51.100.0/24',
+        action: 'ZAPRET',
+        zapretFallback: false
+      })
+    })
+    expect(parseClashLine('DOMAIN,a.example.org,DIRECT,no-vpn-fallback')).toEqual({
+      kind: 'rule',
+      rule: rule({ conditionType: 'Domain', value: 'a.example.org', action: 'DIRECT' })
+    })
+    expect(parseClashLine('MATCH,ZAPRET')).toMatchObject({ kind: 'skip' })
+    const config: RulesConfig = {
+      defaultBehavior: 'proxy',
+      rules: [
+        { id: '1', ...rule({ conditionType: 'Domain', value: 'g.example.org', action: 'ZAPRET' }) },
+        {
+          id: '2',
+          ...rule({
+            conditionType: 'IPCIDR',
+            value: '198.51.100.0/24',
+            action: 'ZAPRET',
+            zapretFallback: false
+          })
+        }
+      ] as RulesConfig['rules']
+    }
+    const text = toClashLines(config)
+    expect(text).toContain('DOMAIN,g.example.org,ZAPRET\n')
+    expect(text).toContain('IP-CIDR,198.51.100.0/24,ZAPRET,no-vpn-fallback\n')
+    expect(JSON.stringify(parseRulesText(text))).toContain('"zapretFallback":false')
+  })
+})

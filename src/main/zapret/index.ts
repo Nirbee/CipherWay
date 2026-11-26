@@ -1,6 +1,6 @@
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
-import type { OutboundConfig, TunServiceInfo } from '@shared/types'
+import type { OutboundConfig, RoutingRule, TunServiceInfo } from '@shared/types'
 import type { ZapretSettings, ZapretView } from '@shared/zapret'
 import { DPI_ALL, DPI_EXE } from '../core/coreNames'
 import type { TunService } from '../core/tunService'
@@ -32,6 +32,10 @@ export interface CreateZapretOpts {
   /** extra names an own domain may not be (the subscription host…) */
   reservedHosts: () => string[]
   applyRouting: (r: ZapretRouting) => Promise<void>
+  /** the user's rules (their «Напрямую + zapret» ones) */
+  rules?: () => readonly RoutingRule[]
+  /** a «Напрямую + zapret» rule changed its way: apply the rules again */
+  rulesChanged?: () => void
   publish: (v: ZapretView) => void
   log: (level: 'info' | 'warn' | 'error', msg: string) => void
 }
@@ -77,8 +81,11 @@ export function createZapretService(o: CreateZapretOpts): ZapretService {
         })
       ).nodes,
     excludeIps: async () => toExcludeCidrs(await resolveServers(o.outbounds())),
+    hasServers: () => o.outbounds().length > 0,
     reserved: () => [...o.outbounds().map((x) => normalizeHost(x.server)), ...o.reservedHosts()],
     applyRouting: o.applyRouting,
+    ...(o.rules ? { rules: o.rules } : {}),
+    ...(o.rulesChanged ? { rulesChanged: o.rulesChanged } : {}),
     foreignDpi: async () => {
       const names = (await runningProcessNames()).map((n) => n.toLowerCase())
       return FOREIGN.find((f) => names.includes(f)) ?? null

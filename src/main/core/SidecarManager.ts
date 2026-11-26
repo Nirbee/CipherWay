@@ -1373,7 +1373,10 @@ export class SidecarManager {
    * moved — the zapret connections without a domain too). While disconnected
    * only remembered (StartParams.zapret wins at start).
    */
-  applyZapret(r: ZapretRouting, domains: string[] = [], cidrs = false): Promise<void> {
+  applyZapret(
+    r: ZapretRouting,
+    affects: (host: string, network: string, rule: string) => boolean = () => false
+  ): Promise<void> {
     const gen = this.opGen
     return this.serial(async () => {
       this.zapret = r
@@ -1387,11 +1390,7 @@ export class SidecarManager {
       const raw = await api.connections()
       let closed = 0
       for (const c of raw?.connections ?? []) {
-        const host = (c.metadata?.host ?? '').toLowerCase()
-        const hit = host
-          ? domains.some((d) => host === d || host.endsWith(`.${d}`))
-          : cidrs && /rule_set=\[?cw-z-/.test(c.rule ?? '')
-        if (!hit) continue
+        if (!affects(c.metadata?.host ?? '', c.metadata?.network ?? 'tcp', c.rule ?? '')) continue
         await api.closeConnection(c.id)
         closed++
       }

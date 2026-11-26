@@ -219,7 +219,7 @@ function Test-Keys($node, [string]$where) {
   if ($node -is [System.Management.Automation.PSCustomObject]) {
     foreach ($q in $node.PSObject.Properties) {
       $w = $where + '.' + $q.Name
-      if ($q.Name -match $Forbidden -and $w -notmatch '^\\.route\\.(rule_set\\[\\d+\\]\\.path|rules\\[\\d+\\]\\.process_path)\\z') { throw ('cw-config запрещённое поле ' + (Safe $w)) }
+      if ($q.Name -match $Forbidden -and $w -notmatch '^\\.route\\.(rule_set\\[[0-9]+\\]\\.path|rules\\[[0-9]+\\]\\.process_path)\\z') { throw ('cw-config запрещённое поле ' + (Safe $w)) }
       Test-Keys $q.Value $w
     }
   } elseif ($node -is [array]) {
@@ -243,7 +243,7 @@ function Test-Config([string]$text) {
     $ca = $c.experimental.clash_api
     if ($null -ne $ca) {
       foreach ($q in $ca.PSObject.Properties) { if (@('external_controller', 'default_mode', 'secret') -notcontains $q.Name) { throw ('cw-config clash_api.' + (Safe $q.Name)) } }
-      if ([string]$ca.external_controller -notmatch '^127\\.0\\.0\\.1:\\d{1,5}\\z') { throw 'cw-config clash_api.external_controller' }
+      if ([string]$ca.external_controller -notmatch '^127\\.0\\.0\\.1:[0-9]{1,5}\\z') { throw 'cw-config clash_api.external_controller' }
     }
   }
   if ($null -ne $c.inbounds) { foreach ($x in @($c.inbounds)) { if ($x.type -ne 'tun') { throw ('cw-config вход ' + (Safe $x.type)) } } }
@@ -768,6 +768,38 @@ try {
     $cl = [string](Get-CimInstance Win32_Process -Filter ('ProcessId=' + [int]$o.Id)).CommandLine
     $mine = $cl.IndexOf('"--hostlist=' + $DpiHosts + '"', [StringComparison]::OrdinalIgnoreCase) -ge 0
     if ($DpiExes -contains $o.MainModule.FileName -and $mine) { $o.Kill(); $null = $o.WaitForExit(5000) }
+  } catch {}
+  # TCP timestamps the DPI broker turned on (0.7.2): put back as they were — only
+  # while no broker runs (the lock opens exclusively), confirmed before the marker goes
+  try {
+    $TsF = Join-Path $Root 'tmp\\dpi-tcp-ts.txt'
+    $LockF = Join-Path $Root 'tmp\\dpi.lock'
+    $Netsh = Join-Path ([Environment]::GetFolderPath('System')) 'netsh.exe'
+    $ti = New-Object IO.FileInfo($TsF)
+    $li = New-Object IO.FileInfo($LockF)
+    $rp = [IO.FileAttributes]::ReparsePoint
+    if ($ti.Exists -and $li.Exists -and -not ($ti.Attributes -band $rp) -and -not ($li.Attributes -band $rp) -and $ti.Length -le 64) {
+      $lk = [IO.File]::Open($LockF, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+      try {
+        if (([IO.File]::ReadAllText($TsF)).Trim() -ceq 'Disabled') {
+          $tsNow = { [int](Get-CimInstance -Namespace 'root/StandardCimv2' -ClassName 'MSFT_NetTCPSetting' -Filter "SettingName='Internet'" -ErrorAction Stop).Timestamps }
+          if ((& $tsNow) -ne 0) {
+            $si = New-Object Diagnostics.ProcessStartInfo
+            $si.FileName = $Netsh
+            $si.Arguments = 'interface tcp set global timestamps=disabled'
+            $si.UseShellExecute = $false
+            $si.CreateNoWindow = $true
+            $si.RedirectStandardOutput = $true
+            $si.RedirectStandardError = $true
+            $pr = [Diagnostics.Process]::Start($si)
+            $null = $pr.StandardOutput.ReadToEnd()
+            $null = $pr.StandardError.ReadToEnd()
+            $done = $pr.WaitForExit(15000) -and $pr.ExitCode -eq 0
+          } else { $done = $true }
+          if ($done -and (& $tsNow) -eq 0) { [IO.File]::Delete($TsF) }
+        }
+      } finally { $lk.Dispose() }
+    }
   } catch {}
   # this user's LAN daemon (its pid from the broker's state, only if it runs our file)
   try {

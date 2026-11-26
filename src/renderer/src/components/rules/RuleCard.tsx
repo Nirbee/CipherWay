@@ -1,4 +1,5 @@
 import type { RoutingRule } from '@shared/types'
+import { ZAPRET_ACTION, zapretRuleText, type ZapretRuleState } from '@shared/zapret'
 import { Card, Pill, Toggle } from '../ui'
 import { EditIcon, GripIcon, TrashIcon } from '../icons'
 import { actionLabel, actionTone, CONDITION_META } from '../../lib/ruleMeta'
@@ -8,12 +9,22 @@ interface Props {
   rule: RoutingRule
   index: number
   draggable: boolean
+  /** «Напрямую + zapret»: its state right now (ZapretService) */
+  zapretState?: ZapretRuleState
   onToggle: () => void
   onEdit: () => void
   onDelete: () => void
 }
 
-export function RuleCard({ rule, index, draggable, onToggle, onEdit, onDelete }: Props) {
+export function RuleCard({
+  rule,
+  index,
+  draggable,
+  zapretState,
+  onToggle,
+  onEdit,
+  onDelete
+}: Props) {
   const meta = CONDITION_META[rule.conditionType]
 
   return (
@@ -35,6 +46,21 @@ export function RuleCard({ rule, index, draggable, onToggle, onEdit, onDelete }:
         </div>
         <div className="mt-0.5 text-[11px] text-text-muted">
           {meta.label} <span className="font-mono text-[10px] text-text-faint">{meta.clash}</span>
+          {rule.action === ZAPRET_ACTION && rule.enabled && (
+            <span
+              className={cn(
+                'ml-2',
+                zapretState?.state === 'direct'
+                  ? 'text-accent-green'
+                  : zapretState?.state === 'vpn'
+                    ? 'text-accent-amber'
+                    : 'text-text-faint'
+              )}
+              title={zapretState?.detail}
+            >
+              · {zapretRuleText(zapretState)}
+            </span>
+          )}
         </div>
       </div>
 

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
+import type { RoutingRule } from '@shared/types'
 import { DEFAULT_ZAPRET, type ZapretSettings, type ZapretView } from '@shared/zapret'
 import { NO_ZAPRET, type ZapretRouting } from '../rules/compile'
 import type { CheckTarget } from './lists'
@@ -9,6 +10,7 @@ import { STRATEGIES } from './strategies'
 import {
   DNS_FAILS,
   dpiErrorText,
+  LIVE_QUIET_MS,
   LIVE_RECHECK_MS,
   LIVE_REPEAT_MS,
   LIVE_STALL_MS,
@@ -21,8 +23,8 @@ import {
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
 const [S0, S1, S2, S3] = STRATEGIES.map((s) => s.id)
 
-/** which hosts open directly with which strategy (null = winws off) */
-type World = (strategy: string | null, host: string) => boolean
+/** which hosts open directly with which strategy (null = winws off); 'noaddr' = no address */
+type World = (strategy: string | null, host: string, quic?: boolean) => boolean | 'noaddr'
 
 function harness(o: {
   world: World
@@ -38,7 +40,14 @@ function harness(o: {
   applyError?: DpiStartError
   /** YouTube's video nodes the check finds (undefined = no video check) */
   videoNodes?: string[]
+  /** the clock (live fallback tests) */
+  now?: () => number
+  /** the user's rules (their «Напрямую + zapret» ones) */
+  rules?: RoutingRule[]
+  /** our servers' addresses (default: one) */
+  excludeIps?: () => Promise<string[]>
 }) {
+  let rulesChanged = 0
   let settings: ZapretSettings = { ...DEFAULT_ZAPRET, enabled: true, warned: true, ...o.settings }
   let memory: Record<string, StrategyMemo> = { ...(o.memory ?? {}) }
   let strategy: string | null = null
@@ -93,11 +102,12 @@ function harness(o: {
     pickDoh: async () => (o.doh === undefined ? 'primary' : o.doh),
     checkTarget: async (t: CheckTarget, _doh, path): Promise<TargetResult> => {
       checked.push({ host: t.host, path })
-      return o.world(strategy, t.host)
-        ? { host: t.host, ok: true, ms: 10 }
-        : { host: t.host, ok: false, error: 'timeout' }
+      const w = o.world(strategy, t.host, t.quic)
+      if (w === 'noaddr') return { host: t.host, ok: false, error: 'noaddr' }
+      return w ? { host: t.host, ok: true, ms: 10 } : { host: t.host, ok: false, error: 'timeout' }
     },
-    excludeIps: async () => ['203.0.113.7/32'],
+    excludeIps: o.excludeIps ?? (async () => ['203.0.113.7/32']),
+    hasServers: () => true,
     reserved: () => ['sub.example.net'],
     applyRouting: async (r) => {
       routes.push(r)
@@ -108,7 +118,9 @@ function harness(o: {
     settleMs: 0,
     checkEveryMs: o.checkEveryMs ?? 3_600_000,
     netPollMs: o.netPollMs ?? 3_600_000,
-    ...(o.videoNodes ? { videoNodes: async () => o.videoNodes ?? [] } : {})
+    ...(o.videoNodes ? { videoNodes: async () => o.videoNodes ?? [] } : {}),
+    ...(o.now ? { now: o.now } : {}),
+    ...(o.rules ? { rules: () => o.rules ?? [], rulesChanged: () => rulesChanged++ } : {})
   }
   const svc = new ZapretService(deps)
   return {
@@ -127,6 +139,9 @@ function harness(o: {
       return memory
     },
     setRunning: (v: boolean) => (running = v),
+    get rulesChanged() {
+      return rulesChanged
+    },
     setNet: (n: NetworkInfo | null) => (net = n),
     lastRoute: () => routes[routes.length - 1],
     /** until the work queued so far is done */
@@ -185,7 +200,9 @@ describe('ZapretService — the pick', () => {
     h.setRunning(true)
     await h.svc.onVpn(true)
     const v = await h.idle()
-    expect(h.applied.length).toBe(STRATEGIES.length + 1)
+    // every strategy once, the best ones once more, then the chosen one
+    expect(h.applied.length).toBeGreaterThan(STRATEGIES.length + 1)
+    expect(h.applied.length).toBeLessThanOrEqual(STRATEGIES.length + 4)
     expect(v.strategy?.id).toBe(S1)
     expect(v.items.find((i) => i.key === 'youtube')?.state).toBe('direct')
     const discord = v.items.find((i) => i.key === 'discord')
@@ -478,8 +495,14 @@ describe('ZapretService — the YouTube video node (0.7.1)', () => {
     expect(h.applied.slice(0, 3)).toEqual([S0, S1, S2])
     expect(v.strategy?.id).toBe(S2)
     expect(v.items[0]).toMatchObject({ key: 'youtube', state: 'direct' })
+    expect(v.items[0].note).toBeUndefined()
     expect(h.checked.some((c) => c.host === NODE)).toBe(true)
-    expect(h.memory['net-home']).toMatchObject({ id: S2, v: 2, ok: ['youtube'] })
+    expect(h.memory['net-home']).toMatchObject({ id: S2, v: 2 })
+    expect(h.memory['net-home'].ok).toEqual(
+      expect.arrayContaining(['youtube', 'youtube:video', 'youtube:quic'])
+    )
+    // it opened the video here: tried first by the next pick
+    expect(h.memory['net-home'].good?.[0].id).toBe(S2)
   })
 
   it('no strategy opens the video → YouTube through the VPN, the reason says «видео»', async () => {
@@ -492,9 +515,15 @@ describe('ZapretService — the YouTube video node (0.7.1)', () => {
     await h.svc.onVpn(true)
     const v = await h.idle()
     expect(v.strategy).toBeNull()
-    expect(v.items[0].state).toBe('vpn')
+    // the pages open by themselves: only they go direct, the video through the VPN
+    expect(v.items[0]).toMatchObject({ state: 'partial', note: 'сайт напрямую, видео через VPN' })
     expect(v.items[0].detail).toMatch(/видео не открывается напрямую/)
-    expect(directHosts(h.lastRoute())).toEqual([])
+    expect(directHosts(h.lastRoute())).toContain('youtube.com')
+    expect(directHosts(h.lastRoute())).not.toContain('googlevideo.com')
+    expect(proxyHosts(h.lastRoute())).toContain('googlevideo.com')
+    // a pick's failure is «не открылся», never «перестало открываться»
+    expect(h.logs.join('\n')).not.toMatch(/перестало открываться/)
+    expect(h.logs.join('\n')).toMatch(/напрямую не открылся — youtube:video/)
   })
 
   it('no video node found → YouTube is not «verified»: through the VPN', async () => {
@@ -507,8 +536,9 @@ describe('ZapretService — the YouTube video node (0.7.1)', () => {
     h.setRunning(true)
     await h.svc.onVpn(true)
     const v = await h.idle()
-    expect(v.items[0].state).toBe('vpn')
+    expect(v.items[0].state).toBe('partial')
     expect(v.items[0].detail).toMatch(/не найден видеосервер/)
+    expect(directHosts(h.lastRoute())).not.toContain('googlevideo.com')
   })
 
   it('a strategy remembered by 0.7.0 (no video check then) is picked again', async () => {
@@ -527,17 +557,20 @@ describe('ZapretService — the YouTube video node (0.7.1)', () => {
 })
 
 describe('ZapretService — back to the VPN by live traffic (0.7.1)', () => {
-  const conn = (id: string, host: string, ageMs: number, download = 0) => ({
+  let clock = Date.now()
+  const conn = (id: string, host: string, ageMs: number, download = 0, network = 'tcp') => ({
     id,
     rule: 'rule_set=cw-z-d => route(direct)',
-    start: new Date(Date.now() - ageMs).toISOString(),
+    start: new Date(clock - ageMs).toISOString(),
     download,
-    metadata: { host, network: 'tcp' }
+    metadata: { host, network }
   })
 
-  it('3 direct connections without an answer within a minute → VPN at once; others do nothing', async () => {
+  it('3 direct connections without an answer within a minute → that protocol through the VPN; others do nothing', async () => {
+    clock = Date.now()
     const h = harness({
       world: () => true,
+      now: () => clock,
       memory: { 'net-home': { id: S0, at: Date.now(), v: 2 } }
     })
     h.setRunning(true)
@@ -546,33 +579,57 @@ describe('ZapretService — back to the VPN by live traffic (0.7.1)', () => {
     const yt = (): ZapretView['items'][number] | undefined =>
       h.svc.view().items.find((i) => i.key === 'youtube')
     expect(yt()?.state).toBe('direct')
+    // the sets were just applied (our reconnection): nothing counts for LIVE_QUIET_MS
+    h.svc.onConnections({
+      connections: ['q1', 'q2', 'q3'].map((id) => conn(id, 'i.ytimg.com', LIVE_STALL_MS + 1000))
+    })
+    expect(yt()?.state).toBe('direct')
+    clock += LIVE_QUIET_MS + 30_000
     const routesBefore = h.routes.length
-    // answered, too young, another rule, UDP: none of them counts; two real ones
+    // answered, too young, another rule, opened during the reconnection: none counts; two real ones
     h.svc.onConnections({
       connections: [
         conn('a', 'rr1---sn-x.googlevideo.com', 20_000, 5000),
         conn('b', 'rr1---sn-x.googlevideo.com', 1000),
         { ...conn('c', 'rr1---sn-x.googlevideo.com', 20_000), rule: 'final' },
-        {
-          ...conn('d', 'rr1---sn-x.googlevideo.com', 20_000),
-          metadata: { host: 'rr1---sn-x.googlevideo.com', network: 'udp' }
-        },
+        conn('old', 'rr1---sn-x.googlevideo.com', LIVE_QUIET_MS + 29_000),
         conn('e', 'rr1---sn-x.googlevideo.com', LIVE_STALL_MS + 1000),
-        conn('f', 'rr2---sn-x.googlevideo.com', LIVE_STALL_MS + 1000)
+        conn('f', 'rr2---sn-x.googlevideo.com', LIVE_STALL_MS + 1000),
+        // QUIC is counted apart: one stalled QUIC connection is not a TCP failure
+        conn('u', 'rr2---sn-x.googlevideo.com', LIVE_STALL_MS + 1000, 0, 'udp')
       ]
     })
     expect(yt()?.state).toBe('direct')
     expect(h.routes.length).toBe(routesBefore)
-    // the third one
-    h.svc.onConnections({ connections: [conn('g', 'i.ytimg.com', LIVE_STALL_MS + 2000)] })
+    // the third TCP one: the video over TCP goes through the VPN, QUIC and the pages stay
+    h.svc.onConnections({
+      connections: [conn('g', 'rr3---sn-x.googlevideo.com', LIVE_STALL_MS + 2000)]
+    })
     await sleep(20)
-    expect(yt()?.state).toBe('vpn')
-    expect(yt()?.detail).toMatch(/не получают ответа/)
-    expect(proxyHosts(h.lastRoute())).toContain('googlevideo.com')
+    expect(yt()).toMatchObject({ state: 'direct', note: 'видео по QUIC' })
+    const r = h.lastRoute()
+    expect(r.proxy).toContainEqual({ domain_suffix: ['googlevideo.com'], network: ['tcp'] })
+    expect(r.direct).toContainEqual(
+      expect.objectContaining({ domain_suffix: ['googlevideo.com'], network: ['udp'] })
+    )
     expect(h.svc.view().items.find((i) => i.key === 'discord')?.state).toBe('direct')
+    // right after that change: quiet again
+    clock += 1000
+    h.svc.onConnections({
+      connections: ['p1', 'p2', 'p3'].map((id) => conn(id, 'i.ytimg.com', LIVE_STALL_MS + 500))
+    })
+    expect(yt()?.state).toBe('direct')
+    // later: the pages too
+    clock += LIVE_QUIET_MS + 10_000
+    h.svc.onConnections({
+      connections: ['p4', 'p5', 'p6'].map((id) => conn(id, 'i.ytimg.com', LIVE_STALL_MS + 500))
+    })
+    await sleep(20)
+    expect(yt()).toMatchObject({ state: 'partial' })
+    expect(yt()?.detail).toMatch(/не получают ответа/)
     // until the re-check time, a passing check does not bring it back (no flip-flop)
     await h.svc.repick()
-    expect(yt()?.state).toBe('vpn')
+    expect(yt()?.state).toBe('partial')
     await h.svc.onVpn(false)
   })
 
@@ -605,6 +662,245 @@ describe('ZapretService — DNS failover (0.7.1)', () => {
     // the next check finds 8.8.8.8 fine again — still on 1.1.1.1 for a while
     await h.svc.repick()
     expect(h.lastRoute().dns).toBe('fallback')
+    await h.svc.onVpn(false)
+  })
+})
+
+describe('ZapretService — QUIC apart from TCP (0.7.2)', () => {
+  const NODE = 'rr2---sn-8ph2xajvh-n8vs.googlevideo.com'
+
+  it('the video opens over QUIC only → UDP to YouTube direct, TCP to googlevideo through the VPN', async () => {
+    const h = harness({
+      // the pages open; the node: QUIC with S1, TCP never
+      world: (s, host, quic) => (host === NODE ? !!quic && s === S1 : host !== 'redirector.googlevideo.com' || !!quic),
+      videoNodes: [NODE],
+      settings: { services: ['youtube'] }
+    })
+    h.setRunning(true)
+    await h.svc.onVpn(true)
+    const v = await h.idle()
+    expect(v.strategy?.id).toBe(S1)
+    expect(v.items[0]).toMatchObject({ state: 'direct', note: 'видео по QUIC' })
+    const r = h.lastRoute()
+    // the pages: TCP (their own result) and QUIC → one rule; the video nodes: QUIC only
+    expect(r.direct).toContainEqual({ domain_suffix: expect.arrayContaining(['youtube.com', 'ytimg.com']) })
+    expect(r.direct).toContainEqual({ domain_suffix: ['googlevideo.com'], network: ['udp'] })
+    expect(r.proxy).toEqual([{ domain_suffix: ['googlevideo.com'], network: ['tcp'] }])
+  })
+})
+
+describe('ZapretService — a sturdy pick (0.7.2)', () => {
+  const NODE = 'rr2---sn-8ph2xajvh-n8vs.googlevideo.com'
+  const S10 = STRATEGIES[10].id
+
+  it('what worked here last is tried first; a lucky single pass does not win over a confirmed one', async () => {
+    // S0 opens the video on its first try only (DPI «remembers»); S10 every time
+    const runsOf = (id: string): number => h.applied.filter((x) => x === id).length
+    const h: ReturnType<typeof harness> = harness({
+      world: (s, host) => host !== NODE || s === S10 || (s === S0 && runsOf(S0) <= 1),
+      videoNodes: [NODE],
+      settings: { services: ['youtube'] },
+      memory: {
+        'net-home': {
+          id: S0,
+          at: Date.now() - 60_000,
+          v: 2,
+          ok: ['youtube'],
+          good: [{ id: S10, at: Date.now() - 3600_000, ok: ['youtube', 'youtube:video'] }]
+        }
+      }
+    })
+    h.setRunning(true)
+    await h.svc.onVpn(true)
+    await h.idle()
+    // the remembered one broke (its check) → a pick: S0, then the one that opened the video here
+    await h.svc.repick()
+    const v = h.svc.view()
+    const pickStart = h.applied.lastIndexOf(S0, h.applied.indexOf(S10))
+    expect(h.applied.slice(pickStart, pickStart + 2)).toEqual([S0, S10])
+    expect(v.strategy?.id).toBe(S10)
+    expect(v.items[0].state).toBe('direct')
+    expect(h.logs.join('\n')).toMatch(/перепроверка/)
+  })
+})
+
+describe('ZapretService — own domains without an address (0.7.2)', () => {
+  it('a bare root without an address: «нет адреса», direct while its subdomain opens; the subdomain is never cut off', async () => {
+    const h = harness({
+      world: (_s, host) =>
+        host === 'pragmaengine.com' || host === 'www.pragmaengine.com' ? 'noaddr' : true,
+      settings: {
+        services: [],
+        custom: ['pragmaengine.com', 'live.wardogs.bulkhead.pragmaengine.com']
+      },
+      memory: { 'net-home': { id: S0, at: Date.now(), v: 2 } }
+    })
+    h.setRunning(true)
+    await h.svc.onVpn(true)
+    const v = await h.idle()
+    expect(v.items[0]).toMatchObject({
+      key: 'd:pragmaengine.com',
+      state: 'direct',
+      note: 'нет адреса — проверяется по поддоменам'
+    })
+    expect(v.items[1]).toMatchObject({ state: 'direct' })
+  })
+
+  it('the more specific entry wins: a direct root with a failing subdomain cuts it out', async () => {
+    const h = harness({
+      world: (_s, host) => !host.includes('bad.'),
+      settings: { services: [], custom: ['example.org', 'bad.example.org'] },
+      memory: { 'net-home': { id: S0, at: Date.now(), v: 2 } }
+    })
+    h.setRunning(true)
+    await h.svc.onVpn(true)
+    await h.idle()
+    const r = h.lastRoute()
+    expect(r.direct).toEqual([
+      {
+        type: 'logical',
+        mode: 'and',
+        rules: [{ domain_suffix: ['example.org'] }, { domain_suffix: ['bad.example.org'], invert: true }]
+      }
+    ])
+    expect(r.proxy).toEqual([{ domain_suffix: ['bad.example.org'] }])
+  })
+})
+
+describe('ZapretService — rules «Напрямую + zapret» (0.7.2)', () => {
+  const rules: RoutingRule[] = [
+    { id: 'a', enabled: true, conditionType: 'Domain', value: 'game.example.org', action: 'ZAPRET' },
+    { id: 'b', enabled: true, conditionType: 'IPCIDR', value: '198.51.100.0/24', action: 'ZAPRET' },
+    {
+      id: 'c',
+      enabled: true,
+      conditionType: 'DomainSuffix',
+      value: 'blocked.example.net',
+      action: 'ZAPRET',
+      zapretFallback: false
+    },
+    { id: 'd', enabled: true, conditionType: 'DomainKeyword', value: 'game', action: 'ZAPRET' },
+    { id: 'e', enabled: true, conditionType: 'Domain', value: 'other.example.org', action: 'DIRECT' }
+  ]
+
+  it('their domains / addresses go to zapret; a failing one goes through the VPN unless the user said no', async () => {
+    const h = harness({
+      world: (_s, host) => host !== 'blocked.example.net' && host !== 'www.blocked.example.net' && host !== 'game.example.org',
+      settings: { services: [] },
+      memory: { 'net-home': { id: S0, at: Date.now(), v: 2 } },
+      rules
+    })
+    // before the VPN: plain «Напрямую»
+    expect(h.svc.effectiveRules(rules).map((r) => r.action)).toEqual([
+      'DIRECT',
+      'DIRECT',
+      'DIRECT',
+      'DIRECT',
+      'DIRECT'
+    ])
+    h.setRunning(true)
+    await h.svc.onVpn(true)
+    const v = await h.idle()
+    const req = h.daemon.requests.at(-1)!
+    expect(req.hosts).toEqual(['game.example.org', 'blocked.example.net'])
+    expect(req.ips).toEqual(['198.51.100.0/24'])
+    // a failing rule → VPN; the fallback switched off → stays direct; a keyword → plain direct
+    expect(h.svc.effectiveRules(rules).map((r) => r.action)).toEqual([
+      'PROXY',
+      'DIRECT',
+      'DIRECT',
+      'DIRECT',
+      'DIRECT'
+    ])
+    expect(h.rulesChanged).toBeGreaterThan(0)
+    expect(v.rules?.a.state).toBe('vpn')
+    expect(v.rules?.b.state).toBe('direct')
+    expect(v.rules?.c.state).toBe('plain')
+    expect(v.rules?.d).toMatchObject({ state: 'plain' })
+    expect(v.rules?.d.detail).toMatch(/Слово в домене/)
+    expect(v.rules?.e).toBeUndefined()
+    // off → plain direct again
+    await h.svc.onVpn(false)
+    expect(h.svc.effectiveRules(rules)[0].action).toBe('DIRECT')
+  })
+})
+
+describe('ZapretService — IP rules, safely (0.7.2 review)', () => {
+  const rules: RoutingRule[] = [
+    { id: 'n', enabled: true, conditionType: 'IPCIDR', value: '198.51.100.0/24', action: 'ZAPRET' },
+    { id: 'w', enabled: true, conditionType: 'IPCIDR', value: '10.0.0.0/7', action: 'ZAPRET' },
+    { id: 'z', enabled: true, conditionType: 'IPCIDR', value: '010.1.1.1', action: 'ZAPRET' },
+    { id: 's', enabled: true, conditionType: 'IPCIDR', value: '2001:DB8:0:0::1', action: 'ZAPRET' }
+  ]
+
+  it('only canonical, not too wide; a bad rule is left out, the rest go; a range: «проверяется по трафику»', async () => {
+    const h = harness({
+      world: () => true,
+      settings: { services: [] },
+      memory: { 'net-home': { id: S0, at: Date.now(), v: 2 } },
+      rules
+    })
+    h.setRunning(true)
+    await h.svc.onVpn(true)
+    const v = await h.idle()
+    expect(h.daemon.requests.at(-1)?.ips).toEqual(['198.51.100.0/24', '2001:db8::1'])
+    expect(v.rules?.n).toMatchObject({ state: 'direct', note: 'проверяется по трафику' })
+    expect(v.rules?.w.state).toBe('plain')
+    expect(v.rules?.w.detail).toMatch(/не шире \/8/)
+    expect(v.rules?.z.state).toBe('plain')
+    expect(v.rules?.s.state).toBe('direct')
+  })
+
+  it('our servers\' addresses unknown (failed / empty with servers) → no IP rules to zapret at all', async () => {
+    for (const excludeIps of [
+      async (): Promise<string[]> => {
+        throw new Error('dns')
+      },
+      async (): Promise<string[]> => []
+    ]) {
+      const h = harness({
+        world: () => true,
+        settings: { services: [] },
+        memory: { 'net-home': { id: S0, at: Date.now(), v: 2 } },
+        rules,
+        excludeIps
+      })
+      h.setRunning(true)
+      await h.svc.onVpn(true)
+      await h.idle()
+      expect(h.daemon.requests.at(-1)?.ips).toBeUndefined()
+      expect(h.logs.join('\n')).toMatch(/правила по IP пока без zapret/)
+      await h.svc.onVpn(false)
+    }
+  })
+
+  it('live traffic of a range: a connection to an address inside it counts', async () => {
+    let clock = Date.now()
+    const h = harness({
+      world: () => true,
+      settings: { services: [] },
+      memory: { 'net-home': { id: S0, at: Date.now(), v: 2 } },
+      rules,
+      now: () => clock
+    })
+    h.setRunning(true)
+    await h.svc.onVpn(true)
+    await h.idle()
+    clock += 60_000
+    const conn = (id: string, ip: string) => ({
+      id,
+      rule: 'rule_set=cw-0-d => route(direct)',
+      start: new Date(clock - LIVE_STALL_MS - 1000).toISOString(),
+      download: 0,
+      metadata: { host: '', network: 'tcp', destinationIP: ip }
+    })
+    // outside the range: nothing
+    h.svc.onConnections({ connections: ['a', 'b', 'c'].map((id) => conn(id, '198.51.101.9')) })
+    expect(h.svc.view().rules?.n.state).toBe('direct')
+    h.svc.onConnections({ connections: ['d', 'e', 'f'].map((id) => conn(id, '198.51.100.77')) })
+    await sleep(20)
+    expect(h.svc.view().rules?.n.state).toBe('vpn')
+    expect(h.svc.effectiveRules(rules)[0].action).toBe('PROXY')
     await h.svc.onVpn(false)
   })
 })

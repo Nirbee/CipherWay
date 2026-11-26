@@ -131,7 +131,13 @@ describe.skipIf(!win)('DPI broker (no elevation, fake winws / real winws --dry-r
 
   function brokerFile(
     r: Root,
-    extra: { hashes?: DpiHashes; dryRun?: boolean; appExe?: string; userRunDir?: string } = {}
+    extra: {
+      hashes?: DpiHashes
+      dryRun?: boolean
+      appExe?: string
+      userRunDir?: string
+      tcpTsTest?: { netsh: string; stateFile: string }
+    } = {}
   ): string {
     const file = join(r.home, 'dpi-broker.ps1')
     writeFileSync(
@@ -145,7 +151,8 @@ describe.skipIf(!win)('DPI broker (no elevation, fake winws / real winws --dry-r
           rootOverride: r.root,
           foreign,
           dryRun: extra.dryRun,
-          cygwinDirSddl: cygwinDirSddl()
+          cygwinDirSddl: cygwinDirSddl(),
+          ...(extra.tcpTsTest ? { tcpTsTest: extra.tcpTsTest } : {})
         })
     )
     return file
@@ -281,6 +288,17 @@ describe.skipIf(!win)('DPI broker (no elevation, fake winws / real winws --dry-r
       { exclude: ['10.0.0.0/8 --x'] },
       { exclude: ['10.0.0.1\n'] },
       { exclude: ['300.1.1.1'] },
+      { ips: ['10.0.0.0/8 --x'] },
+      { ips: ['198.51.100.0/24\n'] },
+      { ips: ['300.1.1.1/32'] },
+      // too wide for zapret (M1): IPv4 wider than /8, IPv6 wider than /32
+      { ips: ['0.0.0.0/0'] },
+      { ips: ['10.0.0.0/7'] },
+      { ips: ['::/0'] },
+      { ips: ['2001:db8::/31'] },
+      // a Unicode digit is not a digit
+      { ips: ['١٩٨.51.100.0/24'] },
+      { ips: ['198.51.100.0/２４'] },
       { services: ['youtube', 'C:\\Windows'] as never },
       { services: ['youtube\n'] as never }
     ]) {
@@ -300,6 +318,111 @@ describe.skipIf(!win)('DPI broker (no elevation, fake winws / real winws --dry-r
       await d.stop()
     }
   }, 180_000)
+
+  it('IP rules (0.7.2): an ipset of their own, its profiles only then; the hostlist stays inert without domains', async () => {
+    const d = daemon(fake)
+    const st = await d.start(
+      req({ services: [], hosts: [], ips: ['198.51.100.0/24', '2001:db8:1::/48'] })
+    )
+    expect(st.status).toBe('running')
+    expect(st.wait).not.toBe('no_hosts')
+    expect(readFileSync(join(fake.home, 'dpi', 'ips.txt'), 'utf8').trim().split('\n')).toEqual([
+      '198.51.100.0/24',
+      '2001:db8:1::/48'
+    ])
+    expect(readFileSync(join(fake.home, 'dpi', 'hosts.txt'), 'utf8').trim()).toBe(
+      'none.cipherway.invalid'
+    )
+    if (st.wait !== 'no_network') {
+      const cmd = await waitFile(join(fake.bin, 'fake-args.txt'))
+      expect(cmd).toContain(`"--ipset=${join(fake.home, 'dpi', 'ips.txt')}"`)
+      expect(cmd).not.toContain('198.51.100')
+    }
+    // without IP rules: no such profile
+    if (existsSync(join(fake.bin, 'fake-args.txt'))) unlinkSync(join(fake.bin, 'fake-args.txt'))
+    const st2 = await d.apply(req())
+    if (st2.wait !== 'no_network') {
+      const cmd = await waitFile(join(fake.bin, 'fake-args.txt'))
+      expect(cmd).not.toContain('ips.txt')
+    }
+    await d.stop()
+  }, 90_000)
+
+  describe('TCP timestamps (0.7.2) — a fake netsh and a fake «Windows setting»', () => {
+    /** a fake netsh: writes its value into the state file; `fail-<value>` next to it → exit 1 */
+    function fakeTs(r: Root, initial: 'enabled' | 'disabled') {
+      const dir = join(r.root, '..', 'ts')
+      mkdirSync(dir, { recursive: true })
+      const stateFile = join(dir, 'state.txt')
+      const netsh = join(dir, 'netsh.cmd')
+      writeFileSync(stateFile, initial)
+      writeFileSync(
+        netsh,
+        `@echo off\r\nif exist "%~dp0fail-%6" exit /b 1\r\n>"${stateFile}" echo %6\r\nexit /b 0\r\n`
+      )
+      const marker = join(r.root, 'tmp', 'dpi-tcp-ts.txt')
+      const now = (): string => readFileSync(stateFile, 'utf8').trim()
+      return { dir, stateFile, netsh, marker, now, file: brokerFile(r, { tcpTsTest: { netsh, stateFile } }) }
+    }
+
+    it('off → on while zapret runs (the original in the marker), back off at the stop; on → untouched', async () => {
+      const r = makeRoot('ts1', false)
+      const f = fakeTs(r, 'disabled')
+      const d = daemon(r, f.file)
+      const st = await d.start(req())
+      expect(st.status).toBe('running')
+      expect(f.now()).toBe('enabled')
+      expect(readFileSync(f.marker, 'utf8')).toBe('Disabled')
+      expect(state(r)?.tcpTs).toBe('enabled')
+      await d.stop()
+      for (let i = 0; i < 50 && existsSync(f.marker); i++) await sleep(100)
+      expect(f.now()).toBe('disabled')
+      expect(existsSync(f.marker)).toBe(false)
+      expect(readFileSync(join(r.home, 'dpi-broker.log'), 'utf8')).toMatch(/метки времени TCP выключены, как было/)
+
+      // already on: nothing touched, no marker
+      writeFileSync(f.stateFile, 'enabled')
+      const d2 = daemon(r, f.file)
+      await d2.start(req())
+      expect(existsSync(f.marker)).toBe(false)
+      await d2.stop()
+      await sleep(800)
+      expect(f.now()).toBe('enabled')
+    }, 90_000)
+
+    it('a failed return keeps the marker; the next broker without work (cleanup) puts it back', async () => {
+      const r = makeRoot('ts2', false)
+      const f = fakeTs(r, 'disabled')
+      writeFileSync(join(f.dir, 'fail-disabled'), '')
+      const d = daemon(r, f.file)
+      await d.start(req())
+      expect(f.now()).toBe('enabled')
+      await d.stop()
+      await sleep(1500)
+      // netsh said «no»: still on, the marker stays
+      expect(f.now()).toBe('enabled')
+      expect(readFileSync(f.marker, 'utf8')).toBe('Disabled')
+      expect(readFileSync(join(r.home, 'dpi-broker.log'), 'utf8')).toMatch(/не удалось вернуть/)
+      // netsh works again: a cleanup run (no winws) restores — the lock is free
+      unlinkSync(join(f.dir, 'fail-disabled'))
+      await d.cleanup()
+      for (let i = 0; i < 50 && existsSync(f.marker); i++) await sleep(100)
+      expect(f.now()).toBe('disabled')
+      expect(existsSync(f.marker)).toBe(false)
+    }, 90_000)
+
+    it('netsh failing to turn them on leaves nothing behind', async () => {
+      const r = makeRoot('ts3', false)
+      const f = fakeTs(r, 'disabled')
+      writeFileSync(join(f.dir, 'fail-enabled'), '')
+      const d = daemon(r, f.file)
+      await d.start(req())
+      expect(f.now()).toBe('disabled')
+      expect(existsSync(f.marker)).toBe(false)
+      expect(readFileSync(join(r.home, 'dpi-broker.log'), 'utf8')).toMatch(/не включились/)
+      await d.stop()
+    }, 90_000)
+  })
 
   it('too many own domains are refused', async () => {
     const d = daemon(fake)
@@ -571,7 +694,11 @@ describe.skipIf(!win)('DPI broker (no elevation, fake winws / real winws --dry-r
         __COMPAT_LAYER: 'RunAsInvoker'
       })
       const st = await d.start(
-        req({ services: ['youtube', 'discord'], strategy: 'multidisorder-auto' })
+        req({
+          services: ['youtube', 'discord'],
+          strategy: 'fake-multisplit-ts',
+          ips: ['198.51.100.0/24']
+        })
       )
       if (st.wait === 'no_network') return
       let end = state(real)

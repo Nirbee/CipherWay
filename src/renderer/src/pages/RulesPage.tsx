@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { DefaultBehavior, RoutingRule } from '@shared/types'
+import type { ZapretView } from '@shared/zapret'
 import { PageHeader } from '../components/PageHeader'
 import { EmptyState } from '../components/EmptyState'
 import { Button, Input } from '../components/ui'
@@ -38,6 +39,12 @@ export function RulesPage() {
   const setRoutingMode = useSettings((s) => s.setRoutingMode)
 
   const [tab, setTab] = useState<Tab>('list')
+  // «Напрямую + zapret»: how each such rule goes right now
+  const [zapret, setZapret] = useState<ZapretView | null>(null)
+  useEffect(() => {
+    void window.api.zapret.get().then(setZapret)
+    return window.api.on.zapret(setZapret)
+  }, [])
   const [filter, setFilter] = useState('')
   const [editorOpen, setEditorOpen] = useState(false)
   const [editing, setEditing] = useState<RoutingRule | null>(null)
@@ -211,6 +218,7 @@ export function RulesPage() {
                       rule={rule}
                       index={index}
                       draggable={dndActive}
+                      zapretState={zapret?.rules?.[rule.id]}
                       onToggle={() => toggleRule(rule.id)}
                       onEdit={() => {
                         setEditing(rule)

@@ -8,8 +8,16 @@ import {
   ZAPRET_ROUTE_TEXT,
   sanitizeZapretSettings,
   zapretStateText,
-  ZAPRET_CUSTOM_MAX
+  ZAPRET_CUSTOM_MAX,
+  PROGRAM_HINT,
+  ZAPRET_ACTION,
+  zapretCidr,
+  zapretCidrCheck,
+  zapretRouteText,
+  zapretRuleTarget,
+  zapretRuleText
 } from './zapret'
+import { TLDS } from './tlds'
 
 const ok = (raw: string, reserved: string[] = []): string => {
   const r = normalizeZapretDomain(raw, reserved)
@@ -192,5 +200,94 @@ describe('«Правила»: how each item goes now (0.7.1)', () => {
     ).toBe('Ваше правило важнее: VPN')
     expect(zapretRoute(it('checking'), 'starting', [])).toBe('checking')
     expect(zapretRoute(it('idle'), 'idle', [])).toBe('waiting')
+  })
+})
+
+describe('0.7.2: programs and made-up zones are not sites', () => {
+  it('a program name / path → the hint about games; a zone that does not exist → refused', () => {
+    expect(bad('wardogsclient-win64-shipping.exe')).toBe(PROGRAM_HINT)
+    expect(bad('WarDogs.EXE')).toBe(PROGRAM_HINT)
+    expect(bad('setup.msi')).toBe(PROGRAM_HINT)
+    expect(bad('run.bat')).toBe(PROGRAM_HINT)
+    expect(bad('steam_api64.dll')).toBe(PROGRAM_HINT)
+    expect(bad('C:\\Games\\WarDogs\\game.exe')).toBe(PROGRAM_HINT)
+    expect(bad('readme.txt')).toMatch(/Такой доменной зоны нет \(\.txt\)/)
+    expect(bad('game.notatld')).toMatch(/доменной зоны нет/)
+    // real zones, new ones and IDN included
+    expect(ok('live.wardogs.bulkhead.pragmaengine.com')).toBe('live.wardogs.bulkhead.pragmaengine.com')
+    expect(ok('example.app')).toBe('example.app')
+    expect(ok('files.zip')).toBe('files.zip')
+    expect(ok('пример.рф')).toBe('xn--e1afmkfd.xn--p1ai')
+    expect(TLDS.size).toBeGreaterThan(1400)
+    expect(TLDS.has('exe')).toBe(false)
+  })
+})
+
+describe('0.7.2: the rule action «Напрямую + zapret»', () => {
+  it('what zapret can take from a rule, and why not', () => {
+    expect(zapretRuleTarget({ conditionType: 'Domain', value: 'Game.Example.org' })).toEqual({
+      ok: true,
+      kind: 'domain',
+      value: 'game.example.org'
+    })
+    expect(zapretRuleTarget({ conditionType: 'IPCIDR', value: '198.51.100.0/24' })).toEqual({
+      ok: true,
+      kind: 'ip',
+      value: '198.51.100.0/24'
+    })
+    expect(zapretRuleTarget({ conditionType: 'IPCIDR', value: '2001:db8::/32' })).toMatchObject({
+      ok: true
+    })
+    expect(zapretRuleTarget({ conditionType: 'IPCIDR', value: '300.1.1.1' }).ok).toBe(false)
+    expect(zapretRuleTarget({ conditionType: 'GeoSite', value: 'youtube' })).toEqual({
+      ok: true,
+      kind: 'service',
+      value: 'youtube'
+    })
+    for (const [conditionType, re] of [
+      ['GeoSite', /youtube и discord/],
+      ['DomainKeyword', /Слово в домене/],
+      ['ProcessName', /не видит, какая программа/],
+      ['GeoIP', /geoip/],
+      ['DstPort', /По порту/]
+    ] as const) {
+      const r = zapretRuleTarget({ conditionType, value: 'x' })
+      expect(r.ok).toBe(false)
+      if (!r.ok) expect(r.reason).toMatch(re)
+    }
+    expect(zapretCidr('10.0.0.0/33')).toBeNull()
+    expect(zapretCidr('203.0.113.7')).toBe('203.0.113.7')
+    expect(zapretRuleText({ state: 'direct' })).toBe('Напрямую + zapret ✓')
+    expect(zapretRuleText(undefined)).toBe('Напрямую (без zapret)')
+  })
+
+  it('a user rule with it catches the service first; the pill shows the note', () => {
+    const rules = [
+      { enabled: true, conditionType: 'GeoSite', value: 'youtube', action: ZAPRET_ACTION }
+    ]
+    expect(zapretRoute({ key: 'youtube', state: 'direct' }, 'running', rules)).toBe('user_zapret')
+    expect(zapretRouteText('direct', 'видео по QUIC')).toBe('Напрямую + zapret ✓ (видео по QUIC)')
+    expect(zapretRouteText('partial', 'сайт напрямую, видео через VPN')).toBe(
+      'Частично напрямую: сайт напрямую, видео через VPN'
+    )
+    expect(zapretRouteText('vpn_failed', 'x')).toBe(ZAPRET_ROUTE_TEXT.vpn_failed)
+  })
+})
+
+describe('0.7.2 review: IP rules for zapret — canonical, not too wide', () => {
+  it('/0 and wider than /8 · /32 refused with a reason; leading zeros and odd spellings refused / made canonical', () => {
+    for (const v of ['0.0.0.0/0', '10.0.0.0/7', '::/0', '2001:db8::/31']) {
+      const r = zapretCidrCheck(v)
+      expect(r.ok, v).toBe(false)
+      if (!r.ok) expect(r.reason).toMatch(/Слишком широкая подсеть/)
+    }
+    expect(zapretCidr('10.0.0.0/8')).toBe('10.0.0.0/8')
+    expect(zapretCidr('2001:db8::/32')).toBe('2001:db8::/32')
+    expect(zapretCidr('010.1.1.1')).toBeNull()
+    expect(zapretCidr('10.1.1.1/08')).toBeNull()
+    expect(zapretCidr('10.1.1.1/24/1')).toBeNull()
+    expect(zapretCidr('١٩٨.51.100.1')).toBeNull()
+    expect(zapretCidr('2001:DB8:0:0::1')).toBe('2001:db8::1')
+    expect(zapretCidr('2001:0db8::0001/64')).toBe('2001:db8::1/64')
   })
 })

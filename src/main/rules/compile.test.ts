@@ -344,6 +344,25 @@ describe('zapret sets («Ускорение без VPN», 0.7.0)', () => {
     for (const text of Object.values(g)) expect(text.startsWith('{"version":')).toBe(true)
   })
 
+  it('0.7.2: the DNS sets keep a logical rule (minus the VPN subdomain) and drop `network`', () => {
+    const r = {
+      direct: [
+        { domain_suffix: ['googlevideo.com'], network: ['udp'] },
+        {
+          type: 'logical',
+          mode: 'and',
+          rules: [{ domain_suffix: ['a.org'] }, { domain_suffix: ['b.a.org'], invert: true }]
+        }
+      ],
+      proxy: [],
+      dns: 'primary' as const
+    }
+    expect(JSON.parse(zapretFiles(r)['cw-z-dn.json']).rules).toEqual([
+      { domain_suffix: ['googlevideo.com'] },
+      r.direct[1]
+    ])
+  })
+
   it('names pass the TUN broker\'s file-name check', () => {
     for (const name of Object.keys(zapretFiles())) {
       expect(name).toMatch(/^cw-[0-9a-z-]{1,40}\.json$/)

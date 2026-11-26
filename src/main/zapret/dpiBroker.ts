@@ -12,7 +12,7 @@ import {
 import { BROKER_HELPERS_PS, HASH_RE, isValidSid, rootExpr } from '../core/serviceScripts'
 import { PUBLIC_SUFFIXES, ZAPRET_CUSTOM_MAX, ZAPRET_SERVICE_IDS } from '@shared/zapret'
 import { SERVICE_DEFS } from './lists'
-import { STRATEGIES, tokenProblems, winwsTokens } from './strategies'
+import { STRATEGIES, tokenProblems, userIpTokens, winwsTokens } from './strategies'
 
 // ---------------------------------------------------------------------------
 // «Ускорение без VPN (zapret)» (0.7.0): winws needs SYSTEM rights (it opens
@@ -61,6 +61,8 @@ import { STRATEGIES, tokenProblems, winwsTokens } from './strategies'
 //                 pattern (labels a-z0-9-, ≤ 253 chars, a letter / xn-- TLD),
 //                 not a public suffix (com.ru, github.io…);
 //      exclude  — our VPN servers' addresses: ≤ 512 IPv4 / IPv6 / CIDR, parsed;
+//      ips      — the user's «Напрямую + zapret» IP rules (0.7.2): the same
+//                 format and check as exclude, ≤ 512; only lines of ips.txt;
 //    every pattern is anchored with \z (a value ending in a newline fails);
 //    anything else → the broker refuses (`bad_request`) and stops; the state
 //    and the journal only ever get our own fixed texts.
@@ -85,6 +87,11 @@ import { STRATEGIES, tokenProblems, winwsTokens } from './strategies'
 //    (before this broker's state replaces the file with its pid) or by
 //    `cleanup` — only that pid, only if it runs our file AND has this user's
 //    hostlist in its command line.
+//  * TCP timestamps (0.7.2; the «ts» strategies fool the DPI with them): turned
+//    on with ONE fixed command (netsh … timestamps=enabled) when Windows has
+//    them off, by the broker that holds the lock; the original value is
+//    remembered in the admin-only <Root>\tmp\dpi-tcp-ts.txt and put back when
+//    that broker ends (and by the service removal). A failure is only noted.
 //  * Windows functions (final path, object directories, process tokens) are
 //    declared in memory with Reflection.Emit — no csc, no temporary files.
 // Talking to the app (files, the broker polls every 500 ms):
@@ -128,6 +135,11 @@ export interface DpiBrokerParams {
   foreign?: ForeignDpi
   /** tests only: start winws with --dry-run appended (it checks the line and exits) */
   dryRun?: boolean
+  /**
+   * tests only: TCP timestamps through a fake — `netsh` is run instead of the
+   * real one, the «Windows setting» is the text of `stateFile` (enabled / disabled)
+   */
+  tcpTsTest?: { netsh: string; stateFile: string }
   /**
    * tests only: the DACL of Cygwin's object directory — a non-elevated test
    * winws needs its own user in it (production: CYGWIN_DIR_SDDL)
@@ -176,6 +188,21 @@ export function plansPs(): string {
   }
   return `@{\n${rows.join('\n')}\n}`
 }
+
+/** `$IpPlans`: strategy id → the profiles of the user's IP rules (appended when ips.txt is not empty). */
+export function ipPlansPs(): string {
+  const rows: string[] = []
+  for (const s of STRATEGIES) {
+    const tokens = userIpTokens(s)
+    const bad = tokenProblems(tokens)
+    if (bad.length) throw new Error(`bad token in ${s.id}: ${bad.join(' ')}`)
+    rows.push(`  ${psQuote(s.id)} = ${psList(tokens)}`)
+  }
+  return `@{\n${rows.join('\n')}\n}`
+}
+
+/** a hostlist entry that never matches: the hostlist profiles stay inert when only IP rules are on */
+export const DPI_NO_HOST = 'none.cipherway.invalid'
 
 /** `$ServiceDomains`: built-in service id → its domains (the hostlist part the user can't change). */
 export function servicesPs(): string {
@@ -374,6 +401,7 @@ export function dpiBrokerScript(p: DpiBrokerParams): string {
   if (!isValidSid(p.sid)) throw new Error('bad sid')
   for (const f of DPI_ALL) if (!HASH_RE.test(p.hashes[f] ?? '')) throw new Error('bad hash')
   if (!/^[A-Za-z]:\\[^"\r\n]*\.exe$/i.test(p.appExe)) throw new Error('bad app exe')
+  if (p.tcpTsTest && !p.rootOverride) throw new Error('tcpTsTest is for tests only')
   const sddl = p.cygwinDirSddl ?? CYGWIN_DIR_SDDL
   if (!/^D:P(\(A;;GA;;;(SY|BA|S-1-5-21(-\d+){3,6})\))+$/.test(sddl)) throw new Error('bad sddl')
   const foreign = p.foreign ?? OFFICIAL_FOREIGN
@@ -397,6 +425,12 @@ $DpiDir = Join-Path $Dir 'dpi'
 $HostsF = Join-Path $DpiDir 'hosts.txt'
 $ExclF = Join-Path $DpiDir 'exclude.txt'
 $DiscordF = Join-Path $DpiDir 'discord-ips.txt'
+$IpsF = Join-Path $DpiDir 'ips.txt'
+$NoHost = ${psQuote(DPI_NO_HOST)}
+$TsF = Join-Path $Tmp 'dpi-tcp-ts.txt'
+$TcpTs = ${!p.rootOverride || p.tcpTsTest ? '$true' : '$false'}
+$Netsh = ${p.tcpTsTest ? psQuote(p.tcpTsTest.netsh) : "Join-Path ([Environment]::GetFolderPath('System')) 'netsh.exe'"}
+$TcpTsTest = ${p.tcpTsTest ? psQuote(p.tcpTsTest.stateFile) : "''"}
 $FakeTls = Join-Path $DpiBin ${psQuote(DPI_FAKE_TLS)}
 $FakeQuic = Join-Path $DpiBin ${psQuote(DPI_FAKE_QUIC)}
 $StateF = Join-Path $Dir 'dpi-state.json'
@@ -422,13 +456,14 @@ ${
 }$MaxHosts = ${DPI_MAX_HOSTS}
 $MaxExcl = ${DPI_MAX_EXCLUDE}
 $DomRe = '^(?=.{4,253}\\z)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]{1,59})\\z'
-$V4Re = '^(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})(/(\\d{1,2}))?\\z'
-$V6Re = '^[0-9a-f:.]{2,45}(/\\d{1,3})?\\z'
+$V4Re = '^([0-9]{1,3})\\.([0-9]{1,3})\\.([0-9]{1,3})\\.([0-9]{1,3})(/([0-9]{1,2}))?\\z'
+$V6Re = '^[0-9a-f:.]{2,45}(/[0-9]{1,3})?\\z'
 $IdRe = '^[a-z0-9-]{1,40}\\z'
 $ServiceDomains = ${servicesPs()}
 $Plans = ${plansPs()}
+$IpPlans = ${ipPlansPs()}
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
-$State = @{ session = ''; status = 'starting'; gen = 0; strategy = ''; ifIdx = 0; ifName = ''; dpiPid = 0; wait = ''; exitCode = $null; output = ''; error = ''; detail = ''; stopReason = ''; brokerPid = $PID; ts = 0 }
+$State = @{ session = ''; status = 'starting'; gen = 0; strategy = ''; ifIdx = 0; ifName = ''; dpiPid = 0; wait = ''; exitCode = $null; output = ''; error = ''; detail = ''; stopReason = ''; tcpTs = ''; brokerPid = $PID; ts = 0 }
 ${BROKER_HELPERS_PS}
 ${PICK_IF_PS}
 function Test-Cidr([string]$s) {
@@ -446,6 +481,15 @@ function Test-Cidr([string]$s) {
     return $true
   }
   return $false
+}
+# a user's «Напрямую + zapret» address: a range no wider than /8 (IPv4) or /32 (IPv6)
+function Test-UserIp([string]$s) {
+  if (-not (Test-Cidr $s)) { return $false }
+  $parts = $s.Split('/')
+  if ($parts.Count -lt 2) { return $true }
+  $bits = [int]$parts[1]
+  if ($s.Contains(':')) { return ($bits -ge 32) }
+  return ($bits -ge 8)
 }
 # the lists of request generation $gen, validated (null = not written yet);
 # a refused value is never repeated in the message
@@ -476,7 +520,14 @@ function Load-Lists([long]$gen) {
     if (-not $ex.Contains($x)) { $ex.Add($x) }
     if ($ex.Count -gt $MaxExcl) { throw 'cw-bad_request слишком много адресов' }
   }
-  return @{ gen = $gen; strategy = $id; services = $picked; hosts = $hosts; exclude = $ex }
+  $ips = New-Object Collections.Generic.List[string]
+  foreach ($x in @($l.ips)) {
+    if ($null -eq $x) { continue }
+    if (-not ($x -is [string]) -or -not (Test-UserIp $x)) { throw 'cw-bad_request адрес' }
+    if (-not $ips.Contains($x)) { $ips.Add($x) }
+    if ($ips.Count -gt $MaxExcl) { throw 'cw-bad_request слишком много адресов' }
+  }
+  return @{ gen = $gen; strategy = $id; services = $picked; hosts = $hosts; exclude = $ex; ips = $ips }
 }
 # the request's pid: a live process of OUR app's exe, owned by THIS user
 function App-Alive($v) {
@@ -547,18 +598,22 @@ function Ensure-DpiDir {
   if ([IO.Directory]::Exists($DpiDir) -or [IO.File]::Exists($DpiDir)) {
     if ((Is-Reparse $DpiDir) -or -not [IO.Directory]::Exists($DpiDir)) { throw 'cw-failed папка zapret подменена' }
   } else { $null = [IO.Directory]::CreateDirectory($DpiDir) }
-  foreach ($f in @($HostsF, $ExclF, $DiscordF)) { if (Is-Reparse $f) { throw 'cw-failed файл zapret подменён' } }
+  foreach ($f in @($HostsF, $ExclF, $DiscordF, $IpsF)) { if (Is-Reparse $f) { throw 'cw-failed файл zapret подменён' } }
 }
 # the hostlist / ipset files winws reads: written here, one entry per line
 function Write-Lists($l) {
   $all = New-Object Collections.Generic.List[string]
   foreach ($s in $l.services) { foreach ($d in $ServiceDomains[$s]) { if (-not $all.Contains($d)) { $all.Add($d) } } }
   foreach ($d in $l.hosts) { if (-not $all.Contains($d)) { $all.Add($d) } }
+  $n = $all.Count + $l.ips.Count
+  # only IP rules: the hostlist profiles get a name that never matches (an empty hostlist matches everything)
+  if ($all.Count -eq 0) { $all.Add($NoHost) }
   Write-Atomic $HostsF (($all -join [string][char]10) + [string][char]10)
   $ex = @($AlwaysExclude) + @($l.exclude)
   Write-Atomic $ExclF (($ex -join [string][char]10) + [string][char]10)
   Write-Atomic $DiscordF (($DiscordIps -join [string][char]10) + [string][char]10)
-  return $all.Count
+  Write-Atomic $IpsF (($l.ips -join [string][char]10) + [string][char]10)
+  return $n
 }
 # the only command line winws ever gets: the table + the broker's own paths
 function Build-Args($l, [int]$ifIdx) {
@@ -567,6 +622,11 @@ function Build-Args($l, [int]$ifIdx) {
   $out.Add('"--wf-iface=' + $ifIdx + '"')
   foreach ($t in $Plans[$key]) {
     $out.Add('"' + $t.Replace('%TLS%', $FakeTls).Replace('%QUIC%', $FakeQuic).Replace('%HOSTS%', $HostsF).Replace('%EXCL%', $ExclF).Replace('%DISCORD_IPS%', $DiscordF) + '"')
+  }
+  if ($l.ips.Count -gt 0) {
+    foreach ($t in $IpPlans[$l.strategy]) {
+      $out.Add('"' + $t.Replace('%TLS%', $FakeTls).Replace('%QUIC%', $FakeQuic).Replace('%EXCL%', $ExclF).Replace('%USER_IPS%', $IpsF) + '"')
+    }
   }
   if ($DryRun) { $out.Add('"--dry-run"') }
   return ($out -join ' ')
@@ -672,6 +732,91 @@ function Dpi-Output {
   if ($t.Length -gt 2000) { $t = $t.Substring($t.Length - 2000) }
   return $t
 }
+# TCP timestamps: on while our zapret runs (fixed commands only; a failure is only noted).
+# Read: CIM MSFT_NetTCPSetting «Internet» — the template Windows applies to
+# connections to the Internet, the store netsh writes; 0 = Disabled, 1 = Enabled.
+# Written: netsh … timestamps=enabled|disabled, its exit code checked, then read back.
+function Tcp-Ts {
+  try {
+    if ($TcpTsTest) {
+      $v = ([IO.File]::ReadAllText($TcpTsTest)).Trim()
+    } else {
+      $v = [string][int](Get-CimInstance -Namespace 'root/StandardCimv2' -ClassName 'MSFT_NetTCPSetting' -Filter "SettingName='Internet'" -ErrorAction Stop).Timestamps
+    }
+    if ($v -ceq '0' -or $v -ceq 'disabled') { return 'Disabled' }
+    if ($v -ceq '1' -or $v -ceq 'enabled') { return 'Enabled' }
+    return ''
+  } catch { return '' }
+}
+# netsh with ONE of two fixed values; true only for exit code 0 (no reliance on error streams)
+function Run-Netsh([string]$v) {
+  if ($v -cne 'enabled' -and $v -cne 'disabled') { return $false }
+  try {
+    $si = New-Object Diagnostics.ProcessStartInfo
+    $si.FileName = $Netsh
+    $si.Arguments = 'interface tcp set global timestamps=' + $v
+    $si.UseShellExecute = $false
+    $si.CreateNoWindow = $true
+    $si.RedirectStandardOutput = $true
+    $si.RedirectStandardError = $true
+    $pr = [Diagnostics.Process]::Start($si)
+    $null = $pr.StandardOutput.ReadToEnd()
+    $null = $pr.StandardError.ReadToEnd()
+    if (-not $pr.WaitForExit(15000)) { try { $pr.Kill() } catch {}; return $false }
+    return ($pr.ExitCode -eq 0)
+  } catch { return $false }
+}
+# the original value from the marker (only «Disabled» is ever written), '' = none / not ours
+function TcpTs-Marker {
+  if ((Is-Reparse $TsF) -or -not [IO.File]::Exists($TsF)) { return '' }
+  if ((New-Object IO.FileInfo($TsF)).Length -gt 64) { return '' }
+  $v = ([IO.File]::ReadAllText($TsF)).Trim()
+  if ($v -ceq 'Disabled') { return $v }
+  return ''
+}
+function Enable-TcpTs {
+  if (-not $TcpTs) { return }
+  try {
+    # already on (or unknown): nothing is touched, no marker
+    if ((Tcp-Ts) -ne 'Disabled') { return }
+    if (Is-Reparse $TsF) { return }
+    if ((TcpTs-Marker) -eq '') { Write-Atomic $TsF 'Disabled' }
+    if ((Run-Netsh 'enabled') -and (Tcp-Ts) -eq 'Enabled') {
+      $State.tcpTs = 'enabled'
+      Note 'метки времени TCP включены (были выключены)'
+      return
+    }
+    Note 'метки времени TCP не включились'
+    # nothing changed: no marker left behind
+    if ((Tcp-Ts) -eq 'Disabled') { [IO.File]::Delete($TsF) }
+  } catch { Note 'метки времени TCP: не удалось включить' }
+}
+# back to the original value; the marker goes only once that is confirmed
+function Restore-TcpTs {
+  if (-not $TcpTs) { return }
+  try {
+    $orig = TcpTs-Marker
+    if ($orig -eq '') { return }
+    if ((Tcp-Ts) -ne $orig) {
+      $ok = Run-Netsh 'disabled'
+      if (-not $ok -or (Tcp-Ts) -ne $orig) { Note 'метки времени TCP: не удалось вернуть — попробуем при следующем запуске'; return }
+    }
+    [IO.File]::Delete($TsF)
+    $State.tcpTs = ''
+    Note 'метки времени TCP выключены, как было'
+  } catch { Note 'метки времени TCP: не удалось вернуть' }
+}
+# a broker that runs no winws (cleanup / no request): puts them back if nobody holds the lock
+function Restore-IfIdle {
+  if (-not $TcpTs) { return }
+  try {
+    if ((Is-Reparse $Tmp) -or -not [IO.Directory]::Exists($Tmp) -or -not [IO.File]::Exists($TsF)) { return }
+    Test-AdminOnly $Tmp
+    $lk = Take-Lock
+    if ($null -eq $lk) { return }
+    try { Restore-TcpTs } finally { $lk.Dispose() }
+  } catch {}
+}
 function Start-Dpi($l, $nic) {
   Test-DpiFolder
   foreach ($k in @($Hashes.Keys)) {
@@ -718,11 +863,13 @@ try {
   $fresh = $null -ne $ctl -and [math]::Abs((Now-Ms) - (Num $ctl.ts)) -le 120000 -and (App-Alive $ctl.pid)
   if ($fresh -and $ctl.cmd -ceq 'cleanup') {
     Stop-Orphan
+    Restore-IfIdle
     $State.status = 'stopped'
     $State.stopReason = 'очистка'
     exit 0
   }
   if (-not $fresh -or $ctl.cmd -cne 'run') {
+    Restore-IfIdle
     $State.status = 'refused'
     $State.error = 'no_request'
     exit 0
@@ -746,6 +893,7 @@ try {
     exit 0
   }
   $cygDir = $h
+  Enable-TcpTs
   $gen = Num $ctl.gen
   $lists = $null
   for ($i = 0; $i -lt 20 -and $null -eq $lists; $i++) {
@@ -846,6 +994,8 @@ try {
   Kill-Dpi $dpi
   $State.dpiPid = 0
   if ($cygDir -ne [IntPtr]::Zero) { try { $null = $Native::NtClose($cygDir) } catch {} }
+  # only the broker that holds the lock turned them on
+  if ($null -ne $lock) { Restore-TcpTs }
   if ($null -ne $lock) { try { $lock.Dispose() } catch {} }
   if ($State.stopReason) { Note ('zapret остановлен: ' + $State.stopReason) }
   if ($State.status -eq 'running' -or $State.status -eq 'starting') { $State.status = 'stopped' }
@@ -871,6 +1021,8 @@ export interface DpiBrokerState {
   error?: DpiBrokerError
   detail?: string
   stopReason?: string
+  /** 'enabled' = this broker turned TCP timestamps on (put back when it ends) */
+  tcpTs?: string
   ts?: number
 }
 
@@ -907,6 +1059,7 @@ export function parseDpiState(text: string): DpiBrokerState | null {
       error: ERRORS.find((s) => s === o.error),
       detail: str(o.detail),
       stopReason: str(o.stopReason),
+      tcpTs: str(o.tcpTs),
       ts: num(o.ts)
     }
   } catch {

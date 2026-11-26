@@ -68,7 +68,10 @@ const TO_CLASH: Record<RuleConditionType, string> = {
 export const CONDITION_TYPE_LIST = Object.keys(TO_CLASH) as RuleConditionType[]
 
 /** trailing rule options we accept and ignore */
-const OPTIONS = new Set(['no-resolve', 'src', 'dst'])
+const OPTIONS = new Set(['no-resolve', 'src', 'dst', 'no-vpn-fallback'])
+/** «Напрямую + zapret» (0.7.2): our pseudo-target in the Clash text; its option: never back to the VPN */
+export const CLASH_ZAPRET = 'ZAPRET'
+const NO_FALLBACK = 'no-vpn-fallback'
 
 // ---- value validation ------------------------------------------------------
 
@@ -158,12 +161,13 @@ export function validateValue(
   }
 }
 
-/** DIRECT / REJECT stay, everything else (PROXY, group or node names) → PROXY. */
+/** DIRECT / REJECT / ZAPRET stay, everything else (PROXY, group or node names) → PROXY. */
 export function mapAction(raw: string): { ok: true; action: string } | { ok: false; reason: string } {
   const a = raw.trim()
   const up = a.toUpperCase()
   if (!a) return { ok: false, reason: 'не указано действие (DIRECT / PROXY / REJECT)' }
   if (up === 'DIRECT') return { ok: true, action: 'DIRECT' }
+  if (up === CLASH_ZAPRET) return { ok: true, action: CLASH_ZAPRET }
   if (up.startsWith('REJECT') || up === 'BLOCK') return { ok: true, action: 'REJECT' }
   if (up === 'PASS') return { ok: false, reason: 'действие PASS не поддерживается' }
   return { ok: true, action: 'PROXY' }
@@ -211,7 +215,9 @@ export function parseClashLine(raw: string): LineResult {
     const act = mapAction(parts[1] ?? '')
     if (!act.ok) return { kind: 'skip', reason: act.reason }
     const b = behaviorFromAction(act.action)
-    return b ? { kind: 'match', behavior: b } : { kind: 'skip', reason: 'MATCH,REJECT не поддерживается' }
+    return b
+      ? { kind: 'match', behavior: b }
+      : { kind: 'skip', reason: `MATCH,${act.action} не поддерживается` }
   }
 
   const cond = CLASH_TYPES[type]
@@ -221,7 +227,10 @@ export function parseClashLine(raw: string): LineResult {
   }
   // trailing options (no-resolve…) are ignored; DOMAIN-REGEX may contain commas
   const rest = parts.slice(1)
-  while (rest.length > 2 && OPTIONS.has(rest[rest.length - 1].toLowerCase())) rest.pop()
+  let noFallback = false
+  while (rest.length > 2 && OPTIONS.has(rest[rest.length - 1].toLowerCase())) {
+    if (rest.pop()?.toLowerCase() === NO_FALLBACK) noFallback = true
+  }
   if (rest.length < 2) return { kind: 'skip', reason: 'не указано действие (DIRECT / PROXY / REJECT)' }
   const actionRaw = rest.pop() as string
   const value = rest.join(',')
@@ -231,7 +240,16 @@ export function parseClashLine(raw: string): LineResult {
   if (!val.ok) return { kind: 'skip', reason: val.reason }
   const act = mapAction(actionRaw)
   if (!act.ok) return { kind: 'skip', reason: act.reason }
-  return { kind: 'rule', rule: { enabled: true, conditionType: cond, value: val.value, action: act.action } }
+  return {
+    kind: 'rule',
+    rule: {
+      enabled: true,
+      conditionType: cond,
+      value: val.value,
+      action: act.action,
+      ...(act.action === CLASH_ZAPRET && noFallback ? { zapretFallback: false } : {})
+    }
+  }
 }
 
 // ---- YAML subset ------------------------------------------------------------
@@ -424,7 +442,8 @@ export function applyImport(
 // ---- export ------------------------------------------------------------------------
 
 function clashAction(action: string): string {
-  if (action === 'DIRECT' || action === 'REJECT' || action === 'PROXY') return action
+  if (action === 'DIRECT' || action === 'REJECT' || action === 'PROXY' || action === CLASH_ZAPRET)
+    return action
   if (action === 'BLOCK') return 'REJECT'
   return action.replace(/,/g, ' ') // a server name — Clash would read it as a group name
 }
@@ -444,7 +463,8 @@ export function toClashLines(config: RulesConfig): string {
     const type = TO_CLASH[r.conditionType]
     if (!type) continue
     const extra = r.conditionType === 'IPCIDR' && r.value.includes(':') ? 'IP-CIDR6' : type
-    const line = `${extra},${clashValue(r)},${clashAction(r.action)}`
+    const opt = r.action === CLASH_ZAPRET && r.zapretFallback === false ? `,${NO_FALLBACK}` : ''
+    const line = `${extra},${clashValue(r)},${clashAction(r.action)}${opt}`
     lines.push(r.enabled ? line : `# ${line}`)
   }
   if (config.defaultBehavior === 'auto') {

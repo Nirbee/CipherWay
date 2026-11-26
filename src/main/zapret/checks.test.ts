@@ -1,6 +1,6 @@
 import { createServer, type Server, type Socket } from 'node:net'
 import { afterAll, describe, expect, it } from 'vitest'
-import { mapLimit, networkId, parseArpMac, probeTls } from './checks'
+import { isServerAlert, mapLimit, networkId, parseArpMac, parseDohAnswer, probeTls } from './checks'
 import { parseDefaultRoutes, pickPhysicalSource } from '../devversion/probes'
 
 describe('network id', () => {
@@ -86,5 +86,29 @@ describe('mapLimit', () => {
     })
     expect(out).toEqual([50, 10, 40, 20, 30])
     expect(peak).toBe(2)
+  })
+})
+
+describe('own domains (0.7.2): a TLS alert is an answer; «no address» is not a failure', () => {
+  it('server alerts count, resets / timeouts do not', () => {
+    expect(isServerAlert('ERR_SSL_TLSV1_ALERT_INTERNAL_ERROR')).toBe(true)
+    expect(isServerAlert('ERR_SSL_SSLV3_ALERT_HANDSHAKE_FAILURE')).toBe(true)
+    expect(isServerAlert('ERR_SSL_TLSV1_UNRECOGNIZED_NAME')).toBe(true)
+    expect(isServerAlert('ECONNRESET')).toBe(false)
+    expect(isServerAlert('ETIMEDOUT')).toBe(false)
+  })
+
+  it('DoH: «answered, no address» apart from «no answer»', () => {
+    expect(parseDohAnswer({ Status: 0, Answer: [{ type: 1, data: '203.0.113.5' }] }, 1)).toEqual({
+      ips: ['203.0.113.5'],
+      answered: true
+    })
+    expect(parseDohAnswer({ Status: 3 }, 1)).toEqual({ ips: [], answered: true })
+    expect(parseDohAnswer({ Status: 0, Answer: [{ type: 28, data: '2001:db8::5' }] }, 28)).toEqual({
+      ips: ['2001:db8::5'],
+      answered: true
+    })
+    expect(parseDohAnswer(null, 1)).toEqual({ ips: [], answered: false })
+    expect(parseDohAnswer({ error: 'x' }, 1)).toEqual({ ips: [], answered: false })
   })
 })

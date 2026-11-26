@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
 import { DPI_EXE, DPI_FAKE_QUIC, DPI_FAKE_TLS } from '../core/coreNames'
-import { STRATEGIES, strategyById, tokenProblems, winwsTokens } from './strategies'
+import { STRATEGIES, strategyById, tokenProblems, userIpTokens, winwsTokens } from './strategies'
 import { SERVICE_DEFS } from './lists'
 
 describe('strategy table', () => {
@@ -28,6 +28,7 @@ describe('strategy table', () => {
         expect(tokenProblems(t)).toEqual([])
         expect(t.join(' ')).not.toMatch(/["'\\/]/)
       }
+      expect(tokenProblems(userIpTokens(s))).toEqual([])
     }
     expect(tokenProblems(['--x="a b"', '--hostlist=C:\\x', '--a=%EVIL%', '-x'])).toHaveLength(4)
   })
@@ -45,6 +46,14 @@ describe('strategy table', () => {
     const at = on.indexOf('--filter-l7=discord,stun')
     expect(on.slice(at, on.indexOf('--new', at))).toContain('--ipset=%DISCORD_IPS%')
     expect(off[0]).toBe('--wf-tcp=80,443')
+    // the user's IP profiles: by address only, our servers skipped too
+    const ip = userIpTokens(s)
+    expect(ip[0]).toBe('--new')
+    expect(ip.filter((x) => x === '--ipset=%USER_IPS%')).toHaveLength(3)
+    expect(ip.filter((x) => x === '--ipset-exclude=%EXCL%')).toHaveLength(3)
+    expect(ip.join(' ')).not.toContain('%HOSTS%')
+    // UltimateFix v9.2: IP ID 0 in fake + multisplit (ts)
+    expect(strategyById('fake-multisplit-ts')?.tls).toContain('--ip-id=zero')
     expect(on[0]).toBe('--wf-tcp=80,443,2053,2083,2087,2096,8443')
   })
 })
@@ -63,6 +72,8 @@ describe.skipIf(!canRun)('cipherway-dpi.exe --dry-run accepts every strategy', (
   const hosts = join(tmp, 'hosts.txt')
   const excl = join(tmp, 'exclude.txt')
   const voice = join(tmp, 'discord-ips.txt')
+  const userIps = join(tmp, 'ips.txt')
+  writeFileSync(userIps, '198.51.100.0/24\n2001:db8:1::/48\n')
   writeFileSync(hosts, 'youtube.com\ngooglevideo.com\nexample.org\n')
   writeFileSync(excl, '10.0.0.0/8\n203.0.113.7/32\n2001:db8::/32\n')
   writeFileSync(voice, SERVICE_DEFS.discord.cidrs.join('\n') + '\n')
@@ -79,6 +90,7 @@ describe.skipIf(!canRun)('cipherway-dpi.exe --dry-run accepts every strategy', (
           .replace('%HOSTS%', hosts)
           .replace('%EXCL%', excl)
           .replace('%DISCORD_IPS%', voice)
+          .replace('%USER_IPS%', userIps)
       )
     ]
     try {
@@ -98,8 +110,8 @@ describe.skipIf(!canRun)('cipherway-dpi.exe --dry-run accepts every strategy', (
 
   for (const s of STRATEGIES) {
     for (const discord of [false, true]) {
-      it(`${s.id}${discord ? ' + Discord' : ''}`, () => {
-        const r = dryRun(winwsTokens(s, discord))
+      it(`${s.id}${discord ? ' + Discord + IP rules' : ''}`, () => {
+        const r = dryRun([...winwsTokens(s, discord), ...(discord ? userIpTokens(s) : [])])
         expect(r.out).toMatch(/command line parameters verified/)
         expect(r.code).toBe(0)
       })

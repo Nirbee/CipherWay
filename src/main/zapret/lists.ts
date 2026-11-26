@@ -20,7 +20,19 @@ export interface CheckTarget {
   path?: string
   /** a YouTube video node (found at check time, videoNodes.ts) */
   video?: boolean
+  /** 0.7.2: checked over QUIC (one Initial to UDP 443), not TLS over TCP */
+  quic?: boolean
+  /** 0.7.2: the route key it decides (routing.ts; default = the item's key) */
+  route?: string
+  /**
+   * an own domain: a finished TLS handshake — or a TLS alert from the server —
+   * is «reachable» (a bare root without a web server still answers TLS)
+   */
+  tlsOnly?: boolean
 }
+
+/** the domains of YouTube's video nodes (their own route key youtube:video / :quic) */
+export const YOUTUBE_VIDEO_DOMAINS: readonly string[] = ['googlevideo.com']
 
 export interface ServiceDef {
   id: ZapretServiceId
@@ -57,8 +69,8 @@ const YOUTUBE: ServiceDef = {
   targets: [
     { host: 'www.youtube.com', http: true },
     { host: 'i.ytimg.com', http: true },
-    // the video servers: DPI throttles by the SNI *.googlevideo.com
-    { host: 'redirector.googlevideo.com', http: true }
+    // the video servers: DPI throttles by the SNI *.googlevideo.com (+ a real node, videoNodes.ts)
+    { host: 'redirector.googlevideo.com', http: true, route: 'youtube:video' }
   ]
 }
 
@@ -434,5 +446,5 @@ export const SERVICE_DEFS: Record<ZapretServiceId, ServiceDef> = {
 
 /** An own domain is checked by a TLS handshake with it (no HTTP request). */
 export function customTargets(domain: string): CheckTarget[] {
-  return [{ host: domain, http: false }]
+  return [{ host: domain, http: false, tlsOnly: true }]
 }

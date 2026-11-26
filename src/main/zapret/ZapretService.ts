@@ -1,9 +1,15 @@
-import type { TunServiceInfo } from '@shared/types'
+import { BlockList, isIP } from 'node:net'
+import type { RoutingRule, TunServiceInfo } from '@shared/types'
 import {
+  ZAPRET_ACTION,
+  ZAPRET_CUSTOM_MAX,
   ZAPRET_SERVICES,
   addZapretDomain,
+  zapretRuleTarget,
   type ZapretItem,
   type ZapretPhase,
+  type ZapretRuleState,
+  type ZapretRuleTarget,
   type ZapretServiceId,
   type ZapretSettings,
   type ZapretView
@@ -11,7 +17,17 @@ import {
 import { NO_ZAPRET, type ZapretRouting } from '../rules/compile'
 import { customTargets, SERVICE_DEFS, type CheckTarget } from './lists'
 import { STRATEGIES, strategyById } from './strategies'
-import { customKey, itemKeys, zapretRouting } from './routing'
+import {
+  customKey,
+  itemKeys,
+  routeKeyOf,
+  routeKeys,
+  routeKeysOf,
+  YT_PAGES,
+  YT_QUIC,
+  YT_VIDEO,
+  zapretRouting
+} from './routing'
 import type { DirectPath, DohServer, NetworkInfo, TargetResult } from './checks'
 import { DpiStartError, type DpiDaemonLike, type DpiRequest } from './DpiDaemon'
 
@@ -42,6 +58,11 @@ export interface StrategyMemo {
   v?: number
   /** the items this strategy opened when it was picked */
   ok?: string[]
+  /**
+   * 0.7.2: the last strategies that opened YouTube's video on this network
+   * (newest first, ≤ 3) — a pick checks them first and prefers them
+   */
+  good?: { id: string; at: number; ok: string[] }[]
 }
 
 const MEMO_VERSION = 2
@@ -75,6 +96,12 @@ export interface ZapretDeps {
   videoNodes?: (doh: DohServer, path: DirectPath) => Promise<string[]>
   /** our VPN servers' addresses (never touched by zapret) */
   excludeIps: () => Promise<string[]>
+  /** the subscription has servers (their addresses must be known before IP rules go to zapret) */
+  hasServers?: () => boolean
+  /** the user's routing rules (their «Напрямую + zapret» ones, 0.7.2) */
+  rules?: () => readonly RoutingRule[]
+  /** the way of a «Напрямую + zapret» rule changed: the rules go to the core again */
+  rulesChanged?: () => void
   /** names an own domain may not be (the subscription host, the servers) */
   reserved: () => string[]
   /** puts the sets into the running core (no-op while disconnected) */
@@ -102,8 +129,18 @@ const NOTHING_RETRY_MS = 6 * 60 * 60_000
 /** own domains checked during a pick (all of them in the regular checks) */
 const PICK_CUSTOM_MAX = 8
 const MEMORY_MAX = 30
-/** a target of a pick gets this long (failing strategies are many, the budget ~2 min) */
+/** a target of a pick gets this long (failing strategies are many, the budget ~3 min) */
 const PICK_TARGET_MS = 5000
+/** a whole pick, re-checks of the best included (0.7.2) */
+const PICK_BUDGET_MS = 170_000
+/** the first pass of a pick leaves this much for re-checking the best ones */
+const CONFIRM_RESERVE_MS = 40_000
+/** this many of the best strategies of the first pass are checked once more */
+const CONFIRM_TOP = 3
+/** a strategy that opened YouTube's video here is tried first this long */
+const GOOD_TTL_MS = 7 * 24 * 60 * 60_000
+/** own domains / «Напрямую + zapret» rules given to zapret at most */
+const RULE_CHECK_MAX = 50
 /** the video nodes found are reused this long (per network) */
 const NODES_TTL_MS = 30 * 60_000
 
@@ -120,6 +157,13 @@ export const LIVE_STALL_MS = 5000
  */
 export const LIVE_STALLS = 3
 export const LIVE_WINDOW_MS = 60_000
+/**
+ * 0.7.2: connections closed by OUR reconnection (new rules, the sets changed,
+ * another server) time out right after it — for this long after such a moment
+ * nothing counts as «no answer» (the log of 0.7.1: «переподключено
+ * соединений: 1» and the fallback in the same second)
+ */
+export const LIVE_QUIET_MS = 15_000
 /** re-checked this long after such a fallback (not at once: no flip-flop) */
 export const LIVE_RECHECK_MS = 3 * 60_000
 /** a second fallback of the same item within this time keeps it in the VPN this long */
@@ -197,13 +241,71 @@ export interface LiveConnection {
   rule?: string
   start?: string
   download?: number
-  metadata?: { host?: string; network?: string }
+  metadata?: { host?: string; network?: string; destinationIP?: string }
 }
 
 interface ItemState {
   state: ZapretItem['state']
   detail?: string
+  note?: string
 }
+
+/** a probe's verdict for one route key */
+interface KeyResult {
+  ok: boolean
+  detail?: string
+  note?: string
+  /** an own domain without an address (its subdomains decide) */
+  noaddr?: boolean
+}
+
+/** a «Напрямую + zapret» rule zapret can take */
+interface ZRule {
+  key: string
+  rule: RoutingRule
+  target: Extract<ZapretRuleTarget, { ok: true }>
+}
+
+const ruleKey = (id: string): string => `r:${id}`
+
+/**
+ * An address / range of a rule as node:net sees it: canonical (the form
+ * zapretCidr gave, re-checked here), its BlockList; null = not sent anywhere.
+ */
+export function ipRange(v: string): { value: string; list: BlockList } | null {
+  const [addr, mask] = v.split('/')
+  const fam = isIP(addr)
+  if (fam === 0) return null
+  const type = fam === 6 ? 'ipv6' : 'ipv4'
+  const bits = mask === undefined ? (fam === 6 ? 128 : 32) : Number(mask)
+  if (!/^[0-9]{1,3}$/.test(String(bits))) return null
+  // leading zeros / another spelling: not the canonical form → not sent
+  if (fam === 4 && addr.split('.').some((x) => x.length > 1 && x.startsWith('0'))) return null
+  try {
+    const list = new BlockList()
+    list.addSubnet(addr, bits, type)
+    return { value: v, list }
+  } catch {
+    return null
+  }
+}
+
+/** a pick's score of one strategy: more is better, in this order */
+function score(ok: ReadonlySet<string>, sample: string[]): number[] {
+  const usable = sample.filter((k) =>
+    k === 'youtube' ? ok.has(YT_PAGES) && (ok.has(YT_VIDEO) || ok.has(YT_QUIC)) : ok.has(k)
+  ).length
+  const video = (ok.has(YT_VIDEO) ? 1 : 0) + (ok.has(YT_QUIC) ? 1 : 0)
+  return [usable, video, ok.size]
+}
+
+function better(a: number[], b: number[]): boolean {
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return a[i] > b[i]
+  return false
+}
+
+const detailOf = (s: ItemState | undefined): { detail?: string } =>
+  s?.detail ? { detail: s.detail } : {}
 
 export class ZapretService {
   private phase: ZapretPhase = 'off'
@@ -238,6 +340,14 @@ export class ZapretService {
   private lastLive = new Map<string, number>()
   private dnsFails: number[] = []
   private dnsHoldUntil = 0
+  /** live fallback: nothing counts before this (our own reconnection, LIVE_QUIET_MS) */
+  private quietUntil = 0
+  /** the ways of the «Напрямую + zapret» rules last given to the core */
+  private lastRuleWays = ''
+  /** the «Напрямую + zapret» rules zapret last got (rulesUpdated) */
+  private lastRulesSig = JSON.stringify([])
+  /** which video node a check / a try of a pick uses (alternated) */
+  private nodeTurn = 0
 
   constructor(private d: ZapretDeps) {}
 
@@ -274,13 +384,133 @@ export class ZapretService {
       ...(this.picking ? { picking: this.picking } : {}),
       ...(this.checkedAt ? { checkedAt: this.checkedAt } : {}),
       ...(this.error ? { error: this.error } : {}),
-      ...(this.warning ? { warning: this.warning } : {})
+      ...(this.warning ? { warning: this.warning } : {}),
+      ...(this.zrules().length ? { rules: this.ruleStates() } : {})
     }
   }
 
+  /** an item of the screen: YouTube is three route keys (pages, video TCP, video QUIC) */
   private itemState(key: string): ItemState {
     if (!this.active) return { state: 'idle' }
-    return this.items.get(key) ?? { state: 'checking' }
+    if (key !== 'youtube') return this.items.get(key) ?? { state: 'checking' }
+    const [p, v, q] = [YT_PAGES, YT_VIDEO, YT_QUIC].map((k) => this.items.get(k))
+    if (!p || !v || !q) return { state: 'checking' }
+    const P = this.direct.has(YT_PAGES)
+    const V = this.direct.has(YT_VIDEO)
+    const Q = this.direct.has(YT_QUIC)
+    if (P && (V || Q)) {
+      return { state: 'direct', ...(V && Q ? {} : { note: V ? 'видео по TCP' : 'видео по QUIC' }) }
+    }
+    if (P) return { state: 'partial', note: 'сайт напрямую, видео через VPN', ...detailOf(v) }
+    if (V || Q) {
+      return {
+        state: 'partial',
+        note: `видео напрямую${V ? '' : ' по QUIC'}, остальное через VPN`,
+        ...detailOf(p)
+      }
+    }
+    return { state: 'vpn', ...detailOf(p.detail ? p : v.detail ? v : q) }
+  }
+
+  /** the «Напрямую + zapret» rules zapret can take (enabled, a known condition) */
+  private zrules(): ZRule[] {
+    const out: ZRule[] = []
+    for (const rule of this.d.rules?.() ?? []) {
+      if (!rule.enabled || rule.action !== ZAPRET_ACTION) continue
+      const target = zapretRuleTarget(rule)
+      if (target.ok) out.push({ key: ruleKey(rule.id), rule, target })
+      if (out.length >= RULE_CHECK_MAX) break
+    }
+    return out
+  }
+
+  /** the state of every «Напрямую + zapret» rule for the rule list */
+  private ruleStates(): Record<string, ZapretRuleState> {
+    const out: Record<string, ZapretRuleState> = {}
+    const s = this.d.getSettings()
+    const on = s.enabled && this.active && this.dpiUp
+    for (const rule of this.d.rules?.() ?? []) {
+      if (!rule.enabled || rule.action !== ZAPRET_ACTION) continue
+      const target = zapretRuleTarget(rule)
+      if (!target.ok) {
+        out[rule.id] = { state: 'plain', detail: target.reason }
+        continue
+      }
+      if (!s.enabled) {
+        out[rule.id] = { state: 'plain', detail: 'zapret выключен в «Ускорении без VPN»' }
+        continue
+      }
+      if (!this.active) {
+        out[rule.id] = { state: 'plain', detail: 'zapret включится вместе с VPN' }
+        continue
+      }
+      const key = ruleKey(rule.id)
+      const it = this.items.get(key)
+      if (this.direct.has(key)) {
+        out[rule.id] = on
+          ? { state: 'direct', ...(it?.note ? { note: it.note } : {}) }
+          : { state: 'plain', detail: 'zapret сейчас не работает — напрямую без него' }
+      } else if (!it) out[rule.id] = { state: 'checking' }
+      else if (rule.zapretFallback === false) {
+        out[rule.id] = { state: 'plain', detail: it.detail ?? 'напрямую не открылся' }
+      } else out[rule.id] = { state: 'vpn', ...(it.detail ? { detail: it.detail } : {}) }
+    }
+    return out
+  }
+
+  /**
+   * The user's rules with «Напрямую + zapret» resolved for the core: «Через
+   * VPN» while it does not open directly (and the fallback is on), else
+   * «Напрямую» — zapret off / broken / the condition not for zapret included.
+   */
+  effectiveRules(rules: readonly RoutingRule[]): RoutingRule[] {
+    return rules.map((r) => {
+      if (r.action !== ZAPRET_ACTION) return r
+      return { ...r, action: this.ruleToVpn(r) ? 'PROXY' : 'DIRECT' }
+    })
+  }
+
+  private ruleToVpn(r: RoutingRule): boolean {
+    if (!this.active || r.zapretFallback === false || !zapretRuleTarget(r).ok) return false
+    const key = ruleKey(r.id)
+    return this.items.has(key) && !this.direct.has(key)
+  }
+
+  /** the rules' ways changed → the core gets them again (handlers.ts) */
+  private syncRules(): void {
+    // only the rules sent through the VPN differ from what the core has (the
+    // others are «Напрямую» there anyway; edits of the list apply by themselves)
+    const ways = (this.d.rules?.() ?? [])
+      .filter((r) => r.action === ZAPRET_ACTION && this.ruleToVpn(r))
+      .map((r) => r.id)
+      .join(',')
+    if (ways === this.lastRuleWays) return
+    this.lastRuleWays = ways
+    this.noteReconnect()
+    this.d.rulesChanged?.()
+  }
+
+  /** the user's rules changed (handlers.ts): their zapret part is checked again */
+  async rulesUpdated(): Promise<void> {
+    // only when the «Напрямую + zapret» rules themselves changed (winws gets new lists)
+    const sig = JSON.stringify(
+      this.zrules().map((z) => [z.key, z.target.value, z.rule.zapretFallback !== false])
+    )
+    if (sig === this.lastRulesSig) {
+      this.publish()
+      return
+    }
+    this.lastRulesSig = sig
+    await this.listsChanged()
+  }
+
+  /**
+   * Our own reconnection (rules applied, another server, the mode): the
+   * connections cut by it are not «no answer» for LIVE_QUIET_MS.
+   */
+  noteReconnect(): void {
+    this.quietUntil = this.now() + LIVE_QUIET_MS
+    this.stalls.clear()
   }
 
   private publish(): void {
@@ -462,6 +692,7 @@ export class ZapretService {
       this.lastRouting = JSON.stringify(NO_ZAPRET)
       await this.d.applyRouting(NO_ZAPRET).catch(() => undefined)
     }
+    this.syncRules()
     this.publish()
   }
 
@@ -538,8 +769,9 @@ export class ZapretService {
       return
     }
     const gen = this.gen
-    const keys = new Set(itemKeys(this.d.getSettings()))
+    const keys = new Set(this.checkKeys())
     for (const k of [...this.direct]) if (!keys.has(k)) this.direct.delete(k)
+    for (const k of [...this.items.keys()]) if (!keys.has(k)) this.items.delete(k)
     await this.route()
     this.publish()
     await this.serial(async () => {
@@ -557,11 +789,36 @@ export class ZapretService {
 
   private async request(strategy: string): Promise<DpiRequest> {
     const s = this.d.getSettings()
+    const services = new Set<ZapretServiceId>(s.services)
+    const hosts = [...s.custom]
+    let ips: string[] = []
+    // the «Напрямую + zapret» rules: their domains into the hostlist, addresses into an ipset
+    for (const z of this.zrules()) {
+      if (z.target.kind === 'service') services.add(z.target.value)
+      else if (z.target.kind === 'domain') {
+        if (!hosts.includes(z.target.value) && hosts.length < ZAPRET_CUSTOM_MAX)
+          hosts.push(z.target.value)
+      } else {
+        // one bad rule never spoils the list: it is just left out
+        const r = ipRange(z.target.value)
+        if (r && !ips.includes(r.value) && ips.length < 512) ips.push(r.value)
+      }
+    }
+    const exclude = await this.d.excludeIps().then(
+      (x) => x,
+      () => null
+    )
+    // our servers' addresses unknown: an IP rule could cover one of them — no IP rules then
+    if (ips.length && (exclude === null || (exclude.length === 0 && this.d.hasServers?.()))) {
+      this.d.log('warn', 'zapret: адреса серверов VPN неизвестны — правила по IP пока без zapret')
+      ips = []
+    }
     return {
       strategy,
-      services: [...s.services],
-      hosts: [...s.custom],
-      exclude: (await this.d.excludeIps().catch(() => [] as string[])).slice(0, 512)
+      services: ZAPRET_SERVICES.map((x) => x.id).filter((id) => services.has(id)),
+      hosts,
+      exclude: (exclude ?? []).slice(0, 512),
+      ...(ips.length ? { ips } : {})
     }
   }
 
@@ -628,14 +885,33 @@ export class ZapretService {
     return this.d.vpn().tun && this.source ? { localAddress: this.source } : {}
   }
 
+  /** every key a check decides: the route keys of the items + the «Напрямую + zapret» rules */
+  private checkKeys(): string[] {
+    return [...routeKeys(this.d.getSettings()), ...this.zrules().map((z) => z.key)]
+  }
+
   private targetsOf(key: string): CheckTarget[] {
     if (key.startsWith('d:')) return customTargets(key.slice(2))
+    if (key.startsWith('r:')) {
+      const z = this.zrules().find((x) => x.key === key)
+      if (!z) return []
+      if (z.target.kind === 'domain') return customTargets(z.target.value)
+      if (z.target.kind === 'service') {
+        return SERVICE_DEFS[z.target.value].targets.map((t) => ({ ...t, route: undefined }))
+      }
+      // an address: a TLS handshake without SNI; a range: nothing to aim at (live traffic decides)
+      const v = z.target.value
+      const single = !v.includes('/') || /\/(32|128)$/.test(v)
+      return single ? [{ host: v.split('/')[0], http: false, tlsOnly: true }] : []
+    }
+    if (key === YT_PAGES) return SERVICE_DEFS.youtube.targets.filter((t) => !t.route)
+    if (key === YT_VIDEO) return SERVICE_DEFS.youtube.targets.filter((t) => t.route === YT_VIDEO)
+    if (key === YT_QUIC) return []
     return [...(SERVICE_DEFS[key as ZapretServiceId]?.targets ?? [])]
   }
 
-  /** key → ok / the first failure, every target of every key (bounded in time) */
   /** the video nodes of this network (cached NODES_TTL_MS); null = no video check */
-  private async videoTargets(doh: DohServer): Promise<CheckTarget[] | null> {
+  private async videoHosts(doh: DohServer): Promise<string[] | null> {
     if (!this.d.videoNodes) return null
     const fresh =
       this.nodes && this.nodes.net === this.netId && this.now() - this.nodes.at < NODES_TTL_MS
@@ -645,29 +921,49 @@ export class ZapretService {
       if (list.length)
         this.d.log('info', `zapret: видеосерверы YouTube для проверки — ${list.join(', ')}`)
     }
-    return (this.nodes?.list ?? []).map((host) => ({
-      host,
-      http: true,
-      path: '/generate_204',
-      video: true
-    }))
+    return this.nodes?.list ?? []
   }
 
+  /**
+   * key → ok / the first failure, every target of every key (bounded in time).
+   * YouTube's video: `nodes` of the found ones (alternated by the caller) over
+   * TCP (TLS + GET /generate_204) and over QUIC (one Initial) — one passing
+   * node is enough; the redirector over TCP must open too.
+   */
   private async probe(
     keys: string[],
     doh: DohServer,
     budgetMs: number,
-    targetMs?: number
-  ): Promise<Map<string, { ok: boolean; detail?: string }>> {
+    targetMs?: number,
+    nodes = 2
+  ): Promise<Map<string, KeyResult>> {
     const path = this.path()
-    const out = new Map<string, { ok: boolean; detail?: string }>()
+    const out = new Map<string, KeyResult>()
     const jobs = keys.flatMap((key) => this.targetsOf(key).map((t) => ({ key, t })))
-    // YouTube = its pages AND a real video node (the video may be throttled alone)
+    const wantVideo = keys.includes(YT_VIDEO) || keys.includes(YT_QUIC)
     let noVideo = false
-    if (keys.includes('youtube')) {
-      const video = await this.videoTargets(doh)
-      if (video && video.length === 0) noVideo = true
-      for (const t of video ?? []) jobs.push({ key: 'youtube', t })
+    if (wantVideo) {
+      const all = await this.videoHosts(doh)
+      if (all === null) {
+        // no video search (tests): QUIC = the redirector
+        if (keys.includes(YT_QUIC))
+          jobs.push({ key: YT_QUIC, t: { host: 'redirector.googlevideo.com', http: false, quic: true } })
+      } else if (all.length === 0) noVideo = true
+      else {
+        const n = Math.min(nodes, all.length)
+        const pick = Array.from({ length: n }, (_, i) => all[(this.nodeTurn + i) % all.length])
+        this.nodeTurn = (this.nodeTurn + 1) % all.length
+        for (const host of pick) {
+          if (keys.includes(YT_VIDEO)) {
+            jobs.push({
+              key: YT_VIDEO,
+              t: { host, http: true, path: '/generate_204', video: true }
+            })
+          }
+          if (keys.includes(YT_QUIC))
+            jobs.push({ key: YT_QUIC, t: { host, http: false, quic: true, video: true } })
+        }
+      }
     }
     const results: (TargetResult | null)[] = new Array(jobs.length).fill(null)
     let next = 0
@@ -677,8 +973,11 @@ export class ZapretService {
         const { key, t } = jobs[i]
         let r = await this.d.checkTarget(t, doh, path, targetMs)
         // an own domain without an address of its own: www.<domain>
-        if (!r.ok && r.error === 'dns' && key.startsWith('d:') && !t.host.startsWith('www.')) {
-          r = await this.d.checkTarget({ ...t, host: `www.${t.host}` }, doh, path, targetMs)
+        const own = key.startsWith('d:') || key.startsWith('r:')
+        if (!r.ok && own && (r.error === 'dns' || r.error === 'noaddr') && !t.host.startsWith('www.')) {
+          const w = await this.d.checkTarget({ ...t, host: `www.${t.host}` }, doh, path, targetMs)
+          // www opens or fails for real: it decides; it has no address either: the first answer stays
+          if (w.ok || r.error === 'dns' || (w.error !== 'dns' && w.error !== 'noaddr')) r = w
         }
         results[i] = r
       }
@@ -688,36 +987,82 @@ export class ZapretService {
       budgetMs,
       undefined
     )
-    for (const key of keys) out.set(key, { ok: true })
+    for (const key of keys) {
+      // nothing to aim at (an address range of a rule): direct, live traffic decides
+      const none = key.startsWith('r:') && !jobs.some((j) => j.key === key)
+      out.set(key, none ? { ok: true, note: 'проверяется по трафику' } : { ok: true })
+    }
+    const nodeOk = new Map<string, boolean>()
+    const nodeFail = new Map<string, string>()
     jobs.forEach(({ key, t }, i) => {
       const r = results[i] ?? { host: t.host, ok: false, error: 'timeout' }
+      if (t.video) {
+        // a video node: any one of them is enough
+        if (r.ok) nodeOk.set(key, true)
+        else if (!nodeFail.has(key)) {
+          const how = t.quic ? 'видео по QUIC не открывается напрямую' : 'видео не открывается напрямую'
+          nodeFail.set(key, `${how} — ${failureText(r)}`)
+        }
+        return
+      }
       const cur = out.get(key)
+      if (r.ok && r.unconfirmed && cur?.ok && !cur.note) {
+        out.set(key, { ok: true, note: 'сертификат не подтвердился — решает живой трафик' })
+        return
+      }
+      if (r.error === 'noaddr' && cur?.ok) {
+        out.set(key, { ok: true, noaddr: true, note: 'нет адреса — проверяется по поддоменам' })
+        return
+      }
       if (!r.ok && cur?.ok) {
         out.set(key, {
           ok: false,
-          detail: t.video ? `видео не открывается напрямую — ${failureText(r)}` : failureText(r)
+          detail: t.quic ? `QUIC: ${failureText(r)}` : failureText(r)
         })
       }
     })
-    if (noVideo && out.get('youtube')?.ok) {
-      out.set('youtube', {
-        ok: false,
-        detail: 'не найден видеосервер YouTube — видео не проверить'
-      })
+    for (const [key, why] of nodeFail) {
+      if (!nodeOk.get(key) && out.get(key)?.ok) out.set(key, { ok: false, detail: why })
+    }
+    if (noVideo) {
+      for (const k of [YT_VIDEO, YT_QUIC]) {
+        if (keys.includes(k) && out.get(k)?.ok) {
+          out.set(k, { ok: false, detail: 'не найден видеосервер YouTube — видео не проверить' })
+        }
+      }
+    }
+    // an own domain without an address: its listed subdomains decide (none listed = direct)
+    for (const [key, r] of out) {
+      if (!r.noaddr) continue
+      const dom = key.slice(2)
+      const subs = [...out].filter(
+        ([k]) => (k.startsWith('d:') || k.startsWith('r:')) && k !== key && this.domainOf(k)?.endsWith(`.${dom}`)
+      )
+      if (subs.length && !subs.some(([, x]) => x.ok && !x.noaddr)) {
+        out.set(key, { ok: false, detail: `${dom}: нет адреса, а поддомены не открываются` })
+      }
     }
     return out
   }
 
+  /** the domain of an own-domain / domain-rule key */
+  private domainOf(key: string): string | null {
+    if (key.startsWith('d:')) return key.slice(2)
+    const z = this.zrules().find((x) => x.key === key)
+    return z?.target.kind === 'domain' ? z.target.value : null
+  }
+
   /** The direct check of every item → the sets; `auto`: a broken strategy is re-picked. */
-  private async check(gen: number, auto: boolean): Promise<void> {
+  private async check(gen: number, auto: boolean, afterPick = false): Promise<void> {
     if (gen !== this.gen) return
-    const keys = itemKeys(this.d.getSettings())
+    const keys = this.checkKeys()
     this.checking = true
     this.publish()
     try {
       const doh = await this.d.pickDoh(this.path()).catch(() => null)
       if (gen !== this.gen) return
-      const before = new Set(this.direct)
+      // after a pick nothing «stopped» opening: the strategy is new
+      const before = afterPick ? new Set<string>() : new Set(this.direct)
       // after the core reported the DoH failing, keep the other one for a while
       if (doh && this.now() >= this.dnsHoldUntil) this.dns = doh
       const res = doh
@@ -736,6 +1081,11 @@ export class ZapretService {
       const lost = [...before].filter((k) => keys.includes(k) && !this.direct.has(k))
       if (lost.length)
         this.d.log('warn', `zapret: напрямую перестало открываться — ${lost.join(', ')}; через VPN`)
+      if (afterPick) {
+        const failed = keys.filter((k) => !this.direct.has(k))
+        if (failed.length)
+          this.d.log('info', `zapret: напрямую не открылся — ${failed.join(', ')}; через VPN`)
+      }
       // the strategy broke: an item it opened when it was picked (or was open a moment ago) fails
       const memo = this.netId ? this.d.getMemory()[this.netId] : undefined
       const broken = keys.some(
@@ -754,7 +1104,7 @@ export class ZapretService {
     }
   }
 
-  private setResults(keys: string[], res: Map<string, { ok: boolean; detail?: string }>): void {
+  private setResults(keys: string[], res: Map<string, KeyResult>): void {
     this.direct.clear()
     for (const key of keys) {
       const r = res.get(key)
@@ -767,7 +1117,7 @@ export class ZapretService {
         })
       } else if (r?.ok) {
         this.direct.add(key)
-        this.items.set(key, { state: 'direct' })
+        this.items.set(key, { state: 'direct', ...(r.note ? { note: r.note } : {}) })
       } else {
         this.items.set(key, { state: 'vpn', ...(r?.detail ? { detail: r.detail } : {}) })
       }
@@ -784,10 +1134,13 @@ export class ZapretService {
 
   /** the sets into the core, only when they changed */
   private async route(): Promise<void> {
+    this.syncRules()
     const r = zapretRouting(this.d.getSettings(), this.direct, this.dns)
     const text = JSON.stringify(r)
     if (text === this.lastRouting) return
     this.lastRouting = text
+    // the connections that change their way are closed: not «no answer»
+    this.noteReconnect()
     await this.d.applyRouting(r).catch((err: unknown) => {
       this.d.log(
         'warn',
@@ -806,34 +1159,51 @@ export class ZapretService {
 
   // --- live traffic (0.7.1) ---------------------------------------------------------
 
-  /** which switched-on item a host belongs to (null = none) */
-  private keyOfHost(host: string): string | null {
-    const h = host.toLowerCase()
-    const under = (d: string): boolean => h === d || h.endsWith(`.${d}`)
-    const s = this.d.getSettings()
-    for (const id of s.services) {
-      if ((SERVICE_DEFS[id]?.domains ?? []).some(under)) return id
+  /** which route key / rule a connection belongs to (null = none of ours) */
+  private keyOfConn(c: LiveConnection): string | null {
+    const rule = c.rule ?? ''
+    const host = (c.metadata?.host ?? '').toLowerCase()
+    const net = c.metadata?.network ?? 'tcp'
+    if (/cw-z-d\b/.test(rule)) return routeKeyOf(this.d.getSettings(), host, net)
+    // a «Напрямую + zapret» rule goes through a direct slot of the user's rules
+    if (!/cw-\d+-d\b/.test(rule)) return null
+    const ip = c.metadata?.destinationIP ?? ''
+    let best: { key: string; len: number } | null = null
+    for (const z of this.zrules()) {
+      const v = z.target.value
+      if (z.target.kind === 'domain' && host && (host === v || host.endsWith(`.${v}`))) {
+        if (!best || v.length > best.len) best = { key: z.key, len: v.length }
+      } else if (z.target.kind === 'ip' && ip && isIP(ip)) {
+        const r = ipRange(v)
+        if (r?.list.check(ip, isIP(ip) === 6 ? 'ipv6' : 'ipv4')) best ??= { key: z.key, len: 0 }
+      }
     }
-    for (const d of s.custom) if (under(d)) return customKey(d)
-    return null
+    return best?.key ?? null
   }
 
   /**
    * Every /connections snapshot of the core (once a second): a direct
-   * connection of a zapret item that got nothing back for LIVE_STALL_MS is
-   * counted; LIVE_STALLS of them within LIVE_WINDOW_MS → that item goes back
-   * through the VPN at once and is re-checked after LIVE_RECHECK_MS.
+   * connection of a zapret item (TCP or QUIC) that got nothing back for
+   * LIVE_STALL_MS is counted; LIVE_STALLS of them within LIVE_WINDOW_MS → that
+   * route key goes back through the VPN at once and is re-checked after
+   * LIVE_RECHECK_MS. Never right after our own reconnection (LIVE_QUIET_MS):
+   * those are cut by us, not by the DPI.
    */
   onConnections(raw: { connections?: LiveConnection[] | null }): void {
     if (!this.active || this.direct.size === 0) return
     const now = this.now()
+    if (now < this.quietUntil) return
     for (const c of raw.connections ?? []) {
-      if (!/cw-z-d\b/.test(c.rule ?? '')) continue
-      if ((c.metadata?.network ?? 'tcp') !== 'tcp' || (c.download ?? 0) > 0) continue
+      if ((c.download ?? 0) > 0) continue
       const start = c.start ? Date.parse(c.start) : NaN
       if (!Number.isFinite(start) || now - start < LIVE_STALL_MS) continue
-      const key = this.keyOfHost(c.metadata?.host ?? '')
+      // opened during our reconnection: its silence is ours
+      if (start < this.quietUntil) continue
+      const key = this.keyOfConn(c)
       if (!key || !this.direct.has(key)) continue
+      // a rule the user keeps direct whatever happens
+      if (key.startsWith('r:') && this.zrules().find((z) => z.key === key)?.rule.zapretFallback === false)
+        continue
       let m = this.stalls.get(key)
       if (!m) this.stalls.set(key, (m = new Map()))
       if (!m.has(c.id)) m.set(c.id, now)
@@ -894,31 +1264,81 @@ export class ZapretService {
 
   // --- the pick ------------------------------------------------------------------
 
+  /** the order of a pick: what worked here last (and recently opened the video) first */
+  private pickOrder(): string[] {
+    const memo = this.netId ? this.d.getMemory()[this.netId] : undefined
+    const known = [
+      ...(memo?.id ? [memo.id] : []),
+      ...(memo?.good ?? []).filter((g) => this.now() - g.at < GOOD_TTL_MS).map((g) => g.id)
+    ]
+    const ids = [...known, ...STRATEGIES.map((s) => s.id)].filter((id) => strategyById(id))
+    return [...new Set(ids)]
+  }
+
   /**
-   * Tries the strategies in order (≤ pickBudgetMs): the first that opens every
-   * item wins, else the one that opens the most; none → winws off, all via VPN.
+   * A pick (0.7.2, ≤ ~3 min): pass 1 tries the strategies — first the one
+   * that worked on this network last time and the ones that opened the video
+   * here — each with the next video node (DPI may «punish» one address); it
+   * stops at one that opens everything. Then the best CONFIRM_TOP are checked
+   * once more (another node): a strategy counts with what opened BOTH times.
+   * Ties: the one that opens the video node, then the one known here.
    */
   private async pick(gen: number, manual: boolean): Promise<void> {
     if (gen !== this.gen) return
     const settings = this.d.getSettings()
-    const keys = itemKeys(settings)
-    if (keys.length === 0) {
+    if (itemKeys(settings).length === 0 && this.zrules().length === 0) {
       this.phase = 'running'
       this.publish()
       return
     }
-    const sample = [
+    // what the pick looks at: the services, the first own domains, the first rules
+    const items = [
       ...settings.services,
-      ...settings.custom.slice(0, PICK_CUSTOM_MAX).map(customKey)
+      ...settings.custom.slice(0, PICK_CUSTOM_MAX).map(customKey),
+      ...this.zrules()
+        .slice(0, PICK_CUSTOM_MAX)
+        .map((z) => z.key)
     ]
+    const sample = items.flatMap(routeKeysOf)
+    const order = this.pickOrder()
+    const memo = this.netId ? this.d.getMemory()[this.netId] : undefined
+    const known = new Set([...(memo?.id ? [memo.id] : []), ...(memo?.good ?? []).map((g) => g.id)])
+    const total = order.length + CONFIRM_TOP
     this.phase = 'picking'
-    this.picking = { done: 0, total: STRATEGIES.length }
+    this.picking = { done: 0, total }
     this.error = undefined
     this.publish()
     this.d.log('info', `zapret: подбираем стратегию${manual ? ' (вручную)' : ''}…`)
-    const end = this.now() + (this.d.pickBudgetMs ?? 120_000)
+    const budget = this.d.pickBudgetMs ?? PICK_BUDGET_MS
+    const end = this.now() + budget
+    const firstEnd = end - Math.min(CONFIRM_RESERVE_MS, budget / 4)
+    const tried = new Map<string, Set<string>>()
     let best: { id: string; ok: Set<string> } | null = null
     let reason = ''
+    const full = (ok: Set<string>): boolean => score(ok, items)[0] === items.length
+    const rank = (a: { id: string; ok: Set<string> }, b: { id: string; ok: Set<string> } | null): boolean => {
+      if (!b) return true
+      const sa = score(a.ok, items)
+      const sb = score(b.ok, items)
+      if (better(sa, sb)) return true
+      if (better(sb, sa)) return false
+      return known.has(a.id) && !known.has(b.id)
+    }
+    const tryOne = async (id: string, doh: DohServer, until: number): Promise<Set<string> | null> => {
+      if (!(await this.runStrategy(gen, id))) return null
+      await sleep(this.d.settleMs ?? 1500)
+      const res = await this.probe(
+        sample,
+        doh,
+        Math.min(15_000, Math.max(1000, until - this.now())),
+        PICK_TARGET_MS,
+        1
+      )
+      if (gen !== this.gen) return null
+      this.picking = { done: (this.picking?.done ?? 0) + 1, total }
+      this.publish()
+      return new Set(sample.filter((k) => res.get(k)?.ok))
+    }
     try {
       const doh = await this.d.pickDoh(this.path()).catch(() => null)
       if (gen !== this.gen) return
@@ -926,28 +1346,42 @@ export class ZapretService {
         reason = 'DNS-серверы 8.8.8.8 и 1.1.1.1 не отвечают напрямую'
       } else {
         if (this.now() >= this.dnsHoldUntil) this.dns = doh
-        for (const s of STRATEGIES) {
+        // pass 1
+        for (const id of order) {
           if (gen !== this.gen) return
-          const left = end - this.now()
-          if (left < 3000) break
-          if (!(await this.runStrategy(gen, s.id))) {
+          if (firstEnd - this.now() < 3000) break
+          const ok = await tryOne(id, doh, firstEnd)
+          if (gen !== this.gen) return
+          if (!ok) {
             // another DPI bypass / the service: no strategy can be tried
             if (this.warning || this.error) break
             continue
           }
-          await sleep(this.d.settleMs ?? 1500)
-          const res = await this.probe(
-            sample,
-            doh,
-            Math.min(15_000, Math.max(1000, end - this.now())),
-            PICK_TARGET_MS
-          )
+          tried.set(id, ok)
+          if (full(ok)) break
+        }
+        // pass 2: the best ones once more; what opened both times counts
+        const top = [...tried]
+          .map(([id, ok]) => ({ id, ok }))
+          .filter((x) => x.ok.size > 0)
+          .sort((a, b) => (rank(a, b) ? -1 : rank(b, a) ? 1 : 0))
+          .slice(0, CONFIRM_TOP)
+        for (const c of top) {
           if (gen !== this.gen) return
-          const ok = new Set(sample.filter((k) => res.get(k)?.ok))
-          this.picking = { done: (this.picking?.done ?? 0) + 1, total: STRATEGIES.length }
-          this.publish()
-          if (!best || ok.size > best.ok.size) best = { id: s.id, ok }
-          if (ok.size === sample.length) break
+          if (end - this.now() < 3000) {
+            if (!best || rank(c, best)) best = c
+            continue
+          }
+          const again = await tryOne(c.id, doh, end)
+          if (gen !== this.gen) return
+          if (!again) continue
+          const both = { id: c.id, ok: new Set([...c.ok].filter((k) => again.has(k))) }
+          this.d.log(
+            'info',
+            `zapret: перепроверка «${strategyById(c.id)?.name}» — ${score(both.ok, items)[0]} из ${items.length}`
+          )
+          if (rank(both, best)) best = both
+          if (full(both.ok)) break
         }
       }
     } finally {
@@ -955,15 +1389,27 @@ export class ZapretService {
     }
     if (gen !== this.gen) return
     const memory = { ...this.d.getMemory() }
-    if (best && best.ok.size > 0) {
+    const usable = best ? score(best.ok, items)[0] : 0
+    if (best && usable > 0) {
       this.strategyId = best.id
       await this.runStrategy(gen, best.id)
       this.d.log(
         'info',
-        `zapret: выбрана стратегия «${strategyById(best.id)?.name}» — открывается ${best.ok.size} из ${sample.length}`
+        `zapret: выбрана стратегия «${strategyById(best.id)?.name}» — открывается ${usable} из ${items.length}`
       )
       if (this.netId) {
-        memory[this.netId] = { id: best.id, at: this.now(), v: MEMO_VERSION, ok: [...best.ok] }
+        const videoOk = best.ok.has(YT_VIDEO) || best.ok.has(YT_QUIC)
+        const good = [
+          ...(videoOk ? [{ id: best.id, at: this.now(), ok: [...best.ok] }] : []),
+          ...(memory[this.netId]?.good ?? []).filter((g) => g.id !== best.id)
+        ].slice(0, 3)
+        memory[this.netId] = {
+          id: best.id,
+          at: this.now(),
+          v: MEMO_VERSION,
+          ok: [...best.ok],
+          ...(good.length ? { good } : {})
+        }
       }
     } else {
       this.strategyId = null
@@ -973,14 +1419,21 @@ export class ZapretService {
         `zapret: ни одна стратегия не помогла${reason ? ` (${reason})` : ''} — всё через VPN`
       )
       // «nothing works here» only when strategies were really tried (not: no service / another bypass)
-      if (this.netId && !this.warning && !this.error)
-        memory[this.netId] = { id: null, at: this.now(), v: MEMO_VERSION }
+      if (this.netId && !this.warning && !this.error) {
+        const good = memory[this.netId]?.good
+        memory[this.netId] = {
+          id: null,
+          at: this.now(),
+          v: MEMO_VERSION,
+          ...(good?.length ? { good } : {})
+        }
+      }
     }
     if (this.netId) this.d.setMemory(trimMemory(memory))
     if (gen !== this.gen) return
     this.phase = 'running'
     // the real state of every item (own domains past the sample included)
-    await this.check(gen, false)
+    await this.check(gen, false, true)
   }
 }
 
