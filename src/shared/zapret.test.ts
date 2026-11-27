@@ -247,7 +247,6 @@ describe('0.7.2: the rule action «Напрямую + zapret»', () => {
     for (const [conditionType, re] of [
       ['GeoSite', /youtube и discord/],
       ['DomainKeyword', /Слово в домене/],
-      ['ProcessName', /не видит, какая программа/],
       ['GeoIP', /geoip/],
       ['DstPort', /По порту/]
     ] as const) {
@@ -255,6 +254,14 @@ describe('0.7.2: the rule action «Напрямую + zapret»', () => {
       expect(r.ok).toBe(false)
       if (!r.ok) expect(r.reason).toMatch(re)
     }
+    // 0.7.4: a program — its addresses on 80/443 go to zapret
+    expect(zapretRuleTarget({ conditionType: 'ProcessName', value: ' game.exe ' })).toEqual({
+      ok: true,
+      kind: 'process',
+      value: 'game.exe'
+    })
+    expect(zapretRuleTarget({ conditionType: 'ProcessPath', value: 'C:\\Games\\game.exe' }).ok).toBe(true)
+    expect(zapretRuleTarget({ conditionType: 'ProcessName', value: ' ' }).ok).toBe(false)
     expect(zapretCidr('10.0.0.0/33')).toBeNull()
     expect(zapretCidr('203.0.113.7')).toBe('203.0.113.7')
     expect(zapretRuleText({ state: 'direct' })).toBe('Напрямую + zapret ✓')

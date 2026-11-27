@@ -4,6 +4,7 @@ import type { RoutingRule, TunServiceInfo } from '@shared/types'
 import {
   ZAPRET_ACTION,
   ZAPRET_CUSTOM_MAX,
+  ZAPRET_PROCESS_NOTE,
   ZAPRET_SERVICES,
   addZapretDomain,
   zapretRuleTarget,
@@ -31,6 +32,16 @@ import {
 } from './routing'
 import type { DirectPath, DohServer, NetworkInfo, TargetResult } from './checks'
 import { DpiStartError, type DpiDaemonLike, type DpiRequest } from './DpiDaemon'
+import {
+  excluded,
+  excludeList,
+  LEARN_MAX,
+  processConnAddress,
+  ProcessIpLearner,
+  SEND_BATCH_MS,
+  SEND_GAP_MS,
+  type ProcConnection
+} from './processIps'
 
 // ---------------------------------------------------------------------------
 // «Ускорение без VPN (zapret)» on the app side:
@@ -131,6 +142,9 @@ export interface ZapretDeps {
   checkBudgetMs?: number
   /** a failure of the current strategy is checked once more after this long */
   confirmMs?: number
+  /** the programs' addresses: a new list at most this often / after this batch (processIps.ts) */
+  learnGapMs?: number
+  learnBatchMs?: number
 }
 
 /** how often a broken strategy may be re-picked by itself, per network */
@@ -275,12 +289,18 @@ export function dpiErrorText(err: unknown): string {
 }
 
 /** the part of a Clash API connection the live fallback reads */
-export interface LiveConnection {
+export interface LiveConnection extends ProcConnection {
   id: string
   rule?: string
   start?: string
   download?: number
-  metadata?: { host?: string; network?: string; destinationIP?: string }
+  metadata?: {
+    host?: string
+    network?: string
+    destinationIP?: string
+    destinationPort?: string
+    processPath?: string
+  }
 }
 
 interface ItemState {
@@ -302,7 +322,13 @@ interface KeyResult {
 interface ZRule {
   key: string
   rule: RoutingRule
-  target: Extract<ZapretRuleTarget, { ok: true }>
+  /** a program is not checked (PRule) */
+  target: Exclude<Extract<ZapretRuleTarget, { ok: true }>, { kind: 'process' }>
+}
+
+/** a «Напрямую + zapret» rule for a program (0.7.4): its addresses are learned from its traffic */
+interface PRule {
+  rule: RoutingRule
 }
 
 const ruleKey = (id: string): string => `r:${id}`
@@ -370,6 +396,9 @@ export class ZapretService {
   private daemonRef: DpiDaemonLike | null = null
   private lastAutoPick = new Map<string, number>()
   private timers: NodeJS.Timeout[] = []
+  /** 0.7.4: the addresses of the «Напрямую + zapret» programs (processIps.ts) */
+  private learner: ProcessIpLearner
+  private learnTimer: NodeJS.Timeout | null = null
   private lastRouting: string = JSON.stringify(NO_ZAPRET)
   private nodes: { net: string | null; at: number; list: string[] } | null = null
   /** live fallback: item → connection id → when it was seen stalled */
@@ -392,7 +421,9 @@ export class ZapretService {
   /** the broker's WinDivert filter: how many of our servers it leaves out (logged on change) */
   private lastWfExcl: number | undefined
 
-  constructor(private d: ZapretDeps) {}
+  constructor(private d: ZapretDeps) {
+    this.learner = new ProcessIpLearner(LEARN_MAX, d.learnGapMs ?? SEND_GAP_MS, d.learnBatchMs ?? SEND_BATCH_MS)
+  }
 
   private now(): number {
     return this.d.now?.() ?? Date.now()
@@ -428,7 +459,7 @@ export class ZapretService {
       ...(this.checkedAt ? { checkedAt: this.checkedAt } : {}),
       ...(this.error ? { error: this.error } : {}),
       ...(this.warning ? { warning: this.warning } : {}),
-      ...(this.zrules().length ? { rules: this.ruleStates() } : {})
+      ...(this.zrules().length || this.prules().length ? { rules: this.ruleStates() } : {})
     }
   }
 
@@ -461,7 +492,19 @@ export class ZapretService {
     for (const rule of this.d.rules?.() ?? []) {
       if (!rule.enabled || rule.action !== ZAPRET_ACTION) continue
       const target = zapretRuleTarget(rule)
-      if (target.ok) out.push({ key: ruleKey(rule.id), rule, target })
+      if (target.ok && target.kind !== 'process') out.push({ key: ruleKey(rule.id), rule, target })
+      if (out.length >= RULE_CHECK_MAX) break
+    }
+    return out
+  }
+
+  /** the «Напрямую + zapret» rules for a program (enabled) */
+  private prules(): PRule[] {
+    const out: PRule[] = []
+    for (const rule of this.d.rules?.() ?? []) {
+      if (!rule.enabled || rule.action !== ZAPRET_ACTION) continue
+      const t = zapretRuleTarget(rule)
+      if (t.ok && t.kind === 'process') out.push({ rule })
       if (out.length >= RULE_CHECK_MAX) break
     }
     return out
@@ -485,6 +528,13 @@ export class ZapretService {
       }
       if (!this.active) {
         out[rule.id] = { state: 'plain', detail: 'zapret включится вместе с VPN' }
+        continue
+      }
+      // a program: not checked — zapret acts on its addresses on 80/443
+      if (target.kind === 'process') {
+        out[rule.id] = on
+          ? { state: 'direct', note: ZAPRET_PROCESS_NOTE }
+          : { state: 'plain', detail: 'zapret сейчас не работает — напрямую без него' }
         continue
       }
       const key = ruleKey(rule.id)
@@ -535,10 +585,14 @@ export class ZapretService {
 
   /** the user's rules changed (handlers.ts): their zapret part is checked again */
   async rulesUpdated(): Promise<void> {
+    // a program's rule gone / changed: the addresses learned for it leave
+    const progs = this.prules()
+    this.learner.keepRules(new Set(progs.map((p) => p.rule.id)), this.now())
     // only when the «Напрямую + zapret» rules themselves changed (winws gets new lists)
-    const sig = JSON.stringify(
-      this.zrules().map((z) => [z.key, z.target.value, z.rule.zapretFallback !== false])
-    )
+    const sig = JSON.stringify([
+      ...this.zrules().map((z) => [z.key, z.target.value, z.rule.zapretFallback !== false]),
+      ...progs.map((p) => [ruleKey(p.rule.id), p.rule.conditionType, p.rule.value.trim().toLowerCase()])
+    ])
     if (sig === this.lastRulesSig) {
       this.publish()
       return
@@ -732,6 +786,8 @@ export class ZapretService {
     this.items.clear()
     this.direct.clear()
     this.strategyId = null
+    this.learner.clear()
+    this.learnTimer = null
     const daemon = this.daemonRef
     this.daemonRef = null
     this.dpiUp = false
@@ -855,6 +911,16 @@ export class ZapretService {
       (x) => x,
       () => null
     )
+    // 0.7.4: the addresses the «Напрямую + zapret» programs talk to (newest first)
+    if (this.prules().length && exclude !== null) {
+      const ours = excludeList(exclude)
+      for (const ip of this.learner.addresses()) {
+        if (ips.length >= 512) break
+        if (!ips.includes(ip) && !excluded(ours, ip)) ips.push(ip)
+      }
+    }
+    // everything learned so far goes with this list
+    this.learner.sent(this.now())
     // our servers' addresses unknown: an IP rule could cover one of them — no IP rules then
     if (ips.length && (exclude === null || (exclude.length === 0 && this.d.hasServers?.()))) {
       this.d.log('warn', 'zapret: адреса серверов VPN неизвестны — правила по IP пока без zapret')
@@ -1348,6 +1414,7 @@ export class ZapretService {
    * those are cut by us, not by the DPI.
    */
   onConnections(raw: { connections?: LiveConnection[] | null }): void {
+    if (this.active) this.learnPrograms(raw)
     if (!this.active || this.direct.size === 0) return
     const now = this.now()
     if (now < this.quietUntil) return
@@ -1370,6 +1437,56 @@ export class ZapretService {
       for (const [id, at] of m) if (now - at > LIVE_WINDOW_MS) m.delete(id)
       if (m.size >= LIVE_STALLS && this.direct.has(key)) this.liveFallback(key, m.size)
     }
+  }
+
+  /**
+   * 0.7.4: the direct connections of the «Напрямую + zapret» programs on
+   * 80/443 → their addresses into zapret's ipset; a new list at most once per
+   * SEND_GAP_MS (it restarts winws) and only when there are new addresses.
+   */
+  private learnPrograms(raw: { connections?: LiveConnection[] | null }): void {
+    const progs = this.prules().map((p) => p.rule)
+    if (progs.length === 0) return
+    const now = this.now()
+    let fresh = 0
+    for (const c of raw.connections ?? []) {
+      const hit = processConnAddress(c, progs)
+      if (hit && this.learner.note(hit.ip, hit.rule, now)) fresh++
+    }
+    if (fresh) this.d.log('info', `zapret: новых адресов программ: ${fresh} (всего ${this.learner.size})`)
+    this.scheduleLearned()
+  }
+
+  /** the learned addresses go to winws when due (one timer at a time) */
+  private scheduleLearned(): void {
+    if (this.learnTimer || !this.active) return
+    const due = this.learner.dueIn(this.now())
+    if (due === null) return
+    const gen = this.gen
+    const t = setTimeout(() => {
+      this.timers = this.timers.filter((x) => x !== t)
+      if (gen !== this.gen) {
+        if (this.learnTimer === t) this.learnTimer = null
+        return
+      }
+      // the timer stays «armed» until the job ran: never a pile of jobs behind a pick
+      void this.serial(async () => {
+        try {
+          if (gen !== this.gen || !this.strategyId || !this.dpiUp) return
+          // another list went meanwhile (it took them all) / not yet: the next snapshot decides
+          if (this.learner.dueIn(this.now()) !== 0) return
+          // winws restarts: a new connection of YouTube & co in that moment is not «no answer»
+          this.noteReconnect()
+          await this.runStrategy(gen, this.strategyId)
+          this.publish()
+        } finally {
+          if (this.learnTimer === t) this.learnTimer = null
+        }
+      }).catch(() => undefined)
+    }, due)
+    t.unref?.()
+    this.learnTimer = t
+    this.timers.push(t)
   }
 
   private liveFallback(key: string, count: number): void {
@@ -1447,6 +1564,12 @@ export class ZapretService {
     if (gen !== this.gen) return
     const settings = this.d.getSettings()
     if (itemKeys(settings).length === 0 && this.zrules().length === 0) {
+      // 0.7.4: only programs — nothing to aim a check at: the first strategy, not remembered
+      if (this.prules().length && STRATEGIES[0]) {
+        this.strategyId = STRATEGIES[0].id
+        await this.runStrategy(gen, this.strategyId)
+        if (gen !== this.gen) return
+      }
       this.phase = 'running'
       this.publish()
       return

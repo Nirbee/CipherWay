@@ -97,8 +97,8 @@ describe('planProcessRule', () => {
 })
 
 describe('zapret for a program', () => {
-  it('follows what zapret takes from a «программа» rule (not yet in 0.7.3)', () => {
-    expect(zapretForProgram('game.exe')).toBe(false)
+  it('follows what zapret takes from a «программа» rule (0.7.4: yes)', () => {
+    expect(zapretForProgram('game.exe')).toBe(true)
   })
 })
 

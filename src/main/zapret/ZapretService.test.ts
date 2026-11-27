@@ -50,6 +50,9 @@ function harness(o: {
   confirmMs?: number
   /** checkTarget: answer after this long, honouring the abort signal */
   targetDelayMs?: number
+  /** the programs' addresses (0.7.4) */
+  learnGapMs?: number
+  learnBatchMs?: number
 }) {
   let rulesChanged = 0
   let settings: ZapretSettings = { ...DEFAULT_ZAPRET, enabled: true, warned: true, ...o.settings }
@@ -145,6 +148,8 @@ function harness(o: {
     netPollMs: o.netPollMs ?? 3_600_000,
     ...(o.videoNodes ? { videoNodes: async () => o.videoNodes ?? [] } : {}),
     ...(o.now ? { now: o.now } : {}),
+    ...(o.learnGapMs !== undefined ? { learnGapMs: o.learnGapMs } : {}),
+    ...(o.learnBatchMs !== undefined ? { learnBatchMs: o.learnBatchMs } : {}),
     ...(o.rules ? { rules: () => o.rules ?? [], rulesChanged: () => rulesChanged++ } : {})
   }
   const svc = new ZapretService(deps)
@@ -1006,6 +1011,98 @@ describe('ZapretService — a light check (0.7.3)', () => {
     await h.svc.onVpn(true)
     await h.idle()
     expect(h.logs.filter((l) => l.includes('не проходит через zapret'))).toHaveLength(1)
+    await h.svc.onVpn(false)
+  })
+})
+
+describe('ZapretService — «Напрямую + zapret» for a program (0.7.4)', () => {
+  const memo = { 'net-home': { id: S0, at: Date.now(), v: 2 } }
+  const prog: RoutingRule = {
+    id: 'p',
+    enabled: true,
+    conditionType: 'ProcessName',
+    value: 'Game.exe',
+    action: 'ZAPRET'
+  }
+  const conn = (id: string, ip: string, port = '443', network = 'tcp', exe = 'C:\\Games\\game.exe') => ({
+    id,
+    rule: 'rule_set=[cw-0-d] => route(cw-0)',
+    chains: ['direct', 'cw-0'],
+    start: new Date().toISOString(),
+    download: 100,
+    metadata: { host: '', network, destinationIP: ip, destinationPort: port, processPath: exe }
+  })
+
+  it('direct, not checked, never to the VPN; the state says «порты 80/443»', async () => {
+    const h = harness({ world: () => true, settings: { services: [] }, memory: memo, rules: [prog] })
+    h.setRunning(true)
+    await h.svc.onVpn(true)
+    const v = await h.idle()
+    expect(v.rules?.p).toEqual({ state: 'direct', note: 'порты 80/443' })
+    expect(h.svc.effectiveRules([prog])[0].action).toBe('DIRECT')
+    expect(h.checked).toEqual([])
+    // nothing learned yet: no IP profiles for winws
+    expect(h.daemon.requests.at(-1)?.ips).toBeUndefined()
+    await h.svc.onVpn(false)
+    expect(h.svc.view().rules?.p.state).toBe('plain')
+  })
+
+  it('only programs, nothing remembered: winws starts with the first strategy (no pick)', async () => {
+    const h = harness({ world: () => true, settings: { services: [] }, rules: [prog] })
+    h.setRunning(true)
+    await h.svc.onVpn(true)
+    await h.idle()
+    expect(h.daemon.requests.map((r) => r.strategy)).toEqual([S0])
+    expect(h.memory['net-home']).toBeUndefined()
+    await h.svc.onVpn(false)
+  })
+
+  it('its addresses on 80/443 go to zapret: public only, never our servers, throttled, only when new', async () => {
+    const h = harness({
+      world: () => true,
+      settings: { services: [] },
+      memory: memo,
+      rules: [prog],
+      excludeIps: async () => ['8.8.8.8/32'],
+      learnGapMs: 80,
+      learnBatchMs: 0
+    })
+    h.setRunning(true)
+    await h.svc.onVpn(true)
+    await h.idle()
+    const n0 = h.daemon.requests.length
+    h.svc.onConnections({
+      connections: [
+        conn('a', '1.1.1.1'),
+        conn('b', '8.8.8.8'), // our server
+        conn('c', '192.168.1.10'), // the LAN
+        conn('d', '9.9.9.9', '27015', 'udp'), // a game's own UDP: not zapret's
+        conn('e', '2606:4700:4700:0:0:0:0:1111', '443', 'udp'), // QUIC
+        conn('f', '4.4.4.4', '443', 'tcp', 'C:\\other.exe') // another program
+      ]
+    })
+    // throttled: not at once after winws started
+    expect(h.daemon.requests.length).toBe(n0)
+    await sleep(200)
+    expect(h.daemon.requests.length).toBe(n0 + 1)
+    expect(h.daemon.requests.at(-1)?.ips).toEqual(['2606:4700:4700::1111', '1.1.1.1'])
+    // the same addresses again: no new list
+    h.svc.onConnections({ connections: [conn('a2', '1.1.1.1')] })
+    await sleep(200)
+    expect(h.daemon.requests.length).toBe(n0 + 1)
+    // a new one: the next list (after the gap)
+    h.svc.onConnections({ connections: [conn('g', '1.0.0.1', '80')] })
+    expect(h.daemon.requests.length).toBe(n0 + 1)
+    await sleep(200)
+    expect(h.daemon.requests.length).toBe(n0 + 2)
+    // newest first; 1.1.1.1 was seen again since — newer than the QUIC address
+    expect(h.daemon.requests.at(-1)?.ips).toEqual(['1.0.0.1', '1.1.1.1', '2606:4700:4700::1111'])
+    await h.svc.onVpn(false)
+    // a new session starts empty
+    h.setRunning(true)
+    await h.svc.onVpn(true)
+    await h.idle()
+    expect(h.daemon.requests.at(-1)?.ips).toBeUndefined()
     await h.svc.onVpn(false)
   })
 })

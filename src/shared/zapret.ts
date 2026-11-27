@@ -474,7 +474,18 @@ export type ZapretRuleTarget =
   | { ok: true; kind: 'domain'; value: string }
   | { ok: true; kind: 'ip'; value: string }
   | { ok: true; kind: 'service'; value: ZapretServiceId }
+  /**
+   * 0.7.4: a program — its traffic goes direct, the addresses it talks to on
+   * TCP 80/443 and QUIC 443 are given to zapret (ZapretService, processIps.ts);
+   * nothing is checked, never back to the VPN
+   */
+  | { ok: true; kind: 'process'; value: string }
   | { ok: false; reason: string }
+
+/** what zapret does for a program (the rule list, the rule editor) */
+export const ZAPRET_PROCESS_NOTE = 'порты 80/443'
+export const ZAPRET_PROCESS_HINT =
+  'Программа идёт напрямую, а zapret снимает замедление провайдера с её трафика на портах 80 и 443 (TCP и QUIC). Остальное — например игровой UDP на других портах — идёт просто напрямую, без zapret. Откат в VPN для программ не делается.'
 
 
 /** the widest range zapret takes from a rule: /8 (IPv4), /32 (IPv6) — the broker refuses wider */
@@ -556,11 +567,7 @@ export function zapretRuleTarget(r: Pick<RuleLike, 'conditionType' | 'value'>): 
       return { ok: false, reason: 'Шаблон нельзя передать zapret — укажите сами домены' }
     case 'ProcessName':
     case 'ProcessPath':
-      return {
-        ok: false,
-        reason:
-          'zapret не видит, какая программа отправила пакет. Впишите домены игры правилом «Домен» с «Напрямую + zapret»'
-      }
+      return v ? { ok: true, kind: 'process', value: v } : { ok: false, reason: 'Укажите программу' }
     case 'GeoIP':
       return { ok: false, reason: 'Набор geoip слишком велик для zapret — укажите подсети' }
     case 'DstPort':

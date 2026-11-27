@@ -9,7 +9,7 @@ import {
 } from '../../lib/ruleMeta'
 import { ProcessPicker } from './ProcessPicker'
 import { validateValue } from '@shared/rulesText'
-import { ZAPRET_ACTION, zapretRuleTarget } from '@shared/zapret'
+import { ZAPRET_ACTION, ZAPRET_PROCESS_HINT, zapretRuleTarget } from '@shared/zapret'
 
 type Draft = Omit<RoutingRule, 'id'>
 
@@ -133,8 +133,10 @@ export function RuleEditor({ open, initial, outboundNames, onClose, onSave }: Pr
           hint={
             zt && !zt.ok
               ? zt.reason
-              : isZapret
-                ? 'Напрямую, а zapret снимает замедление провайдера. Работает, когда в «Ускорении без VPN» включён zapret; иначе — просто напрямую.'
+              : isZapret && isProcess
+                ? ZAPRET_PROCESS_HINT
+                : isZapret
+                  ? 'Напрямую, а zapret снимает замедление провайдера. Работает, когда в «Ускорении без VPN» включён zapret; иначе — просто напрямую.'
                 : undefined
           }
         >
@@ -144,7 +146,8 @@ export function RuleEditor({ open, initial, outboundNames, onClose, onSave }: Pr
             onChange={(v) => setDraft((d) => ({ ...d, action: v }))}
           />
         </Field>
-        {isZapret && (
+        {/* a program is never checked: no way back to the VPN (0.7.4) */}
+        {isZapret && !isProcess && (
           <label className="flex cursor-pointer items-center gap-2.5 text-sm text-text-primary">
             <input
               type="checkbox"
