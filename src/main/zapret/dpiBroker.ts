@@ -12,7 +12,14 @@ import {
 import { BROKER_HELPERS_PS, HASH_RE, isValidSid, rootExpr } from '../core/serviceScripts'
 import { PUBLIC_SUFFIXES, ZAPRET_CUSTOM_MAX, ZAPRET_SERVICE_IDS } from '@shared/zapret'
 import { SERVICE_DEFS } from './lists'
-import { STRATEGIES, tokenProblems, userIpTokens, winwsTokens } from './strategies'
+import {
+  STRATEGIES,
+  tokenProblems,
+  userIpTokens,
+  WF_MAX_TESTS,
+  wfParts,
+  winwsTokens
+} from './strategies'
 
 // ---------------------------------------------------------------------------
 // «Ускорение без VPN (zapret)» (0.7.0): winws needs SYSTEM rights (it opens
@@ -71,6 +78,11 @@ import { STRATEGIES, tokenProblems, userIpTokens, winwsTokens } from './strategi
 //    (user: read only), the user's strings only ever end up as lines of those
 //    files, never as arguments. No path, option or file of the user reaches winws.
 //    Discord's voice profile only acts on Discord's own ranges (an ipset).
+//  * the WinDivert filter (0.7.3, --wf-raw-part=@<home>\dpi\windivert.txt): the
+//    fixed parts of strategies.ts (wfParts, baked in) + our VPN servers'
+//    addresses of `exclude`, each re-made from its numbers (Wf-Tests: octets /
+//    the 16 bytes of the parsed address, masked) — never the request's text.
+//    Their packets never reach winws (the tunnel is not slowed down by it).
 //  * --wf-iface: the broker itself finds the adapter of the default route that
 //    is not ours (not «CipherWay», not «CipherWay LAN»; an on-link route such as
 //    PPPoE counts) — WinDivert must never touch packets inside the tunnel — and
@@ -187,6 +199,20 @@ export function plansPs(): string {
     }
   }
   return `@{\n${rows.join('\n')}\n}`
+}
+
+/** `$WfOut` / `$WfIn`: `0` / `1` (Discord off / on) → the fixed parts of our WinDivert filter. */
+export function wfPartsPs(): { out: string; in: string } {
+  const row = (k: 'out' | 'in'): string =>
+    `@{ '0' = ${psQuote(wfParts(false)[k])}; '1' = ${psQuote(wfParts(true)[k])} }`
+  for (const d of [false, true]) {
+    const p = wfParts(d)
+    // only the WinDivert words, numbers and operators — never a path or a quote
+    for (const s of [p.out, p.in]) {
+      if (!/^[a-zA-Z0-9 .()=<>![\]]+$/.test(s)) throw new Error('bad filter part')
+    }
+  }
+  return { out: row('out'), in: row('in') }
 }
 
 /** `$IpPlans`: strategy id → the profiles of the user's IP rules (appended when ips.txt is not empty). */
@@ -426,6 +452,7 @@ $HostsF = Join-Path $DpiDir 'hosts.txt'
 $ExclF = Join-Path $DpiDir 'exclude.txt'
 $DiscordF = Join-Path $DpiDir 'discord-ips.txt'
 $IpsF = Join-Path $DpiDir 'ips.txt'
+$WfF = Join-Path $DpiDir 'windivert.txt'
 $NoHost = ${psQuote(DPI_NO_HOST)}
 $TsF = Join-Path $Tmp 'dpi-tcp-ts.txt'
 $TcpTs = ${!p.rootOverride || p.tcpTsTest ? '$true' : '$false'}
@@ -462,8 +489,11 @@ $IdRe = '^[a-z0-9-]{1,40}\\z'
 $ServiceDomains = ${servicesPs()}
 $Plans = ${plansPs()}
 $IpPlans = ${ipPlansPs()}
+$WfOut = ${wfPartsPs().out}
+$WfIn = ${wfPartsPs().in}
+$WfMax = ${WF_MAX_TESTS}
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
-$State = @{ session = ''; status = 'starting'; gen = 0; strategy = ''; ifIdx = 0; ifName = ''; dpiPid = 0; wait = ''; exitCode = $null; output = ''; error = ''; detail = ''; stopReason = ''; tcpTs = ''; brokerPid = $PID; ts = 0 }
+$State = @{ session = ''; status = 'starting'; gen = 0; strategy = ''; ifIdx = 0; ifName = ''; dpiPid = 0; wait = ''; exitCode = $null; output = ''; error = ''; detail = ''; stopReason = ''; tcpTs = ''; wfExcl = 0; brokerPid = $PID; ts = 0 }
 ${BROKER_HELPERS_PS}
 ${PICK_IF_PS}
 function Test-Cidr([string]$s) {
@@ -490,6 +520,77 @@ function Test-UserIp([string]$s) {
   $bits = [int]$parts[1]
   if ($s.Contains(':')) { return ($bits -ge 32) }
   return ($bits -ge 8)
+}
+# one validated exclusion (Test-Cidr) → the WinDivert tests that leave it out,
+# made from its numbers: IPv4 octets as Test-Cidr reads them (decimal), IPv6 the
+# 16 bytes of the parsed address; masked to the range, printed by us
+function Wf-Tests([string]$s, [string]$dir) {
+  $parts = $s.Split('/')
+  if ($s.Contains(':')) {
+    $b = ([Net.IPAddress]::Parse($parts[0])).GetAddressBytes()
+    $f = 'ipv6.' + $dir + 'Addr'
+  } else {
+    if ($s -cnotmatch $V4Re) { throw 'cw-bad_request адрес' }
+    $b = [byte[]]@([byte][int]$Matches[1], [byte][int]$Matches[2], [byte][int]$Matches[3], [byte][int]$Matches[4])
+    $f = 'ip.' + $dir + 'Addr'
+  }
+  $bits = $(if ($parts.Count -gt 1) { [int]$parts[1] } else { 8 * $b.Length })
+  $lo = New-Object byte[] $b.Length
+  $hi = New-Object byte[] $b.Length
+  for ($i = 0; $i -lt $b.Length; $i++) {
+    $keep = [Math]::Max(0, [Math]::Min(8, $bits - 8 * $i))
+    $m = (0xFF -shl (8 - $keep)) -band 0xFF
+    $lo[$i] = [byte]($b[$i] -band $m)
+    $hi[$i] = [byte]($lo[$i] -bor (0xFF -bxor $m))
+  }
+  $txt = {
+    param($x)
+    if ($x.Length -eq 4) { return ($x -join '.') }
+    return ((0..7 | ForEach-Object { '{0:x}' -f ([int]$x[2 * $_] * 256 + [int]$x[2 * $_ + 1]) }) -join ':')
+  }
+  $l = & $txt $lo
+  $h = & $txt $hi
+  $v6 = $b.Length -eq 16
+  if ($l -ceq $h) { return @{ key = $l + '-' + $h; n = 1; v6 = $v6; text = $f + '!=' + $l } }
+  return @{ key = $l + '-' + $h; n = 2; v6 = $v6; text = '(' + $f + '<' + $l + ' or ' + $f + '>' + $h + ')' }
+}
+# each family's tests behind a guard: a test of a field the packet lacks is false
+# (an IPv4 address test fails on an IPv6 packet, != too)
+function Wf-Excl($tests) {
+  $v4 = @($tests | Where-Object { -not $_.v6 } | ForEach-Object { $_.text })
+  $v6 = @($tests | Where-Object { $_.v6 } | ForEach-Object { $_.text })
+  $g = New-Object Collections.Generic.List[string]
+  if ($v4.Count -gt 0) { $g.Add('(ipv6 or (' + ($v4 -join ' and ') + '))') }
+  if ($v6.Count -gt 0) { $g.Add('(ip or (' + ($v6 -join ' and ') + '))') }
+  return ($g -join ' and ')
+}
+# the --wf-raw-part file: our fixed parts, our VPN servers left out in the kernel
+# (too many for WinDivert → none left out, --ipset-exclude still skips them)
+function Wf-Filter($l) {
+  $k = $(if ($l.services.Contains('discord')) { '1' } else { '0' })
+  $out = $WfOut[$k]
+  $in = $WfIn[$k]
+  $seen = New-Object Collections.Generic.HashSet[string]
+  $dst = New-Object Collections.Generic.List[object]
+  $src = New-Object Collections.Generic.List[object]
+  $n = 0
+  foreach ($x in $l.exclude) {
+    $d = Wf-Tests $x 'Dst'
+    if (-not $seen.Add($d.key)) { continue }
+    $n += $d.n
+    $dst.Add($d)
+    $src.Add((Wf-Tests $x 'Src'))
+  }
+  $State.wfExcl = $seen.Count
+  if ($n -gt $WfMax) {
+    $State.wfExcl = -1
+    Note ('адресов серверов VPN слишком много для фильтра WinDivert (' + $seen.Count + ') — их трафик проходит через zapret')
+  } elseif ($dst.Count -gt 0) {
+    $out = $out + ' and ' + (Wf-Excl $dst)
+    $in = $in + ' and ' + (Wf-Excl $src)
+  }
+  $lf = [string][char]10
+  return '(' + $out + ')' + $lf + 'or' + $lf + '(' + $in + ')' + $lf
 }
 # the lists of request generation $gen, validated (null = not written yet);
 # a refused value is never repeated in the message
@@ -598,7 +699,7 @@ function Ensure-DpiDir {
   if ([IO.Directory]::Exists($DpiDir) -or [IO.File]::Exists($DpiDir)) {
     if ((Is-Reparse $DpiDir) -or -not [IO.Directory]::Exists($DpiDir)) { throw 'cw-failed папка zapret подменена' }
   } else { $null = [IO.Directory]::CreateDirectory($DpiDir) }
-  foreach ($f in @($HostsF, $ExclF, $DiscordF, $IpsF)) { if (Is-Reparse $f) { throw 'cw-failed файл zapret подменён' } }
+  foreach ($f in @($HostsF, $ExclF, $DiscordF, $IpsF, $WfF)) { if (Is-Reparse $f) { throw 'cw-failed файл zapret подменён' } }
 }
 # the hostlist / ipset files winws reads: written here, one entry per line
 function Write-Lists($l) {
@@ -613,6 +714,7 @@ function Write-Lists($l) {
   Write-Atomic $ExclF (($ex -join [string][char]10) + [string][char]10)
   Write-Atomic $DiscordF (($DiscordIps -join [string][char]10) + [string][char]10)
   Write-Atomic $IpsF (($l.ips -join [string][char]10) + [string][char]10)
+  Write-Atomic $WfF (Wf-Filter $l)
   return $n
 }
 # the only command line winws ever gets: the table + the broker's own paths
@@ -621,7 +723,7 @@ function Build-Args($l, [int]$ifIdx) {
   $out = New-Object Collections.Generic.List[string]
   $out.Add('"--wf-iface=' + $ifIdx + '"')
   foreach ($t in $Plans[$key]) {
-    $out.Add('"' + $t.Replace('%TLS%', $FakeTls).Replace('%QUIC%', $FakeQuic).Replace('%HOSTS%', $HostsF).Replace('%EXCL%', $ExclF).Replace('%DISCORD_IPS%', $DiscordF) + '"')
+    $out.Add('"' + $t.Replace('%TLS%', $FakeTls).Replace('%QUIC%', $FakeQuic).Replace('%HOSTS%', $HostsF).Replace('%EXCL%', $ExclF).Replace('%DISCORD_IPS%', $DiscordF).Replace('%WF%', $WfF) + '"')
   }
   if ($l.ips.Count -gt 0) {
     foreach ($t in $IpPlans[$l.strategy]) {
@@ -1023,6 +1125,11 @@ export interface DpiBrokerState {
   stopReason?: string
   /** 'enabled' = this broker turned TCP timestamps on (put back when it ends) */
   tcpTs?: string
+  /**
+   * 0.7.3: how many of our servers' addresses / ranges the WinDivert filter
+   * leaves out (their packets never reach winws); -1 = too many, none left out
+   */
+  wfExcl?: number
   ts?: number
 }
 
@@ -1060,6 +1167,7 @@ export function parseDpiState(text: string): DpiBrokerState | null {
       detail: str(o.detail),
       stopReason: str(o.stopReason),
       tcpTs: str(o.tcpTs),
+      wfExcl: num(o.wfExcl),
       ts: num(o.ts)
     }
   } catch {

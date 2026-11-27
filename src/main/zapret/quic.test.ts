@@ -96,6 +96,15 @@ describe('probeQuic never hangs', () => {
       error: 'timeout'
     })
     expect(Date.now() - t0).toBeLessThan(1500)
+    // 0.7.3: switched off meanwhile → ends at once
+    const ac = new AbortController()
+    setTimeout(() => ac.abort(), 50)
+    const t1 = Date.now()
+    expect(await probeQuic('127.0.0.1', 'example.org', undefined, 5000, port, ac.signal)).toEqual({
+      ok: false,
+      error: 'aborted'
+    })
+    expect(Date.now() - t1).toBeLessThan(1000)
     silent.close()
 
     // a «server» that answers a server Initial addressed to someone else (RFC A.3: empty DCID) → not ours

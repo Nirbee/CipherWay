@@ -46,6 +46,10 @@ function harness(o: {
   rules?: RoutingRule[]
   /** our servers' addresses (default: one) */
   excludeIps?: () => Promise<string[]>
+  /** a failure is checked once more after this long (default 0) */
+  confirmMs?: number
+  /** checkTarget: answer after this long, honouring the abort signal */
+  targetDelayMs?: number
 }) {
   let rulesChanged = 0
   let settings: ZapretSettings = { ...DEFAULT_ZAPRET, enabled: true, warned: true, ...o.settings }
@@ -58,6 +62,8 @@ function harness(o: {
   const views: ZapretView[] = []
   const logs: string[] = []
   const checked: { host: string; path: DirectPath }[] = []
+  let inFlight = 0
+  let maxInFlight = 0
   const daemon: DpiDaemonLike & { stops: number; requests: DpiRequest[] } = {
     stops: 0,
     requests: [],
@@ -73,7 +79,8 @@ function harness(o: {
         status: 'running',
         gen: applied.length,
         strategy: req.strategy,
-        dpiPid: 100 + applied.length
+        dpiPid: 100 + applied.length,
+        wfExcl: req.exclude.length
       } as DpiBrokerState
     },
     async stop() {
@@ -100,8 +107,24 @@ function harness(o: {
     daemon: async () => daemon,
     network: async () => net,
     pickDoh: async () => (o.doh === undefined ? 'primary' : o.doh),
-    checkTarget: async (t: CheckTarget, _doh, path): Promise<TargetResult> => {
+    checkTarget: async (t: CheckTarget, _doh, path, _ms, signal): Promise<TargetResult> => {
       checked.push({ host: t.host, path })
+      inFlight++
+      maxInFlight = Math.max(maxInFlight, inFlight)
+      try {
+        if (o.targetDelayMs) {
+          const aborted = await new Promise<boolean>((res) => {
+            const tm = setTimeout(() => res(false), o.targetDelayMs)
+            signal?.addEventListener('abort', () => {
+              clearTimeout(tm)
+              res(true)
+            })
+          })
+          if (aborted) return { host: t.host, ok: false, error: 'aborted' }
+        }
+      } finally {
+        inFlight--
+      }
       const w = o.world(strategy, t.host, t.quic)
       if (w === 'noaddr') return { host: t.host, ok: false, error: 'noaddr' }
       return w ? { host: t.host, ok: true, ms: 10 } : { host: t.host, ok: false, error: 'timeout' }
@@ -116,6 +139,8 @@ function harness(o: {
     publish: (v) => views.push(v),
     log: (_l, m) => logs.push(m),
     settleMs: 0,
+    confirmMs: o.confirmMs ?? 0,
+    connections: () => checked.length,
     checkEveryMs: o.checkEveryMs ?? 3_600_000,
     netPollMs: o.netPollMs ?? 3_600_000,
     ...(o.videoNodes ? { videoNodes: async () => o.videoNodes ?? [] } : {}),
@@ -143,6 +168,15 @@ function harness(o: {
       return rulesChanged
     },
     setNet: (n: NetworkInfo | null) => (net = n),
+    /** the most checkTarget calls running at the same time; reset with `true` */
+    maxParallel: (reset = false): number => {
+      const m = maxInFlight
+      if (reset) maxInFlight = 0
+      return m
+    },
+    get inFlight() {
+      return inFlight
+    },
     lastRoute: () => routes[routes.length - 1],
     /** until the work queued so far is done */
     async idle(): Promise<ZapretView> {
@@ -901,6 +935,77 @@ describe('ZapretService — IP rules, safely (0.7.2 review)', () => {
     await sleep(20)
     expect(h.svc.view().rules?.n.state).toBe('vpn')
     expect(h.svc.effectiveRules(rules)[0].action).toBe('PROXY')
+    await h.svc.onVpn(false)
+  })
+})
+
+describe('ZapretService — a light check (0.7.3)', () => {
+  const memo = { 'net-home': { id: S0, at: Date.now(), v: 2 } }
+
+  it('≤ 2 connections at a time; the log names the reason, the time and the connections', async () => {
+    const h = harness({ world: (s) => s === S0, memory: memo, targetDelayMs: 15 })
+    h.setRunning(true)
+    await h.svc.onVpn(true)
+    await h.idle()
+    expect(h.checked.length).toBeGreaterThan(2)
+    expect(h.maxParallel()).toBeLessThanOrEqual(2)
+    const line = h.logs.find((l) => l.includes('перепроверка (после подключения)'))
+    expect(line).toMatch(/— \d{1,2}:\d{2}:\d{2}–\d{1,2}:\d{2}:\d{2} \(\d+ с\), соединений: \d+, напрямую \d+ из \d+$/)
+    await h.svc.onVpn(false)
+  })
+
+  it('a one-off failure is checked once more: no re-pick when it opens the second time', async () => {
+    let flaky = 0
+    const h = harness({
+      // the regular check (after the first one) misses www.youtube.com once
+      world: (s, host) => {
+        if (s !== S0) return false
+        if (host === 'www.youtube.com' && flaky === 1) {
+          flaky = 2
+          return false
+        }
+        return true
+      },
+      memory: memo,
+      checkEveryMs: 60
+    })
+    h.setRunning(true)
+    await h.svc.onVpn(true)
+    await h.idle()
+    flaky = 1
+    for (let i = 0; i < 200 && !h.logs.some((l) => l.includes('со второй попытки')); i++)
+      await sleep(10)
+    expect(h.logs.join('\n')).toMatch(/со второй попытки открылось — youtube/)
+    expect(h.logs.join('\n')).not.toMatch(/подбираем/)
+    expect(h.applied).toEqual([S0])
+    expect(h.svc.view().items.every((i) => i.state === 'direct')).toBe(true)
+    await h.svc.onVpn(false)
+  })
+
+  it('zapret off / VPN off in the middle of a check: the probes in flight end at once, nothing new starts', async () => {
+    const h = harness({ world: () => true, memory: memo, targetDelayMs: 10_000 })
+    h.setRunning(true)
+    await h.svc.onVpn(true)
+    for (let i = 0; i < 200 && h.inFlight === 0; i++) await sleep(5)
+    expect(h.inFlight).toBeGreaterThan(0)
+    const asked = h.checked.length
+    const t0 = Date.now()
+    h.setRunning(false)
+    await h.svc.onVpn(false)
+    await sleep(30)
+    expect(h.inFlight).toBe(0)
+    expect(Date.now() - t0).toBeLessThan(2000)
+    await sleep(100)
+    expect(h.checked.length).toBe(asked)
+    expect(h.logs.join('\n')).toMatch(/перепроверка \(после подключения\) — .*прервана/)
+  })
+
+  it('the broker leaving our servers out of WinDivert is logged once', async () => {
+    const h = harness({ world: (s) => s === S0, memory: memo })
+    h.setRunning(true)
+    await h.svc.onVpn(true)
+    await h.idle()
+    expect(h.logs.filter((l) => l.includes('не проходит через zapret'))).toHaveLength(1)
     await h.svc.onVpn(false)
   })
 })

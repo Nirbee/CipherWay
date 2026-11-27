@@ -11,6 +11,7 @@ import { runningProcessNames } from '../system/processes'
 import { normalizeHost, resolveServers, toExcludeCidrs } from '../system/resolve'
 import { checkTarget, currentNetwork, dohResolve, pickDoh } from './checks'
 import { findVideoNodes, getDirect } from './videoNodes'
+import { connectionsOpened } from './probeNet'
 import { DpiDaemon } from './DpiDaemon'
 import { ZapretService, type StrategyMemo } from './ZapretService'
 
@@ -69,17 +70,20 @@ export function createZapretService(o: CreateZapretOpts): ZapretService {
     },
     // our TUN's own address is never «the physical adapter»
     network: () => currentNetwork([TUN_ADDRESS4]),
-    pickDoh: (path) => pickDoh(path),
-    checkTarget: (t, doh, path, timeoutMs) => checkTarget(t, doh, path, timeoutMs),
+    pickDoh: (path, signal) => pickDoh(path, 4000, signal),
+    checkTarget: (t, doh, path, timeoutMs, signal) =>
+      checkTarget(t, doh, path, timeoutMs, signal),
     // a real video node of this client (the watch page, else report_mapping)
-    videoNodes: async (doh, path) =>
+    videoNodes: async (doh, path, signal) =>
       (
         await findVideoNodes({
           get: (host, urlPath, maxBytes, timeoutMs) =>
-            getDirect(host, urlPath, doh, path, maxBytes, timeoutMs),
-          resolves: async (host) => (await dohResolve(host, doh, path)).length > 0
+            getDirect(host, urlPath, doh, path, maxBytes, timeoutMs, signal),
+          resolves: async (host) =>
+            (await dohResolve(host, doh, path, 4000, true, signal)).length > 0
         })
       ).nodes,
+    connections: connectionsOpened,
     excludeIps: async () => toExcludeCidrs(await resolveServers(o.outbounds())),
     hasServers: () => o.outbounds().length > 0,
     reserved: () => [...o.outbounds().map((x) => normalizeHost(x.server)), ...o.reservedHosts()],

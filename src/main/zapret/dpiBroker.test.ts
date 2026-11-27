@@ -9,9 +9,10 @@ import {
   parseDpiState,
   plansPs,
   servicesPs,
+  wfPartsPs,
   type DpiHashes
 } from './dpiBroker'
-import { STRATEGIES } from './strategies'
+import { STRATEGIES, WF_MAX_TESTS } from './strategies'
 import { SERVICE_DEFS } from './lists'
 
 const SID = 'S-1-5-21-1000000001-1000000002-1000000003-1001'
@@ -57,6 +58,26 @@ describe('dpiBrokerScript', () => {
     expect(ps).toContain('if ($l.ips.Count -gt 0) {')
     expect(ps).toContain(".Replace('%USER_IPS%', $IpsF)")
     expect(ps).toContain(`$NoHost = '${DPI_NO_HOST}'`)
+  })
+
+  it('0.7.3: the WinDivert filter — fixed parts baked in, addresses re-made from their numbers', () => {
+    const parts = wfPartsPs()
+    expect(ps).toContain(`$WfOut = ${parts.out}`)
+    expect(ps).toContain(`$WfIn = ${parts.in}`)
+    expect(parts.out).toContain(`'0' = 'outbound and (`)
+    expect(parts.out).toContain('udp.Payload[4]==1')
+    expect(ps).toContain(`$WfMax = ${WF_MAX_TESTS}`)
+    expect(ps).toContain("$WfF = Join-Path $DpiDir 'windivert.txt'")
+    expect(ps).toContain('Write-Atomic $WfF (Wf-Filter $l)')
+    expect(ps).toContain(".Replace('%WF%', $WfF)")
+    // the address: octets / bytes of the parsed address, never the request's text
+    expect(ps).toContain('$b = ([Net.IPAddress]::Parse($parts[0])).GetAddressBytes()')
+    expect(ps).toContain('[byte][int]$Matches[1]')
+    expect(ps).toMatch(/foreach \(\$x in \$l\.exclude\) \{\n\s+\$d = Wf-Tests \$x 'Dst'/)
+    expect(ps).toContain('foreach ($f in @($HostsF, $ExclF, $DiscordF, $IpsF, $WfF))')
+    // winws' own port filter is gone from every plan
+    expect(plansPs()).not.toMatch(/--wf-(tcp|udp)=/)
+    expect(plansPs()).toContain("'--wf-raw-part=@%WF%'")
   })
 
   it('TCP timestamps: two fixed netsh calls, exit code checked, read back; only by the lock holder', () => {
@@ -246,9 +267,17 @@ describe('parseDpiState', () => {
   it('known fields only; garbage → null / undefined', () => {
     expect(
       parseDpiState(
-        '\ufeff{"session":"ab","status":"running","gen":2,"strategy":"sniext","ifIdx":17,"dpiPid":42,"wait":"","error":"","exitCode":null,"ts":5}'
+        '\ufeff{"session":"ab","status":"running","gen":2,"strategy":"sniext","ifIdx":17,"dpiPid":42,"wait":"","error":"","exitCode":null,"wfExcl":3,"ts":5}'
       )
-    ).toMatchObject({ session: 'ab', status: 'running', gen: 2, ifIdx: 17, dpiPid: 42, wait: '' })
+    ).toMatchObject({
+      session: 'ab',
+      status: 'running',
+      gen: 2,
+      ifIdx: 17,
+      dpiPid: 42,
+      wait: '',
+      wfExcl: 3
+    })
     expect(parseDpiState('{"status":"pwned","error":"x","wait":"y"}')).toMatchObject({
       status: undefined,
       error: undefined,

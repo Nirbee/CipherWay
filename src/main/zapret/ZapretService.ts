@@ -1,3 +1,4 @@
+import { setMaxListeners } from 'node:events'
 import { BlockList, isIP } from 'node:net'
 import type { RoutingRule, TunServiceInfo } from '@shared/types'
 import {
@@ -38,7 +39,12 @@ import { DpiStartError, type DpiDaemonLike, type DpiRequest } from './DpiDaemon'
 //     every item is checked directly → the ones that open go direct;
 //   every ~10 min, and when the network changes → checked again; an item
 //     that stops opening goes back through the VPN at once; if one that worked
-//     stops, the strategy is picked again (at most every 30 min per network);
+//     stops (and fails once more a few seconds later), the strategy is picked
+//     again (at most every 30 min per network);
+//   0.7.3: a check is light — the current strategy only, ≤ 2 connections at a
+//     time, one video node (the ones found are reused for hours), every probe
+//     aborted the moment zapret / the VPN goes off; its log line names the
+//     time, the duration and the connections it opened (to line up with lags);
 //   «Подобрать заново» → a pick by hand;
 //   VPN off / switched off / app quit → winws stops, the sets are emptied.
 // A pick (like utils\test zapret.ps1, lighter): the strategies in order, each
@@ -82,18 +88,21 @@ export interface ZapretDeps {
   }
   daemon: () => Promise<DpiDaemonLike>
   network: () => Promise<NetworkInfo | null>
-  pickDoh: (path: DirectPath) => Promise<DohServer | null>
+  pickDoh: (path: DirectPath, signal?: AbortSignal) => Promise<DohServer | null>
   checkTarget: (
     t: CheckTarget,
     doh: DohServer,
     path: DirectPath,
-    timeoutMs?: number
+    timeoutMs?: number,
+    signal?: AbortSignal
   ) => Promise<TargetResult>
   /**
    * YouTube's video nodes for this client (videoNodes.ts findVideoNodes).
    * Absent (tests) = no video check; [] = none found → YouTube not verified.
    */
-  videoNodes?: (doh: DohServer, path: DirectPath) => Promise<string[]>
+  videoNodes?: (doh: DohServer, path: DirectPath, signal?: AbortSignal) => Promise<string[]>
+  /** connections the checks opened since the start (probeNet.ts) — for the log */
+  connections?: () => number
   /** our VPN servers' addresses (never touched by zapret) */
   excludeIps: () => Promise<string[]>
   /** the subscription has servers (their addresses must be known before IP rules go to zapret) */
@@ -120,6 +129,8 @@ export interface ZapretDeps {
   settleMs?: number
   /** the whole direct check of all items */
   checkBudgetMs?: number
+  /** a failure of the current strategy is checked once more after this long */
+  confirmMs?: number
 }
 
 /** how often a broken strategy may be re-picked by itself, per network */
@@ -141,8 +152,18 @@ const CONFIRM_TOP = 3
 const GOOD_TTL_MS = 7 * 24 * 60 * 60_000
 /** own domains / «Напрямую + zapret» rules given to zapret at most */
 const RULE_CHECK_MAX = 50
-/** the video nodes found are reused this long (per network) */
+/** the video nodes found are reused this long by a pick (per network) */
 const NODES_TTL_MS = 30 * 60_000
+/** … and by the regular check (0.7.3: the watch page is ~1 MB — not every 30 min) */
+const NODES_KEEP_MS = 6 * 60 * 60_000
+/** the regular check: at most this many connections at a time (0.7.3; 12 before) */
+const CHECK_PARALLEL = 2
+/** … a target this long at most */
+const CHECK_TARGET_MS = 6000
+/** … the whole check at most (scaled to the number of targets, at least a minute) */
+const CHECK_BUDGET_MAX_MS = 5 * 60_000
+/** a failure of the current strategy is checked once more after this long, before a re-pick */
+const CONFIRM_MS = 5000
 
 // --- the fallback by live traffic (0.7.1) -----------------------------------
 // A connection the zapret set sent direct that got NOTHING back for this long
@@ -178,7 +199,25 @@ export const DNS_FAILS = 2
 export const DNS_HOLD_MS = 30 * 60_000
 const DNS_FAIL_RE = /exchange failed for .*?\b(8\.8\.8\.8|1\.1\.1\.1):(?:443|853)\b/
 
-const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms))
+/** waits `ms`, or less: the signal aborting ends it at once */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve()
+      return
+    }
+    const done = (): void => {
+      clearTimeout(t)
+      signal?.removeEventListener('abort', done)
+      resolve()
+    }
+    const t = setTimeout(done, ms)
+    signal?.addEventListener('abort', done, { once: true })
+  })
+}
+
+/** «14:03:27» — the log line of a check / a pick */
+const clock = (ms: number): string => new Date(ms).toLocaleTimeString('ru-RU', { hour12: false })
 
 function deadline<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
   return new Promise((resolve) => {
@@ -348,6 +387,10 @@ export class ZapretService {
   private lastRulesSig = JSON.stringify([])
   /** which video node a check / a try of a pick uses (alternated) */
   private nodeTurn = 0
+  /** aborted by every deactivation: the probes in flight close their sockets at once */
+  private ac = new AbortController()
+  /** the broker's WinDivert filter: how many of our servers it leaves out (logged on change) */
+  private lastWfExcl: number | undefined
 
   constructor(private d: ZapretDeps) {}
 
@@ -655,6 +698,9 @@ export class ZapretService {
     this.active = true
     this.serviceOk = false
     const gen = ++this.gen
+    this.ac = new AbortController()
+    // a pick runs a dozen probes on this one signal: no false «possible leak» warning
+    setMaxListeners(64, this.ac.signal)
     this.error = undefined
     this.warning = undefined
     this.phase = 'starting'
@@ -676,6 +722,8 @@ export class ZapretService {
   private async deactivate(): Promise<void> {
     const wasActive = this.active
     this.gen++
+    // every probe in flight (DoH, TLS, QUIC, the video page) stops right now
+    this.ac.abort()
     this.active = false
     this.stopTimers()
     this.phase = 'off'
@@ -709,7 +757,7 @@ export class ZapretService {
     const check = setInterval(
       () => {
         if (gen !== this.gen) return
-        void this.serial(() => this.check(gen, true)).catch(() => undefined)
+        void this.serial(() => this.check(gen, true, false, 'по таймеру')).catch(() => undefined)
       },
       this.d.checkEveryMs ?? 10 * 60_000
     )
@@ -742,8 +790,7 @@ export class ZapretService {
     if (gen !== this.gen) return
     this.phase = 'running'
     // a remembered strategy that no longer opens what it opened: picked again (rate-limited)
-    void firstCheck
-    await this.check(gen, true)
+    await this.check(gen, true, false, firstCheck ? 'после подключения' : 'после смены сети')
   }
 
   private async pollNetwork(gen: number): Promise<void> {
@@ -781,7 +828,7 @@ export class ZapretService {
         await this.pick(gen, false)
         return
       }
-      await this.check(gen, false)
+      await this.check(gen, false, false, 'списки изменились')
     })
   }
 
@@ -856,6 +903,7 @@ export class ZapretService {
         return false
       }
       this.dpiUp = st.status === 'running'
+      this.noteFilter(st.wfExcl)
       if (st.wait === 'no_network')
         this.d.log('warn', 'zapret: не найден сетевой адаптер с выходом в интернет')
       return this.dpiUp
@@ -870,6 +918,15 @@ export class ZapretService {
       this.d.log('warn', `zapret: ${text}`)
       return false
     }
+  }
+
+  private noteFilter(n: number | undefined): void {
+    if (n === undefined || n === this.lastWfExcl) return
+    this.lastWfExcl = n
+    if (n > 0)
+      this.d.log('info', `zapret: трафик к серверам VPN (адресов: ${n}) не проходит через zapret`)
+    else if (n < 0)
+      this.d.log('warn', 'zapret: адресов серверов VPN слишком много — их трафик проходит через zapret')
   }
 
   private async stopDpi(): Promise<void> {
@@ -910,13 +967,18 @@ export class ZapretService {
     return [...(SERVICE_DEFS[key as ZapretServiceId]?.targets ?? [])]
   }
 
-  /** the video nodes of this network (cached NODES_TTL_MS); null = no video check */
-  private async videoHosts(doh: DohServer): Promise<string[] | null> {
+  /** the video nodes of this network (reused `maxAge`); null = no video check */
+  private async videoHosts(doh: DohServer, maxAge = NODES_TTL_MS): Promise<string[] | null> {
     if (!this.d.videoNodes) return null
     const fresh =
-      this.nodes && this.nodes.net === this.netId && this.now() - this.nodes.at < NODES_TTL_MS
+      this.nodes && this.nodes.net === this.netId && this.now() - this.nodes.at < maxAge
     if (!fresh || !this.nodes?.list.length) {
-      const list = await this.d.videoNodes(doh, this.path()).catch(() => [] as string[])
+      const signal = this.ac.signal
+      const list = await this.d
+        .videoNodes(doh, this.path(), signal)
+        .catch(() => [] as string[])
+      // switched off meanwhile: nothing is remembered from a cut-off search
+      if (signal.aborted) return []
       this.nodes = { net: this.netId, at: this.now(), list }
       if (list.length)
         this.d.log('info', `zapret: видеосерверы YouTube для проверки — ${list.join(', ')}`)
@@ -929,21 +991,27 @@ export class ZapretService {
    * YouTube's video: `nodes` of the found ones (alternated by the caller) over
    * TCP (TLS + GET /generate_204) and over QUIC (one Initial) — one passing
    * node is enough; the redirector over TCP must open too.
+   * `parallel` connections at a time; `budgetMs` 'auto' = enough for every
+   * target at that pace (≥ 1 min, ≤ CHECK_BUDGET_MAX_MS). No target starts
+   * after the budget; the deactivation aborts the ones in flight.
    */
   private async probe(
     keys: string[],
     doh: DohServer,
-    budgetMs: number,
+    budgetMs: number | 'auto',
     targetMs?: number,
-    nodes = 2
+    nodes = 2,
+    parallel = 12,
+    nodesAge = NODES_TTL_MS
   ): Promise<Map<string, KeyResult>> {
     const path = this.path()
+    const signal = this.ac.signal
     const out = new Map<string, KeyResult>()
     const jobs = keys.flatMap((key) => this.targetsOf(key).map((t) => ({ key, t })))
     const wantVideo = keys.includes(YT_VIDEO) || keys.includes(YT_QUIC)
     let noVideo = false
     if (wantVideo) {
-      const all = await this.videoHosts(doh)
+      const all = await this.videoHosts(doh, nodesAge)
       if (all === null) {
         // no video search (tests): QUIC = the redirector
         if (keys.includes(YT_QUIC))
@@ -966,16 +1034,36 @@ export class ZapretService {
       }
     }
     const results: (TargetResult | null)[] = new Array(jobs.length).fill(null)
+    const budget =
+      budgetMs === 'auto'
+        ? Math.min(
+            CHECK_BUDGET_MAX_MS,
+            Math.max(60_000, Math.ceil(jobs.length / parallel) * ((targetMs ?? 9000) + 1000))
+          )
+        : budgetMs
     let next = 0
+    let over = false
     const worker = async (): Promise<void> => {
-      while (next < jobs.length) {
+      while (next < jobs.length && !over && !signal.aborted) {
         const i = next++
         const { key, t } = jobs[i]
-        let r = await this.d.checkTarget(t, doh, path, targetMs)
+        let r = await this.d.checkTarget(t, doh, path, targetMs, signal)
         // an own domain without an address of its own: www.<domain>
         const own = key.startsWith('d:') || key.startsWith('r:')
-        if (!r.ok && own && (r.error === 'dns' || r.error === 'noaddr') && !t.host.startsWith('www.')) {
-          const w = await this.d.checkTarget({ ...t, host: `www.${t.host}` }, doh, path, targetMs)
+        if (
+          !r.ok &&
+          own &&
+          (r.error === 'dns' || r.error === 'noaddr') &&
+          !t.host.startsWith('www.') &&
+          !signal.aborted
+        ) {
+          const w = await this.d.checkTarget(
+            { ...t, host: `www.${t.host}` },
+            doh,
+            path,
+            targetMs,
+            signal
+          )
           // www opens or fails for real: it decides; it has no address either: the first answer stays
           if (w.ok || r.error === 'dns' || (w.error !== 'dns' && w.error !== 'noaddr')) r = w
         }
@@ -983,10 +1071,12 @@ export class ZapretService {
       }
     }
     await deadline(
-      Promise.all(Array.from({ length: Math.min(12, jobs.length) }, worker)),
-      budgetMs,
+      Promise.all(Array.from({ length: Math.min(parallel, jobs.length) }, worker)),
+      budget,
       undefined
     )
+    // the budget is over: no new target starts (the ones in flight end by their own deadline)
+    over = true
     for (const key of keys) {
       // nothing to aim at (an address range of a rule): direct, live traffic decides
       const none = key.startsWith('r:') && !jobs.some((j) => j.key === key)
@@ -1052,21 +1142,39 @@ export class ZapretService {
     return z?.target.kind === 'domain' ? z.target.value : null
   }
 
-  /** The direct check of every item → the sets; `auto`: a broken strategy is re-picked. */
-  private async check(gen: number, auto: boolean, afterPick = false): Promise<void> {
+  /**
+   * The direct check of every item → the sets; `auto`: a broken strategy is
+   * re-picked (after one more look at what failed). Light (0.7.3): the
+   * strategy that runs, CHECK_PARALLEL connections at a time, one video node;
+   * `why` goes into its log line (with the time and the connections it opened).
+   */
+  private async check(gen: number, auto: boolean, afterPick = false, why = ''): Promise<void> {
     if (gen !== this.gen) return
     const keys = this.checkKeys()
+    const signal = this.ac.signal
+    const t0 = this.now()
+    const c0 = this.d.connections?.() ?? 0
+    let verdict = ''
+    let logged = false
     this.checking = true
     this.publish()
     try {
-      const doh = await this.d.pickDoh(this.path()).catch(() => null)
+      const doh = await this.d.pickDoh(this.path(), signal).catch(() => null)
       if (gen !== this.gen) return
       // after a pick nothing «stopped» opening: the strategy is new
       const before = afterPick ? new Set<string>() : new Set(this.direct)
       // after the core reported the DoH failing, keep the other one for a while
       if (doh && this.now() >= this.dnsHoldUntil) this.dns = doh
       const res = doh
-        ? await this.probe(keys, doh, this.d.checkBudgetMs ?? 60_000)
+        ? await this.probe(
+            keys,
+            doh,
+            this.d.checkBudgetMs ?? 'auto',
+            CHECK_TARGET_MS,
+            1,
+            CHECK_PARALLEL,
+            NODES_KEEP_MS
+          )
         : new Map(
             keys.map((k) => [
               k,
@@ -1075,6 +1183,7 @@ export class ZapretService {
           )
       if (gen !== this.gen) return
       this.setResults(keys, res)
+      verdict = this.directCount(keys)
       this.checkedAt = this.now()
       if (this.phase === 'starting') this.phase = 'running'
       await this.route()
@@ -1088,20 +1197,69 @@ export class ZapretService {
       }
       // the strategy broke: an item it opened when it was picked (or was open a moment ago) fails
       const memo = this.netId ? this.d.getMemory()[this.netId] : undefined
-      const broken = keys.some(
+      const failed = keys.filter(
         (k) => !this.direct.has(k) && (before.has(k) || (memo?.ok ?? []).includes(k))
       )
-      if (auto && broken && this.strategyId && this.canAutoPick()) {
-        this.checking = false
-        this.d.log('info', 'zapret: стратегия перестала работать — подбираем заново')
-        await this.pick(gen, false)
+      // without a DoH nothing can be judged: never a pick from that
+      if (auto && failed.length && this.strategyId && doh) {
+        // a lost packet / a busy node is not a broken strategy: what failed, once more, a bit later
+        await sleep(this.d.confirmMs ?? CONFIRM_MS, signal)
+        if (gen !== this.gen) return
+        const again = await this.probe(
+          failed,
+          doh,
+          'auto',
+          CHECK_TARGET_MS,
+          1,
+          CHECK_PARALLEL,
+          NODES_KEEP_MS
+        )
+        if (gen !== this.gen) return
+        const back = failed.filter(
+          (k) => again.get(k)?.ok && (this.liveHold.get(k) ?? 0) <= this.now()
+        )
+        if (back.length) {
+          for (const k of back) {
+            const note = again.get(k)?.note
+            this.direct.add(k)
+            this.items.set(k, { state: 'direct', ...(note ? { note } : {}) })
+          }
+          this.d.log('info', `zapret: со второй попытки открылось — ${back.join(', ')}; напрямую`)
+          await this.route()
+          verdict = this.directCount(keys)
+        }
+        if (back.length < failed.length && this.canAutoPick()) {
+          this.checking = false
+          this.logCheck(why, t0, c0, verdict)
+          logged = true
+          this.d.log('info', 'zapret: стратегия перестала работать — подбираем заново')
+          await this.pick(gen, false)
+        }
       }
     } finally {
+      if (!logged && why) {
+        // switched off midway: said so (the probes were aborted with it)
+        this.logCheck(why, t0, c0, gen === this.gen && verdict ? verdict : 'прервана')
+      }
       if (gen === this.gen) {
         this.checking = false
         this.publish()
       }
     }
+  }
+
+  private directCount(keys: string[]): string {
+    return `напрямую ${keys.filter((k) => this.direct.has(k)).length} из ${keys.length}`
+  }
+
+  /** «перепроверка (по таймеру) — 14:03:27–14:03:35 (8 с), соединений: 11, напрямую 3 из 3» */
+  private logCheck(why: string, t0: number, c0: number, verdict: string): void {
+    const t1 = this.now()
+    const conns = this.d.connections ? `, соединений: ${this.d.connections() - c0}` : ''
+    this.d.log(
+      'info',
+      `zapret: перепроверка${why ? ` (${why})` : ''} — ${clock(t0)}–${clock(t1)} (${Math.round((t1 - t0) / 1000)} с)${conns}, ${verdict || 'прервана'}`
+    )
   }
 
   private setResults(keys: string[], res: Map<string, KeyResult>): void {
@@ -1234,7 +1392,9 @@ export class ZapretService {
     const t = setTimeout(
       () => {
         if (gen !== this.gen) return
-        void this.serial(() => this.check(gen, true)).catch(() => undefined)
+        void this.serial(() => this.check(gen, true, false, 'после отката по трафику')).catch(
+          () => undefined
+        )
       },
       (repeated ? LIVE_REPEAT_MS : LIVE_RECHECK_MS) + 1000
     )
@@ -1309,6 +1469,10 @@ export class ZapretService {
     this.error = undefined
     this.publish()
     this.d.log('info', `zapret: подбираем стратегию${manual ? ' (вручную)' : ''}…`)
+    const signal = this.ac.signal
+    const t0 = this.now()
+    const c0 = this.d.connections?.() ?? 0
+    let restarts = 0
     const budget = this.d.pickBudgetMs ?? PICK_BUDGET_MS
     const end = this.now() + budget
     const firstEnd = end - Math.min(CONFIRM_RESERVE_MS, budget / 4)
@@ -1325,8 +1489,10 @@ export class ZapretService {
       return known.has(a.id) && !known.has(b.id)
     }
     const tryOne = async (id: string, doh: DohServer, until: number): Promise<Set<string> | null> => {
+      restarts++
       if (!(await this.runStrategy(gen, id))) return null
-      await sleep(this.d.settleMs ?? 1500)
+      await sleep(this.d.settleMs ?? 1500, signal)
+      if (gen !== this.gen) return null
       const res = await this.probe(
         sample,
         doh,
@@ -1340,7 +1506,7 @@ export class ZapretService {
       return new Set(sample.filter((k) => res.get(k)?.ok))
     }
     try {
-      const doh = await this.d.pickDoh(this.path()).catch(() => null)
+      const doh = await this.d.pickDoh(this.path(), signal).catch(() => null)
       if (gen !== this.gen) return
       if (!doh) {
         reason = 'DNS-серверы 8.8.8.8 и 1.1.1.1 не отвечают напрямую'
@@ -1386,6 +1552,12 @@ export class ZapretService {
       }
     } finally {
       if (gen === this.gen) this.picking = undefined
+      const t1 = this.now()
+      const conns = this.d.connections ? `, соединений: ${this.d.connections() - c0}` : ''
+      this.d.log(
+        'info',
+        `zapret: подбор${gen === this.gen ? '' : ' прерван'} — ${clock(t0)}–${clock(t1)} (${Math.round((t1 - t0) / 1000)} с), перезапусков zapret: ${restarts}${conns}`
+      )
     }
     if (gen !== this.gen) return
     const memory = { ...this.d.getMemory() }
@@ -1433,7 +1605,7 @@ export class ZapretService {
     if (gen !== this.gen) return
     this.phase = 'running'
     // the real state of every item (own domains past the sample included)
-    await this.check(gen, false, true)
+    await this.check(gen, false, true, 'после подбора')
   }
 }
 

@@ -4,6 +4,7 @@ import { isIP } from 'node:net'
 import { checkServerIdentity, connect as tlsConnect, type TLSSocket } from 'node:tls'
 import { execLow, parseDefaultRoutes, parseDohJson, pickPhysicalSource } from '../devversion/probes'
 import type { CheckTarget } from './lists'
+import { countConnection, onAbort } from './probeNet'
 import { probeQuic } from './quic'
 
 // ---------------------------------------------------------------------------
@@ -75,9 +76,10 @@ export async function dohResolve(
   server: DohServer,
   path: DirectPath,
   timeoutMs = 4000,
-  cache = true
+  cache = true,
+  signal?: AbortSignal
 ): Promise<string[]> {
-  return (await dohLookup(name, server, path, timeoutMs, cache)).ips
+  return (await dohLookup(name, server, path, timeoutMs, cache, 1, signal)).ips
 }
 
 /** A (or AAAA) records of `name` from one DoH server, directly; never throws. */
@@ -87,7 +89,8 @@ export function dohLookup(
   path: DirectPath,
   timeoutMs = 4000,
   cache = true,
-  type: 1 | 28 = 1
+  type: 1 | 28 = 1,
+  signal?: AbortSignal
 ): Promise<DohAnswer> {
   const d = DOH[server]
   const key = `${server}|${path.localAddress ?? ''}|${name}|${type}`
@@ -95,12 +98,15 @@ export function dohLookup(
   if (cache && hit && hit.until > Date.now()) {
     return Promise.resolve({ ips: hit.ips, answered: true })
   }
+  if (signal?.aborted) return Promise.resolve({ ips: [], answered: false })
+  countConnection()
   return new Promise((resolve) => {
     let done = false
     const finish = (v: DohAnswer): void => {
       if (done) return
       done = true
       clearTimeout(timer)
+      unhook()
       if (v.ips.length) {
         if (dohCache.size > 500) dohCache.clear()
         dohCache.set(key, { ips: v.ips, until: Date.now() + DOH_CACHE_MS })
@@ -139,17 +145,25 @@ export function dohLookup(
       req.destroy()
       finish(fail)
     }, timeoutMs)
+    const unhook = onAbort(signal, () => {
+      req.destroy()
+      finish(fail)
+    })
     req.on('error', () => finish(fail))
     req.end()
   })
 }
 
 /** Which DoH answers directly right now (null = neither). */
-export async function pickDoh(path: DirectPath, timeoutMs = 4000): Promise<DohServer | null> {
+export async function pickDoh(
+  path: DirectPath,
+  timeoutMs = 4000,
+  signal?: AbortSignal
+): Promise<DohServer | null> {
   const [a, b] = await Promise.all([
     // reachability: always asked for real
-    dohResolve('www.google.com', 'primary', path, timeoutMs, false),
-    dohResolve('www.google.com', 'fallback', path, timeoutMs, false)
+    dohResolve('www.google.com', 'primary', path, timeoutMs, false, signal),
+    dohResolve('www.google.com', 'fallback', path, timeoutMs, false, signal)
   ])
   return a.length ? 'primary' : b.length ? 'fallback' : null
 }
@@ -197,9 +211,12 @@ export function probeTls(
   t: CheckTarget,
   path: DirectPath,
   timeoutMs = 6000,
-  port = 443
+  port = 443,
+  signal?: AbortSignal
 ): Promise<TargetResult> {
   const t0 = Date.now()
+  if (signal?.aborted) return Promise.resolve({ host: t.host, ok: false, error: 'aborted' })
+  countConnection()
   return new Promise((resolve) => {
     let sock: TLSSocket | null = null
     let done = false
@@ -207,6 +224,7 @@ export function probeTls(
       if (done) return
       done = true
       clearTimeout(timer)
+      unhook()
       sock?.destroy()
       resolve({
         host: t.host,
@@ -216,6 +234,7 @@ export function probeTls(
       })
     }
     const timer = setTimeout(() => finish(false, 'timeout'), timeoutMs)
+    const unhook = onAbort(signal, () => finish(false, 'aborted'))
     try {
       sock = tlsConnect({
         host: ip,
@@ -274,27 +293,29 @@ export async function checkTarget(
   t: CheckTarget,
   doh: DohServer,
   path: DirectPath,
-  timeoutMs = 9000
+  timeoutMs = 9000,
+  signal?: AbortSignal
 ): Promise<TargetResult> {
   const t0 = Date.now()
   let ips = [t.host]
   if (!isIP(t.host)) {
-    const a = await dohLookup(t.host, doh, path, 4000)
+    const a = await dohLookup(t.host, doh, path, 4000, true, 1, signal)
     ips = a.ips
     // an own domain: no A record — an AAAA one, or «no address» (not a failure of the way)
     if (!ips.length && a.answered && t.tlsOnly) {
-      const v6 = await dohLookup(t.host, doh, path, 3000, true, 28)
+      const v6 = await dohLookup(t.host, doh, path, 3000, true, 28, signal)
       if (!v6.ips.length && v6.answered) return { host: t.host, ok: false, error: 'noaddr' }
       ips = v6.ips
     }
   }
+  if (signal?.aborted) return { host: t.host, ok: false, error: 'aborted' }
   if (!ips.length) return { host: t.host, ok: false, error: 'dns' }
   const left = Math.max(1000, timeoutMs - (Date.now() - t0))
   if (t.quic) {
-    const r = await probeQuic(ips[0], t.host, path.localAddress, Math.min(3000, left))
+    const r = await probeQuic(ips[0], t.host, path.localAddress, Math.min(3000, left), 443, signal)
     return { host: t.host, ok: r.ok, ...(r.ok ? { ms: r.ms } : { error: r.error ?? 'timeout' }) }
   }
-  return probeTls(ips[0], t, path, left)
+  return probeTls(ips[0], t, path, left, 443, signal)
 }
 
 /** Runs `fn` over `items`, at most `limit` at a time (order kept). */

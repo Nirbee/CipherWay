@@ -25,6 +25,7 @@ import {
 } from './dpiBroker'
 import { DpiDaemon, DpiStartError, type DpiRequest } from './DpiDaemon'
 import { SERVICE_DEFS } from './lists'
+import { WF_MAX_TESTS, windivertFilter } from './strategies'
 
 // The DPI broker for real, without elevation: a temp «ProgramData», a fake
 // winws (a tiny C# exe that records its command line) and the real
@@ -237,6 +238,13 @@ describe.skipIf(!win)('DPI broker (no elevation, fake winws / real winws --dry-r
       .trim()
       .split('\n')
     expect(voice).toEqual([...SERVICE_DEFS.discord.cidrs])
+    // 0.7.3: the WinDivert filter — what strategies.ts makes of the same list, byte for byte
+    const wfFile = join(fake.home, 'dpi', 'windivert.txt')
+    expect(readFileSync(wfFile, 'utf8')).toBe(windivertFilter(false, req().exclude))
+    expect(readFileSync(wfFile, 'utf8')).toContain(
+      '(ip or (ipv6.DstAddr!=2001:db8:0:0:0:0:0:7))'
+    )
+    expect(st.wfExcl).toBe(3)
 
     if (st.wait === 'no_network') return // a machine without a default route: nothing to start
     expect(st.dpiPid).toBeGreaterThan(0)
@@ -249,6 +257,9 @@ describe.skipIf(!win)('DPI broker (no elevation, fake winws / real winws --dry-r
       `"--dpi-desync-fake-tls=@${join(fake.bin, 'tls_clienthello_www_google_com.bin')}"`
     )
     expect(cmd).toContain('"--dpi-desync=fake,fakedsplit"')
+    expect(cmd).toContain(`"--wf-raw-part=@${wfFile}"`)
+    expect(cmd).not.toMatch(/--wf-(tcp|udp)=/)
+    expect(cmd).not.toContain('203.0.113')
     expect(cmd).not.toContain('discord')
     expect(cmd).not.toContain(fake.userRun)
     expect(cmd).not.toContain('example.org')
@@ -265,6 +276,8 @@ describe.skipIf(!win)('DPI broker (no elevation, fake winws / real winws --dry-r
     // the voice profile acts on Discord's ranges only
     expect(cmd2).toContain(`"--ipset=${join(fake.home, 'dpi', 'discord-ips.txt')}"`)
     expect(readFileSync(join(fake.home, 'dpi', 'hosts.txt'), 'utf8')).toContain('discord.com')
+    // Discord's ports are in the filter now
+    expect(readFileSync(wfFile, 'utf8')).toBe(windivertFilter(true, req().exclude))
     expect(() => process.kill(st.dpiPid!, 0)).toThrow()
 
     await d.stop()
@@ -318,6 +331,31 @@ describe.skipIf(!win)('DPI broker (no elevation, fake winws / real winws --dry-r
       await d.stop()
     }
   }, 180_000)
+
+  it('the WinDivert filter (0.7.3): ranges masked, duplicates and leading zeros folded, too many → none', async () => {
+    const d = daemon(fake)
+    const exclude = ['010.1.2.3/24', '2001:db8:1::/48', '203.0.113.7', '203.0.113.7/32', '::ffff:0:0/96']
+    const st = await d.start(req({ exclude }))
+    expect(st.status).toBe('running')
+    const wfFile = join(fake.home, 'dpi', 'windivert.txt')
+    const text = readFileSync(wfFile, 'utf8')
+    expect(text).toBe(windivertFilter(false, exclude))
+    expect(text).toContain('(ip.DstAddr<10.1.2.0 or ip.DstAddr>10.1.2.255)')
+    expect(text).toContain(
+      '(ipv6.SrcAddr<2001:db8:1:0:0:0:0:0 or ipv6.SrcAddr>2001:db8:1:ffff:ffff:ffff:ffff:ffff)'
+    )
+    expect(text.match(/ip\.DstAddr!=203\.0\.113\.7/g)).toHaveLength(1)
+    expect(st.wfExcl).toBe(4)
+    // more than WinDivert takes: the filter as before 0.7.3 (no address in it)
+    const many = Array.from({ length: WF_MAX_TESTS + 1 }, (_, i) => `198.51.100.${i}`)
+    const st2 = await d.apply(req({ exclude: many }))
+    expect(st2.wfExcl).toBe(-1)
+    expect(readFileSync(wfFile, 'utf8')).toBe(windivertFilter(false, []))
+    expect(readFileSync(join(fake.home, 'dpi-broker.log'), 'utf8')).toContain(
+      'адресов серверов VPN слишком много для фильтра WinDivert'
+    )
+    await d.stop()
+  }, 90_000)
 
   it('IP rules (0.7.2): an ipset of their own, its profiles only then; the hostlist stays inert without domains', async () => {
     const d = daemon(fake)

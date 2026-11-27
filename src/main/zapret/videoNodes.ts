@@ -1,5 +1,6 @@
 import { request as httpsRequest } from 'node:https'
 import { dohResolve, type DirectPath, type DohServer } from './checks'
+import { countConnection, onAbort } from './probeNet'
 
 // ---------------------------------------------------------------------------
 // YouTube's video servers (0.7.1). www.youtube.com and redirector.googlevideo.com
@@ -81,12 +82,14 @@ export async function getDirect(
   doh: DohServer,
   path: DirectPath,
   maxBytes: number,
-  timeoutMs: number
+  timeoutMs: number,
+  signal?: AbortSignal
 ): Promise<string | null> {
   const t0 = Date.now()
-  const ips = await dohResolve(host, doh, path, Math.min(4000, timeoutMs))
-  if (!ips.length) return null
+  const ips = await dohResolve(host, doh, path, Math.min(4000, timeoutMs), true, signal)
+  if (!ips.length || signal?.aborted) return null
   const left = Math.max(1000, timeoutMs - (Date.now() - t0))
+  countConnection()
   return new Promise((resolve) => {
     let done = false
     const chunks: Buffer[] = []
@@ -95,6 +98,7 @@ export async function getDirect(
       if (done) return
       done = true
       clearTimeout(timer)
+      unhook()
       req.destroy()
       resolve(v)
     }
@@ -132,6 +136,7 @@ export async function getDirect(
       () => finish(size > 0 ? Buffer.concat(chunks).toString('utf8') : null),
       left
     )
+    const unhook = onAbort(signal, () => finish(null))
     req.on('error', () => finish(null))
     req.end()
   })

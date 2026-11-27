@@ -1,6 +1,7 @@
 import { createCipheriv, createHmac, generateKeyPairSync, randomBytes } from 'node:crypto'
 import { createSocket } from 'node:dgram'
 import { isIP } from 'node:net'
+import { countConnection, onAbort } from './probeNet'
 
 // ---------------------------------------------------------------------------
 // A QUIC probe of a YouTube video node (0.7.2). Browsers fetch YouTube video
@@ -221,9 +222,12 @@ export function probeQuic(
   sni: string,
   localAddress?: string,
   timeoutMs = 3000,
-  port = 443
+  port = 443,
+  signal?: AbortSignal
 ): Promise<QuicResult> {
   const t0 = Date.now()
+  if (signal?.aborted) return Promise.resolve({ ok: false, error: 'aborted' })
+  countConnection()
   return new Promise((resolve) => {
     let done = false
     const sock = createSocket(isIP(ip) === 6 ? 'udp6' : 'udp4')
@@ -231,6 +235,7 @@ export function probeQuic(
       if (done) return
       done = true
       clearTimeout(timer)
+      unhook()
       try {
         sock.close()
       } catch {
@@ -239,6 +244,7 @@ export function probeQuic(
       resolve(r)
     }
     const timer = setTimeout(() => finish({ ok: false, error: 'timeout' }), timeoutMs)
+    const unhook = onAbort(signal, () => finish({ ok: false, error: 'aborted' }))
     sock.on('error', (e) =>
       finish({ ok: false, error: `udp:${(e as { code?: string }).code ?? 'error'}` })
     )

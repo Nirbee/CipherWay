@@ -255,8 +255,159 @@ export const PLACEHOLDERS = [
   '%HOSTS%',
   '%EXCL%',
   '%DISCORD_IPS%',
-  '%USER_IPS%'
+  '%USER_IPS%',
+  '%WF%'
 ] as const
+
+// --- what WinDivert hands to winws at all (0.7.3) ----------------------------
+// winws v72.13 (nfq/nfqws.c wf_make_filter) turns --wf-tcp=80,443 / --wf-udp=443
+// into «outbound and (!tcp or tcp.Syn or tcp.Rst or tcp.Fin or
+// tcp.PayloadLength>0) and (tcp.DstPort == 443 … or udp.DstPort == 443)» —
+// EVERY data packet of every TCP connection to those ports and every UDP
+// datagram to 443 goes through winws in user mode, with no address filter:
+// our own VPN tunnel to a server on 443 (VLESS Reality over TCP, Hysteria2
+// over UDP) included. --ipset-exclude only stops the desync, not the trip
+// through winws (delay, jitter of the whole tunnel; packets in flight are lost
+// when winws restarts during a pick). So the kernel filter is ours
+// (--wf-raw-part, a file the broker writes): the same packets the constructor
+// takes for TCP (non-empty outbound + the incoming SYN-ACK / RST / FIN that
+// autottl needs), UDP 443 only for a QUIC v1 Initial (the layout of
+// zapret's windivert_part.quic_initial_ietf.txt — the only QUIC packet winws
+// acts on), and our servers' addresses left out IN THE KERNEL. winws still adds
+// its prolog (!impostor, !loopback, ifIdx of --wf-iface) and the LAN filter.
+// WinDivert 2.2: `!` negates ONE test only (not a group), and a test of a field
+// the packet does not have is false whatever the operator (`!ip.DstAddr==A` is
+// false for an IPv6 packet too — checked with WinDivertHelperEvalFilter) — so
+// each family's address tests sit behind a guard: `(ipv6 or (ip.DstAddr!=A …))`.
+
+/** outbound TCP to `ports`: the packets winws' own constructor takes (empty ACKs skipped) */
+const wfTcpOut = (ports: string): string =>
+  `(tcp and (${ports
+    .split(',')
+    .map((p) => `tcp.DstPort==${p}`)
+    .join(' or ')}) and (tcp.Syn or tcp.Rst or tcp.Fin or tcp.PayloadLength>0))`
+
+/** incoming SYN-ACK / RST / FIN from `ports` (autottl reads the server's TTL from the SYN-ACK) */
+const wfTcpIn = (ports: string): string =>
+  `(tcp and (${ports
+    .split(',')
+    .map((p) => `tcp.SrcPort==${p}`)
+    .join(' or ')}) and (tcp.Ack and tcp.Syn or tcp.Rst or tcp.Fin))`
+
+/** a QUIC v1 Initial to UDP 443: long header, type Initial, version 1, ≥ 256 bytes */
+export const WF_QUIC_INITIAL =
+  '(udp and udp.DstPort==443 and udp.PayloadLength>=256 and udp.Payload[0]>=0xC0 and udp.Payload[0]<0xD0 and udp.Payload[1]==0 and udp.Payload16[1]==0 and udp.Payload[4]==1)'
+
+/** Discord voice: its UDP ports as before (winws recognizes the protocol itself) */
+const wfDiscordUdp = (): string =>
+  `(udp and (${DISCORD_UDP.split(',')
+    .map((r) => {
+      const [a, b] = r.split('-')
+      return b ? `udp.DstPort>=${a} and udp.DstPort<=${b}` : `udp.DstPort==${a}`
+    })
+    .join(' or ')}))`
+
+/**
+ * The fixed parts of our WinDivert filter: `out` (outbound packets winws gets)
+ * and `in` (incoming ones). The broker appends the address tests of our servers
+ * to both; nothing else is ever added.
+ */
+export function wfParts(discord: boolean): { out: string; in: string } {
+  const tcp = `80,443${discord ? `,${DISCORD_TCP}` : ''}`
+  const out = [wfTcpOut(tcp), WF_QUIC_INITIAL, ...(discord ? [wfDiscordUdp()] : [])]
+  return { out: `outbound and (${out.join(' or ')})`, in: `inbound and ${wfTcpIn(tcp)}` }
+}
+
+/**
+ * The most address tests (a single address = 1, a range = 2) per direction:
+ * WinDivert 2.2 refuses a longer filter (checked with WinDivertHelperCompileFilter
+ * on the shipped WinDivert.dll: 80 single addresses still compile, 88 do not).
+ * More → no exclusion in the kernel (the filter as before 0.7.3, --ipset-exclude only).
+ */
+export const WF_MAX_TESTS = 64
+
+const v4Num = (s: string): bigint =>
+  s.split('.').reduce((n, o) => (n << 8n) | BigInt(Number(o)), 0n)
+
+function v6Num(s: string): bigint {
+  // expanded by hand: «::» → the missing zero groups
+  const [head, tail] = s.includes('::') ? s.split('::') : [s, undefined]
+  const h = head ? head.split(':') : []
+  const t = tail === undefined ? [] : tail ? tail.split(':') : []
+  const groups = tail === undefined ? h : [...h, ...Array(8 - h.length - t.length).fill('0'), ...t]
+  return groups.reduce((n, g) => (n << 16n) | BigInt(parseInt(g, 16)), 0n)
+}
+
+const v4Text = (n: bigint): string =>
+  [24n, 16n, 8n, 0n].map((s) => String((n >> s) & 0xffn)).join('.')
+const v6Text = (n: bigint): string =>
+  [112n, 96n, 80n, 64n, 48n, 32n, 16n, 0n].map((s) => ((n >> s) & 0xffffn).toString(16)).join(':')
+
+/**
+ * One excluded address / range as the WinDivert tests for `dir` (Dst / Src)
+ * that are true for every OTHER address of its family; `key` = the range, for
+ * dropping duplicates. The broker does the same in PowerShell (Wf-Tests) —
+ * this one is for the tests and documentation. Input: plain IPv4 / IPv6 (no
+ * IPv4-in-IPv6 dots), optional /prefix.
+ */
+export function wfAddressTests(
+  cidr: string,
+  dir: 'Dst' | 'Src'
+): { key: string; n: number; v6: boolean; text: string } {
+  const [addr, mask] = cidr.split('/')
+  const v6 = addr.includes(':')
+  const width = v6 ? 128n : 32n
+  const bits = BigInt(mask === undefined ? Number(width) : Number(mask))
+  const n = v6 ? v6Num(addr.toLowerCase()) : v4Num(addr)
+  const all = (1n << width) - 1n
+  const host = (1n << (width - bits)) - 1n
+  const lo = n & (all ^ host)
+  const hi = lo | host
+  const text = v6 ? v6Text : v4Text
+  const f = `${v6 ? 'ipv6' : 'ip'}.${dir}Addr`
+  const key = `${text(lo)}-${text(hi)}`
+  if (lo === hi) return { key, n: 1, v6, text: `${f}!=${text(lo)}` }
+  return { key, n: 2, v6, text: `(${f}<${text(lo)} or ${f}>${text(hi)})` }
+}
+
+/**
+ * The address part of the filter: each family's tests behind a guard — an
+ * IPv4 test is false for an IPv6 packet (a missing field fails, `!=` too), so
+ * `(ipv6 or (…IPv4 tests…)) and (ip or (…IPv6 tests…))`. '' = nothing excluded.
+ */
+function wfExclusion(tests: { v6: boolean; text: string }[]): string {
+  const v4 = tests.filter((t) => !t.v6).map((t) => t.text)
+  const v6 = tests.filter((t) => t.v6).map((t) => t.text)
+  return [
+    ...(v4.length ? [`(ipv6 or (${v4.join(' and ')}))`] : []),
+    ...(v6.length ? [`(ip or (${v6.join(' and ')}))`] : [])
+  ].join(' and ')
+}
+
+/**
+ * The --wf-raw-part file of the broker (Wf-Filter): our parts, our servers'
+ * addresses left out of both directions; too many → none left out.
+ */
+export function windivertFilter(discord: boolean, exclude: readonly string[]): string {
+  const p = wfParts(discord)
+  const seen = new Set<string>()
+  const dst: { v6: boolean; text: string }[] = []
+  const src: { v6: boolean; text: string }[] = []
+  let tests = 0
+  for (const x of exclude) {
+    const d = wfAddressTests(x, 'Dst')
+    if (seen.has(d.key)) continue
+    seen.add(d.key)
+    tests += d.n
+    dst.push(d)
+    src.push(wfAddressTests(x, 'Src'))
+  }
+  const tooMany = tests > WF_MAX_TESTS
+  const out = dst.length && !tooMany ? `${p.out} and ${wfExclusion(dst)}` : p.out
+  const inb = src.length && !tooMany ? `${p.in} and ${wfExclusion(src)}` : p.in
+  return `(${out})\nor\n(${inb})\n`
+}
+
 /** a token: `--option` or `--option=value`, value without spaces / quotes / shell syntax */
 export const TOKEN_RE = /^--[a-z0-9-]+(=[A-Za-z0-9@%.,:+!=_-]+)?$/
 
@@ -264,13 +415,14 @@ export const TOKEN_RE = /^--[a-z0-9-]+(=[A-Za-z0-9@%.,:+!=_-]+)?$/
  * The whole winws command line of a strategy, as tokens with placeholders.
  * `discord`: the Discord profiles (voice UDP, extra TLS ports) are added.
  * The interface (--wf-iface) is added by the broker: it finds the adapter.
+ * The packets winws gets: the broker's filter file %WF% (windivertFilter —
+ * the Discord ports in it follow the same switch).
  */
 export function winwsTokens(s: DpiStrategy, discord: boolean): string[] {
   const excl = '--ipset-exclude=%EXCL%'
   const hosts = '--hostlist=%HOSTS%'
   const t: string[] = [
-    `--wf-tcp=80,443${discord ? `,${DISCORD_TCP}` : ''}`,
-    `--wf-udp=443${discord ? `,${DISCORD_UDP}` : ''}`,
+    '--wf-raw-part=@%WF%',
     // QUIC (YouTube in the browser)
     '--filter-udp=443',
     hosts,

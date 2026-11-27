@@ -2,6 +2,7 @@ import { createServer, type Server, type Socket } from 'node:net'
 import { afterAll, describe, expect, it } from 'vitest'
 import { isServerAlert, mapLimit, networkId, parseArpMac, parseDohAnswer, probeTls } from './checks'
 import { parseDefaultRoutes, pickPhysicalSource } from '../devversion/probes'
+import { connectionsOpened } from './probeNet'
 
 describe('network id', () => {
   it('PPPoE: an on-link default route is the network (our TUN skipped); its id survives a new address', () => {
@@ -64,6 +65,28 @@ describe('probeTls never hangs', () => {
     expect(r).toEqual({ host: 'example.org', ok: false, error: 'timeout' })
     expect(Date.now() - t0).toBeGreaterThanOrEqual(700)
     expect(Date.now() - t0).toBeLessThan(2000)
+  })
+
+  it('zapret switched off: the probe in flight ends at once, its connection counted (0.7.3)', async () => {
+    const before = connectionsOpened()
+    const ac = new AbortController()
+    const t0 = Date.now()
+    setTimeout(() => ac.abort(), 100)
+    const r = await probeTls(
+      '127.0.0.1',
+      { host: 'example.org', http: true },
+      {},
+      5000,
+      await port,
+      ac.signal
+    )
+    expect(r).toEqual({ host: 'example.org', ok: false, error: 'aborted' })
+    expect(Date.now() - t0).toBeLessThan(1000)
+    expect(connectionsOpened()).toBe(before + 1)
+    // already aborted: nothing is opened at all
+    const r2 = await probeTls('127.0.0.1', { host: 'example.org', http: true }, {}, 5000, await port, ac.signal)
+    expect(r2.error).toBe('aborted')
+    expect(connectionsOpened()).toBe(before + 1)
   })
 
   it('a closed port → an error at once, not a hang', async () => {
