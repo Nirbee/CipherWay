@@ -231,3 +231,40 @@ body {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* «Новогоднее оформление» (0.7.6): soft twinkle over the garland's bulbs */
+@keyframes ny-twinkle {
+  0%,
+  100% {
+    opacity: 0.25;
+    transform: scale(0.8);
+  }
+  50% {
+    opacity: 0.95;
+    transform: scale(1.15);
+  }
+}
+.ny-light {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  margin: -7px 0 0 -7px;
+  border-radius: 9999px;
+  background: radial-gradient(
+    circle,
+    rgba(255, 240, 190, 0.95) 0,
+    rgba(255, 200, 100, 0.5) 35%,
+    rgba(255, 170, 60, 0) 70%
+  );
+  mix-blend-mode: screen;
+  animation: ny-twinkle 2.8s ease-in-out infinite;
+}
+.ny-snowcap svg {
+  filter: drop-shadow(0 1px 1.5px rgba(0, 0, 0, 0.35));
+}
+@media (prefers-reduced-motion: reduce) {
+  .ny-light {
+    animation: none;
+    opacity: 0.6;
+  }
+}

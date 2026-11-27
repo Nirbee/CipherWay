@@ -8,6 +8,7 @@ import {
   type TunServiceInfo
 } from '@shared/types'
 import { buildDiagnostics } from '@shared/diagnostics'
+import { sanitizeNewYearMode, type NewYearMode } from '@shared/seasonal'
 import { CHANGELOG } from '@shared/changelog'
 import { PageHeader } from '../components/PageHeader'
 import { Button, Card, Input, Toggle } from '../components/ui'
@@ -115,6 +116,23 @@ export function SettingsPage() {
               onChange={(v) => void save({ autoConnect: v })}
             />
           </Row>
+        </Section>
+
+        <Section
+          title="Новогоднее оформление"
+          hint="Снег на карточках, колпак на кнопке, гирлянда и падающий снег. В «Авто» — с 1 декабря по 14 января."
+        >
+          <div className="grid grid-cols-4 gap-3">
+            {NEW_YEAR_OPTIONS.map((o) => (
+              <ModeCard
+                key={o.mode}
+                active={sanitizeNewYearMode(settings.newYearDecor) === o.mode}
+                onClick={() => void save({ newYearDecor: o.mode })}
+                title={o.title}
+                desc={o.desc}
+              />
+            ))}
+          </div>
         </Section>
 
         <Section
@@ -310,6 +328,25 @@ const PING_OPTIONS: { mode: PingMode; title: string; desc: string }[] = [
     title: 'До сервера (TCP)',
     desc: 'Время TCP-соединения с адресом сервера напрямую, без проверки VPN: сервер может отвечать, а VPN через него — нет. Для Hysteria2 (работает по UDP) недоступно.'
   }
+]
+
+const NEW_YEAR_OPTIONS: { mode: NewYearMode; title: string; desc: string }[] = [
+  {
+    mode: 'auto',
+    title: 'Авто',
+    desc: 'Полное оформление с 1 декабря по 14 января, в остальное время выключено.'
+  },
+  {
+    mode: 'light',
+    title: 'Лёгкое',
+    desc: 'Снег на карточках, колпак, гирлянда и падающий снег — без картинок фона.'
+  },
+  {
+    mode: 'full',
+    title: 'Полное',
+    desc: 'Всё из «Лёгкого», плюс зимний ночной фон, ёлка и кот на главной.'
+  },
+  { mode: 'off', title: 'Выкл', desc: 'Обычный вид приложения.' }
 ]
 
 /** Settings → «Пинг»: what the server list measures and how long a server gets. */

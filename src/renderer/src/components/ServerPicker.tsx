@@ -4,6 +4,7 @@ import { useServerList, type ServerEntry } from '../hooks/useServerList'
 import { useConnection } from '../store/connectionStore'
 import { PROTOCOL_LABEL } from '../lib/format'
 import { cn } from '../lib/cn'
+import { SnowCap } from '../seasonal'
 import { Flag } from './Flag'
 import { LatencyBadge } from './LatencyBadge'
 import { CheckIcon, ChevronDownIcon, RefreshIcon } from './icons'
@@ -67,6 +68,7 @@ export function ServerPicker() {
         </div>
       )}
 
+      <SnowCap seed="picker" icicles />
       <button
         onClick={() => setOpen((v) => !v)}
         className={cn(

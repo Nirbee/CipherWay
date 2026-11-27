@@ -3,6 +3,7 @@ import { useConnection } from '../store/connectionStore'
 import { useSupport } from '../store/supportStore'
 import { useDev } from '../store/devStore'
 import { cn } from '../lib/cn'
+import { SnowCap, useNewYear } from '../seasonal'
 import {
   ActivityIcon,
   CardIcon,
@@ -47,11 +48,13 @@ export function Sidebar() {
   const unread = useSupport((s) => s.view?.unread ?? 0)
   const dev = useDev((s) => s.status.enabled)
   const items = dev ? [...NAV.slice(0, -1), STATS_ITEM, NAV[NAV.length - 1]] : NAV
+  // «Новогоднее оформление»: room for the garland above the logo and the snow above the first item
+  const newYear = useNewYear() !== 'off'
 
   return (
     <nav className="drag-region flex w-[216px] shrink-0 flex-col border-r border-border-subtle bg-bg-sidebar">
       {/* brand + live state */}
-      <div className="flex items-center gap-3 px-5 pb-5 pt-5">
+      <div className={cn('flex items-center gap-3 px-5', newYear ? 'pb-3 pt-8' : 'pb-5 pt-5')}>
         <div className="relative">
           <img src={shield} alt="" className="h-9 w-9 rounded-xl object-cover" />
           <span
@@ -85,7 +88,12 @@ export function Sidebar() {
       </div>
 
       {/* nav */}
-      <div className="no-drag flex flex-1 flex-col gap-0.5 overflow-y-auto px-3">
+      <div
+        className={cn(
+          'no-drag flex flex-1 flex-col gap-0.5 overflow-y-auto px-3',
+          newYear && 'pt-2'
+        )}
+      >
         {items.map(({ key, label, Icon }) => {
           const active = page === key
           return (
@@ -100,6 +108,7 @@ export function Sidebar() {
                   : 'text-text-muted hover:bg-bg-elevated/60 hover:text-text-primary'
               )}
             >
+              {active && <SnowCap seed={`nav-${key}`} size="sm" inset={-1} />}
               <span
                 className={cn(
                   'absolute left-0 top-1/2 h-4 w-[3px] -translate-y-1/2 rounded-r-full bg-accent-green transition-all duration-300 ease-spring',

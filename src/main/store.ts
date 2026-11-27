@@ -7,6 +7,7 @@ import {
   type RulesConfig,
   type SubscriptionData
 } from '@shared/types'
+import { DEFAULT_NEW_YEAR_MODE, sanitizeNewYearMode } from '@shared/seasonal'
 import type { DevLastUpload, DevVersionConsent } from '@shared/devversion'
 import { DEFAULT_ZAPRET, sanitizeZapretSettings, type ZapretSettings } from '@shared/zapret'
 
@@ -61,7 +62,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   apiBase: DEFAULT_API_BASE,
   tunService: true,
   pingMode: DEFAULT_PING_MODE,
-  pingTimeoutSec: DEFAULT_PING_TIMEOUT_S
+  pingTimeoutSec: DEFAULT_PING_TIMEOUT_S,
+  newYearDecor: DEFAULT_NEW_YEAR_MODE
 }
 
 export const DEFAULT_RULES: RulesConfig = {
@@ -110,7 +112,8 @@ export const store = new Store<Schema>({
 
 /** Settings merged over the defaults (stores written by older versions lack new keys). */
 export function getSettings(): AppSettings {
-  return { ...DEFAULT_SETTINGS, ...store.get('settings') }
+  const s = { ...DEFAULT_SETTINGS, ...store.get('settings') }
+  return { ...s, newYearDecor: sanitizeNewYearMode(s.newYearDecor) }
 }
 
 /** «Ускорение без VPN» settings, cleaned up (an older / edited store can't break it). */

@@ -4,6 +4,7 @@ import { useConnection } from '../store/connectionStore'
 import { toast } from '../store/toastStore'
 import { errorText } from '../lib/format'
 import { cn } from '../lib/cn'
+import { SnowCap } from '../seasonal'
 import { DirectIcon, ShieldIcon, SplitIcon } from './icons'
 
 export const ROUTING_MODES: {
@@ -38,7 +39,8 @@ export function ModeSwitch() {
   }
 
   return (
-    <div className="rounded-2xl border border-border-subtle bg-bg-panel/70 p-1.5">
+    <div className="relative rounded-2xl border border-border-subtle bg-bg-panel/70 p-1.5">
+      <SnowCap seed="mode" size="sm" inset={-2} />
       <div className="px-2 pb-1.5 pt-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-text-faint">
         Режим трафика
       </div>

@@ -15,6 +15,7 @@ import {
   CardIcon,
   ExternalIcon,
   MegaphoneIcon,
+  SnowflakeIcon,
   PowerIcon,
   RefreshIcon,
   SupportIcon
@@ -29,6 +30,7 @@ import {
   plural
 } from '../lib/format'
 import { cn } from '../lib/cn'
+import { SantaHat, SnowCap, useNewYear } from '../seasonal'
 
 function useNow(active: boolean): number {
   const [now, setNow] = useState(Date.now())
@@ -45,6 +47,7 @@ export function HomePage() {
   const loadActive = useServers((s) => s.loadActive)
   const test = useServers((s) => s.test)
   const hasServers = !!data?.servers.length
+  const newYear = useNewYear()
 
   useEffect(() => {
     void load()
@@ -57,7 +60,13 @@ export function HomePage() {
   }, [hasServers, test])
 
   return (
-    <div className="mx-auto flex h-full w-full max-w-[760px] flex-col gap-5 px-7 pb-6 pt-2">
+    <div
+      className={cn(
+        'mx-auto flex h-full w-full max-w-[760px] flex-col gap-5 px-7 pb-6',
+        // the snow on the top card rises ~15px over it: keep it inside the scroll area
+        newYear === 'off' ? 'pt-2' : 'pt-5'
+      )}
+    >
       {data?.announce && <Announcement text={data.announce} />}
       {loaded && <ProfileCard />}
       <div className="flex min-h-[300px] flex-1 flex-col items-center justify-center">
@@ -72,10 +81,16 @@ export function HomePage() {
 
 function Announcement({ text }: { text: string }) {
   const [hidden, setHidden] = useState(false)
+  const newYear = useNewYear()
   if (hidden) return null
   return (
-    <div className="animate-fade flex items-start gap-3 rounded-2xl border border-accent-blue/30 bg-accent-blue/10 px-4 py-3">
-      <MegaphoneIcon width={18} height={18} className="mt-0.5 shrink-0 text-accent-blue-bright" />
+    <div className="animate-fade relative flex items-start gap-3 rounded-2xl border border-accent-blue/30 bg-accent-blue/10 px-4 py-3">
+      {/* «Новогоднее оформление»: no snow here (too much next to the cards), a snowflake instead */}
+      {newYear === 'off' ? (
+        <MegaphoneIcon width={18} height={18} className="mt-0.5 shrink-0 text-accent-blue-bright" />
+      ) : (
+        <SnowflakeIcon width={18} height={18} className="mt-0.5 shrink-0 text-accent-blue-bright" />
+      )}
       <p className="min-w-0 flex-1 whitespace-pre-line text-[13px] leading-relaxed text-text-secondary select-text">
         {text}
       </p>
@@ -101,7 +116,8 @@ function ProfileCard() {
 
   if (!data) {
     return (
-      <div className="animate-fade flex items-center gap-4 rounded-card border border-border-default bg-bg-panel px-5 py-4">
+      <div className="animate-fade relative flex items-center gap-4 rounded-card border border-border-default bg-bg-panel px-5 py-4">
+        <SnowCap seed="profile-empty" />
         <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-accent-green/10 text-accent-green">
           <CardIcon width={20} height={20} />
         </div>
@@ -128,7 +144,8 @@ function ProfileCard() {
   const lowTraffic = total > 0 && left / total < 0.1
 
   return (
-    <div className="animate-fade rounded-card border border-border-default bg-bg-panel p-4">
+    <div className="animate-fade relative rounded-card border border-border-default bg-bg-panel p-4">
+      <SnowCap seed="profile" />
       <div className="flex items-center gap-3 px-1">
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
@@ -274,6 +291,7 @@ function Tile({
 // --- the big button ----------------------------------------------------------
 
 function ConnectHero({ hasServers }: { hasServers: boolean }) {
+  const newYear = useNewYear()
   const { state, message, traffic, connectedAt, connect, disconnect } = useConnection()
   const mode = useSettings((s) => s.settings?.routingMode ?? 'rule')
   const setPage = useNav((s) => s.setPage)
@@ -291,88 +309,92 @@ function ConnectHero({ hasServers }: { hasServers: boolean }) {
 
   return (
     <div className="flex flex-col items-center">
-      <button
-        onClick={onToggle}
-        disabled={!hasServers && !connected && !connecting}
-        aria-label={connected || connecting ? 'Отключить' : 'Подключить'}
-        className="group relative flex h-[196px] w-[196px] items-center justify-center rounded-full outline-none transition-transform duration-300 ease-spring active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-40"
-      >
-        {/* soft halo */}
-        <span
-          className={cn(
-            'absolute inset-0 rounded-full transition-opacity duration-500',
-            connected ? 'animate-glow opacity-100' : 'opacity-0'
-          )}
-        />
-        <svg viewBox="0 0 196 196" className="absolute inset-0 h-full w-full">
-          <defs>
-            <linearGradient id="cw-ring" x1="0" y1="0" x2="1" y2="1">
-              {/* accent variables: silver in DevVersion */}
-              <stop offset="0%" style={{ stopColor: 'rgb(var(--c-accent-blue))' }} />
-              <stop offset="100%" style={{ stopColor: 'rgb(var(--c-status-ok))' }} />
-            </linearGradient>
-          </defs>
-          <circle
-            cx="98"
-            cy="98"
-            r="90"
-            fill="none"
-            stroke="rgba(255,255,255,0.05)"
-            strokeWidth="5"
-          />
-          <circle
-            cx="98"
-            cy="98"
-            r="90"
-            fill="none"
-            stroke={
-              connected
-                ? 'url(#cw-ring)'
-                : connecting
-                  ? '#f5b942'
-                  : error
-                    ? '#f56565'
-                    : 'rgb(var(--c-accent-green) / 0.22)'
-            }
-            strokeWidth="5"
-            strokeLinecap="round"
-            strokeDasharray={connecting ? '110 455' : undefined}
-            className={cn(
-              'origin-center transition-[stroke] duration-500',
-              connecting && 'animate-[ring-spin_1.1s_linear_infinite]'
-            )}
-            style={{ transformBox: 'fill-box' }}
-          />
-        </svg>
-        <span
-          className={cn(
-            'flex h-[152px] w-[152px] flex-col items-center justify-center rounded-full border transition-all duration-300',
-            connected
-              ? 'border-status-ok/30 bg-status-ok/10'
-              : error
-                ? 'border-accent-red/30 bg-accent-red/5'
-                : 'border-border-subtle bg-bg-panel group-hover:bg-bg-elevated'
-          )}
+      {/* room for Santa's hat over the ring: it rises ~45px above the button */}
+      <div className={cn('relative', newYear !== 'off' && 'mt-8')}>
+        <button
+          onClick={onToggle}
+          disabled={!hasServers && !connected && !connecting}
+          aria-label={connected || connecting ? 'Отключить' : 'Подключить'}
+          className="group relative flex h-[196px] w-[196px] items-center justify-center rounded-full outline-none transition-transform duration-300 ease-spring active:scale-[0.97] disabled:cursor-not-allowed disabled:opacity-40"
         >
-          <PowerIcon
-            width={48}
-            height={48}
+          {/* soft halo */}
+          <span
             className={cn(
-              'transition-colors duration-300',
-              connected
-                ? 'text-status-ok'
-                : connecting
-                  ? 'text-accent-amber'
-                  : error
-                    ? 'text-accent-red'
-                    : 'text-text-muted group-hover:text-text-primary'
+              'absolute inset-0 rounded-full transition-opacity duration-500',
+              connected ? 'animate-glow opacity-100' : 'opacity-0'
             )}
           />
-          <span className="mt-2 text-xs font-semibold uppercase tracking-[0.12em] text-text-muted">
-            {connected ? 'Отключить' : connecting ? 'Отмена' : 'Подключить'}
+          <svg viewBox="0 0 196 196" className="absolute inset-0 h-full w-full">
+            <defs>
+              <linearGradient id="cw-ring" x1="0" y1="0" x2="1" y2="1">
+                {/* accent variables: silver in DevVersion */}
+                <stop offset="0%" style={{ stopColor: 'rgb(var(--c-accent-blue))' }} />
+                <stop offset="100%" style={{ stopColor: 'rgb(var(--c-status-ok))' }} />
+              </linearGradient>
+            </defs>
+            <circle
+              cx="98"
+              cy="98"
+              r="90"
+              fill="none"
+              stroke="rgba(255,255,255,0.05)"
+              strokeWidth="5"
+            />
+            <circle
+              cx="98"
+              cy="98"
+              r="90"
+              fill="none"
+              stroke={
+                connected
+                  ? 'url(#cw-ring)'
+                  : connecting
+                    ? '#f5b942'
+                    : error
+                      ? '#f56565'
+                      : 'rgb(var(--c-accent-green) / 0.22)'
+              }
+              strokeWidth="5"
+              strokeLinecap="round"
+              strokeDasharray={connecting ? '110 455' : undefined}
+              className={cn(
+                'origin-center transition-[stroke] duration-500',
+                connecting && 'animate-[ring-spin_1.1s_linear_infinite]'
+              )}
+              style={{ transformBox: 'fill-box' }}
+            />
+          </svg>
+          <span
+            className={cn(
+              'flex h-[152px] w-[152px] flex-col items-center justify-center rounded-full border transition-all duration-300',
+              connected
+                ? 'border-status-ok/30 bg-status-ok/10'
+                : error
+                  ? 'border-accent-red/30 bg-accent-red/5'
+                  : 'border-border-subtle bg-bg-panel group-hover:bg-bg-elevated'
+            )}
+          >
+            <PowerIcon
+              width={48}
+              height={48}
+              className={cn(
+                'transition-colors duration-300',
+                connected
+                  ? 'text-status-ok'
+                  : connecting
+                    ? 'text-accent-amber'
+                    : error
+                      ? 'text-accent-red'
+                      : 'text-text-muted group-hover:text-text-primary'
+              )}
+            />
+            <span className="mt-2 text-xs font-semibold uppercase tracking-[0.12em] text-text-muted">
+              {connected ? 'Отключить' : connecting ? 'Отмена' : 'Подключить'}
+            </span>
           </span>
-        </span>
-      </button>
+        </button>
+        <SantaHat />
+      </div>
 
       <div className="mt-5 text-center">
         <div

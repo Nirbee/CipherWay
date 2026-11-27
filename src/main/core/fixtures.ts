@@ -35,7 +35,8 @@ export const TEST_SETTINGS: AppSettings = {
   apiBase: 'https://cabinet.example.com',
   tunService: true,
   pingMode: 'keepalive',
-  pingTimeoutSec: 7
+  pingTimeoutSec: 7,
+  newYearDecor: 'auto'
 }
 
 export const TEST_RULES: RulesConfig = {

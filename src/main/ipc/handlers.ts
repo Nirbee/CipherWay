@@ -22,6 +22,7 @@ import type {
   LanView
 } from '@shared/types'
 import { LogBatcher } from '@shared/logBuffer'
+import { newYearModeSchema } from './seasonalSchema'
 import { DEFAULT_SETTINGS, getSettings, getZapretSettings, store } from '../store'
 import {
   findOtherVpnClients,
@@ -156,7 +157,8 @@ const settingsPatchSchema = z
     verboseLog: z.boolean(),
     apiBase: apiBaseSchema,
     pingMode: z.enum(['keepalive', 'connect', 'tcp']),
-    pingTimeoutSec: z.number().int().min(PING_TIMEOUT_MIN_S).max(PING_TIMEOUT_MAX_S)
+    pingTimeoutSec: z.number().int().min(PING_TIMEOUT_MIN_S).max(PING_TIMEOUT_MAX_S),
+    newYearDecor: newYearModeSchema
   })
   .partial()
 

@@ -27,6 +27,7 @@ import { StatsPage } from './pages/StatsPage'
 import { ImportSubscriptionDialog } from './components/ImportSubscriptionDialog'
 import { WhatsNew } from './components/WhatsNew'
 import { cn } from './lib/cn'
+import { Garland, HomeScenery, Snowfall, useNewYear } from './seasonal'
 
 export default function App() {
   const page = useNav((s) => s.page)
@@ -44,6 +45,7 @@ export default function App() {
   const [maximized, setMaximized] = useState(false)
   const devOn = useDev((s) => s.status.enabled)
   const loadDev = useDev((s) => s.load)
+  const newYear = useNewYear()
 
   // DevVersion: the silver accent + «Статистика»
   useEffect(() => {
@@ -115,14 +117,18 @@ export default function App() {
   ])
 
   return (
-    <div className={cn('app-shell flex text-text-primary', maximized && 'maximized')}>
+    <div className={cn('app-shell relative flex text-text-primary', maximized && 'maximized')}>
       <Sidebar />
       <ImportSubscriptionDialog />
       <Toaster />
       <WhatsNew />
-      <div className="flex min-w-0 flex-1 flex-col">
+      <Garland />
+      <div className="relative flex min-w-0 flex-1 flex-col">
+        {/* «Новогоднее оформление»: behind the content, no clicks */}
+        {page === 'home' && <HomeScenery />}
+        {newYear !== 'off' && <Snowfall />}
         <TitleBar />
-        <main className="min-h-0 flex-1 overflow-y-auto">
+        <main className="relative z-[1] min-h-0 flex-1 overflow-y-auto">
           <div key={page} className="animate-page h-full">
             <PageView page={page} />
           </div>

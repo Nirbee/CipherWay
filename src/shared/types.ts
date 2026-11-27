@@ -1,3 +1,4 @@
+import type { NewYearMode } from './seasonal'
 // Shared TypeScript types used by both the Electron main process and the renderer.
 
 export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'error'
@@ -171,6 +172,8 @@ export interface AppSettings {
   pingMode: PingMode
   /** «Пинг» → seconds a server gets to answer (PING_TIMEOUT_MIN_S…MAX_S) */
   pingTimeoutSec: number
+  /** «Оформление» → «Новогоднее оформление» (0.7.6, see @shared/seasonal) */
+  newYearDecor: NewYearMode
 }
 
 /**

@@ -227,6 +227,15 @@ export const MegaphoneIcon = (p: P) => (
   </svg>
 )
 
+export const SnowflakeIcon = (p: P) => (
+  <svg {...base(p)}>
+    <path d="M12 2v20M3.3 7l17.4 10M3.3 17L20.7 7" />
+    <path d="M9.5 3.5 12 6l2.5-2.5M9.5 20.5 12 18l2.5 2.5" />
+    <path d="M3.6 10.4 7 9.6 6.1 6.2M17.9 17.8 17 14.4l3.4-.8" />
+    <path d="M6.1 17.8 7 14.4l-3.4-.8M17.9 6.2 17 9.6l3.4.8" />
+  </svg>
+)
+
 export const CalendarIcon = (p: P) => (
   <svg {...base(p)}>
     <rect x="3" y="5" width="18" height="16" rx="2" />

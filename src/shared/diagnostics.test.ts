@@ -16,7 +16,8 @@ const settings: AppSettings = {
   apiBase: 'https://cabinet.example.com',
   tunService: true,
   pingMode: 'keepalive',
-  pingTimeoutSec: 7
+  pingTimeoutSec: 7,
+  newYearDecor: 'auto'
 }
 const logs: LogEntry[] = Array.from({ length: 500 }, (_, i) => ({
   ts: Date.UTC(2026, 10, 4, 12, 0, i % 60),
