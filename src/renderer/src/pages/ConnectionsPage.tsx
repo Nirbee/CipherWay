@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState, type MouseEvent as ReactMouseEvent } from 'react'
 import type { ConnItem, ConnSnapshot, FailedDirect, RoutingRule } from '@shared/types'
 import { PageHeader } from '../components/PageHeader'
 import { EmptyState } from '../components/EmptyState'
-import { Button, Input } from '../components/ui'
+import { Button, Input, Modal } from '../components/ui'
+import { ContextMenu, type MenuEntry } from '../components/ContextMenu'
 import {
   ActivityIcon,
   AppWindowIcon,
@@ -16,10 +17,25 @@ import {
 } from '../components/icons'
 import { useConnection } from '../store/connectionStore'
 import { useRules } from '../store/rulesStore'
+import { useNav } from '../store/navStore'
 import { useProcessIcon } from '../hooks/useProcessIcon'
 import { toast } from '../store/toastStore'
 import { errorText, formatBytes, formatDuration, formatSpeed } from '../lib/format'
 import { cn } from '../lib/cn'
+import {
+  closeConnections,
+  connIdsOf,
+  planProcessRule,
+  PROCESS_ACTION_TEXT,
+  PROCESS_RULE_ACTIONS,
+  processKey,
+  processRuleName,
+  ruleActionText,
+  zapretForProgram,
+  type ProcessRuleAction,
+  type ProcessRulePlan
+} from '../lib/connMenu'
+import { ZAPRET_ACTION } from '@shared/zapret'
 
 type GroupBy = 'process' | 'host'
 
@@ -47,7 +63,7 @@ function siteOf(host: string): string {
 function group(items: ConnItem[], by: GroupBy): Group[] {
   const map = new Map<string, Group>()
   for (const c of items) {
-    const key = by === 'process' ? (c.process ?? '').toLowerCase() || '—' : siteOf(c.host)
+    const key = by === 'process' ? processKey(c.process) : siteOf(c.host)
     const title = by === 'process' ? c.process || 'Неизвестная программа' : key
     let g = map.get(key)
     if (!g) {
@@ -115,6 +131,8 @@ export function ConnectionsPage() {
   const directCount = items.filter((c) => c.route === 'direct').length
   const down = items.reduce((s, c) => s + c.downloadSpeed, 0)
   const up = items.reduce((s, c) => s + c.uploadSpeed, 0)
+
+  const menu = useProcessMenu(items)
 
   const closeAll = async () => {
     try {
@@ -236,6 +254,11 @@ export function ConnectionsPage() {
                     by={effectiveBy}
                     active={current?.key === g.key}
                     onClick={() => setSelected(g.key)}
+                    onContextMenu={
+                      effectiveBy === 'process'
+                        ? (e) => menu.open(e, { process: g.items[0]?.process, path: g.path })
+                        : undefined
+                    }
                   />
                 ))}
               </div>
@@ -250,12 +273,146 @@ export function ConnectionsPage() {
                 </span>
               </div>
             </div>
-            {current && <GroupDetail g={current} by={effectiveBy} />}
+            {current && (
+              <GroupDetail
+                g={current}
+                by={effectiveBy}
+                onMenu={menu.open}
+                onCloseProcess={(t) => void menu.closeProcess(t)}
+              />
+            )}
           </>
         )}
       </div>
+      {menu.element}
     </div>
   )
+}
+
+/** the program a right click was on */
+interface ProcTarget {
+  process?: string
+  path?: string
+}
+
+/**
+ * Right click on a program (0.7.3): a rule for its exe (no duplicates: an
+ * existing rule gets the new action after a question) and «close all its
+ * connections». A connection without a program (system) gets no rule items.
+ */
+function useProcessMenu(items: ConnItem[]) {
+  const [at, setAt] = useState<{ x: number; y: number; t: ProcTarget } | null>(null)
+  const [confirm, setConfirm] = useState<{
+    exe: string
+    action: ProcessRuleAction
+    plan: Extract<ProcessRulePlan, { kind: 'change' }>
+  } | null>(null)
+  const { prependRule, updateRule, loaded, load } = useRules()
+  const setPage = useNav((s) => s.setPage)
+  const close = useCallback(() => setAt(null), [])
+
+  const open = useCallback((e: ReactMouseEvent, t: ProcTarget) => {
+    e.preventDefault()
+    setAt({ x: e.clientX, y: e.clientY, t })
+  }, [])
+
+  const toRules = { label: 'Открыть «Правила»', run: () => setPage('rules') }
+
+  const ruleFor = async (exe: string, action: ProcessRuleAction, path?: string) => {
+    try {
+      if (!loaded) await load()
+      const plan = planProcessRule(useRules.getState().rules, exe, action, path)
+      if (plan.kind === 'same') {
+        toast(`Правило уже есть: программа ${exe} → ${PROCESS_ACTION_TEXT[action]}`, 'info', toRules)
+      } else if (plan.kind === 'change') {
+        setConfirm({ exe, action, plan })
+      } else {
+        await prependRule(plan.rule)
+        toast(`Правило добавлено: программа ${exe} → ${PROCESS_ACTION_TEXT[action]}`, 'success', toRules)
+      }
+    } catch (e) {
+      toast(errorText(e), 'error')
+    }
+  }
+
+  const applyChange = async () => {
+    const c = confirm
+    setConfirm(null)
+    if (!c) return
+    try {
+      await updateRule(c.plan.rule.id, c.plan.patch)
+      toast(`Правило изменено: программа ${c.exe} → ${PROCESS_ACTION_TEXT[c.action]}`, 'success', toRules)
+    } catch (e) {
+      toast(errorText(e), 'error')
+    }
+  }
+
+  const closeProcess = async (t: ProcTarget) => {
+    const ids = connIdsOf(items, processKey(t.process))
+    if (ids.length === 0) return
+    const r = await closeConnections(ids, (id) => window.api.connections.close(id))
+    if (r.closed === 0) toast('Не удалось закрыть соединения', 'error')
+    else toast(`Закрыто соединений: ${r.closed} — программа переподключится сама`, 'success')
+  }
+
+  let entries: MenuEntry[] = []
+  let title = ''
+  if (at) {
+    const exe = processRuleName(at.t.process)
+    title = exe ?? 'Программа неизвестна'
+    const zapretOk = exe !== null && zapretForProgram(exe)
+    entries = [
+      ...PROCESS_RULE_ACTIONS.map((a) => ({
+        label: `Правило для ${exe ?? 'программы'}: ${PROCESS_ACTION_TEXT[a]}`,
+        disabled: exe === null || (a === ZAPRET_ACTION && !zapretOk),
+        hint:
+          exe === null
+            ? 'Системное соединение без имени программы: правило не создать'
+            : a === ZAPRET_ACTION && !zapretOk
+              ? 'Скоро: для программ пока недоступно'
+              : undefined,
+        onSelect: exe ? () => void ruleFor(exe, a, at.t.path) : undefined
+      })),
+      'separator',
+      {
+        label: 'Закрыть все соединения процесса',
+        danger: true,
+        disabled: connIdsOf(items, processKey(at.t.process)).length === 0,
+        onSelect: () => void closeProcess(at.t)
+      }
+    ]
+  }
+
+  const element = (
+    <>
+      {at && <ContextMenu x={at.x} y={at.y} title={title} items={entries} onClose={close} />}
+      <Modal
+        open={confirm !== null}
+        onClose={() => setConfirm(null)}
+        title="Правило для этой программы уже есть"
+        width="max-w-md"
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setConfirm(null)}>
+              Отмена
+            </Button>
+            <Button onClick={() => void applyChange()}>Изменить</Button>
+          </>
+        }
+      >
+        {confirm && (
+          <p className="text-sm leading-relaxed text-text-secondary">
+            Для программы <span className="font-medium text-text-primary">{confirm.exe}</span> уже есть
+            правило «{ruleActionText(confirm.plan.rule.action)}»
+            {confirm.plan.rule.enabled ? '' : ' (выключено)'}. Изменить его действие на «
+            {PROCESS_ACTION_TEXT[confirm.action]}»? Второе правило создано не будет.
+          </p>
+        )}
+      </Modal>
+    </>
+  )
+
+  return { open, closeProcess, element }
 }
 
 const IPV4_RE = /^\d{1,3}(\.\d{1,3}){3}$/
@@ -365,13 +522,26 @@ function ProcIcon({ path, by, className }: { path?: string; by: GroupBy; classNa
   )
 }
 
-function GroupRow({ g, by, active, onClick }: { g: Group; by: GroupBy; active: boolean; onClick: () => void }) {
+function GroupRow({
+  g,
+  by,
+  active,
+  onClick,
+  onContextMenu
+}: {
+  g: Group
+  by: GroupBy
+  active: boolean
+  onClick: () => void
+  onContextMenu?: (e: ReactMouseEvent) => void
+}) {
   const n = g.items.length
   const vpnShare = n ? (g.vpn / n) * 100 : 0
   const directShare = n ? (g.direct / n) * 100 : 0
   return (
     <button
       onClick={onClick}
+      onContextMenu={onContextMenu}
       className={cn(
         'flex w-full items-center gap-3 rounded-xl px-2.5 py-2 text-left transition-colors',
         active ? 'bg-accent-green/10' : 'hover:bg-bg-elevated/70'
@@ -414,7 +584,17 @@ function RouteBadge({ c }: { c: ConnItem }) {
   )
 }
 
-function GroupDetail({ g, by }: { g: Group; by: GroupBy }) {
+function GroupDetail({
+  g,
+  by,
+  onMenu,
+  onCloseProcess
+}: {
+  g: Group
+  by: GroupBy
+  onMenu: (e: ReactMouseEvent, t: ProcTarget) => void
+  onCloseProcess: (t: ProcTarget) => void
+}) {
   const [now, setNow] = useState(Date.now())
   useEffect(() => setNow(Date.now()), [g])
   const items = [...g.items].sort((a, b) => b.start - a.start)
@@ -441,11 +621,21 @@ function GroupDetail({ g, by }: { g: Group; by: GroupBy }) {
           <div className="text-accent-green">↓ {formatSpeed(g.downSpeed)}</div>
           <div className="text-accent-blue-bright">↑ {formatSpeed(g.upSpeed)}</div>
         </div>
+        {by === 'process' && (
+          <button
+            onClick={() => onCloseProcess({ process: g.items[0]?.process, path: g.path })}
+            title="Закрыть все соединения процесса"
+            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-text-faint transition-colors hover:bg-accent-red/15 hover:text-accent-red"
+          >
+            <CloseIcon width={14} height={14} />
+          </button>
+        )}
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto">
         {items.map((c) => (
           <div
             key={c.id}
+            onContextMenu={(e) => onMenu(e, { process: c.process, path: c.processPath })}
             className="group grid grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-3 border-b border-border-subtle/60 px-4 py-2.5 last:border-0 hover:bg-bg-elevated/40"
           >
             <div className="min-w-0">

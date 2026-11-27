@@ -53,7 +53,7 @@ describe('«Что нового»', () => {
 
   it('the bundled changelog: newest first, 0.7.2 … 0.5.2 filled, short Russian bullets', () => {
     const versions = CHANGELOG.map((e) => e.version)
-    expect(versions.slice(0, 5)).toEqual(['0.7.2', '0.7.1', '0.7.0', '0.6.0', '0.5.2'])
+    expect(versions.slice(0, 5)).toEqual(['0.7.3', '0.7.2', '0.7.1', '0.7.0', '0.6.0'])
     for (let i = 1; i < versions.length; i++) {
       expect(compareVersions(versions[i - 1], versions[i])).toBe(1)
     }
